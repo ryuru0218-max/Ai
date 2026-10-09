@@ -1,7 +1,24 @@
 import discord
 from google import genai
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# Renderのポート検出用（無料枠で落とされないための設定）
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    server.serve_forever()
+
+threading.Thread(target=run_web, daemon=True).start()
+
+# --- Discord Bot & Gemini の設定 ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
