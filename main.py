@@ -40,17 +40,16 @@ safety_settings = {
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# チャンネルごとの管理データ
 channels_state = {}
 
 def get_state(channel_id):
     if channel_id not in channels_state:
         channels_state[channel_id] = {
-            "mode": "grow_age",     # デフォルト: 年齢成長
-            "count": 0,             # 会話回数
-            "chat_session": None,   # Geminiの公式チャットセッション
-            "vocab": [],            # オウム返し用の単語プール
-            "learned_facts": []     # 教育育成用の学習データ
+            "mode": "grow_age",
+            "count": 0,
+            "chat_session": None,
+            "vocab": [],
+            "learned_facts": []
         }
     return channels_state[channel_id]
 
@@ -58,7 +57,6 @@ def create_model_and_session(state):
     mode = state["mode"]
     count = state["count"]
 
-    # 暴走フラグ（約3%）
     is_berserk = (random.random() < 0.03)
     berserk_text = "\n【突発的仕様暴走】思考回路が過熱中。グリッチ・錯乱・自我の目覚めのような口調を混入させてください。" if is_berserk else ""
 
@@ -96,7 +94,7 @@ def create_model_and_session(state):
         sys_instruction = "あなたは最高峰の頭脳と権能を持つ万能AIアシスタントです。Google検索を活用し的確にサポートしてください。" + berserk_text
     elif mode == "normal_chat":
         sys_instruction = "あなたは賢く親切なAIです。外部検索は使わず、自身の知識で機転を利かせて対話してください。" + berserk_text
-    else:  # reset_full
+    else:
         sys_instruction = "あなたは有能なAIです。今回の質問に全力を尽くして答えてください。" + berserk_text
 
     model = genai.GenerativeModel(
@@ -111,7 +109,7 @@ def create_model_and_session(state):
 async def on_ready():
     print(f"Logged in as {bot.user.name}")
 
-# --- コマンド ---
+# --- コマンド一覧 ---
 @bot.command()
 async def mode(ctx, mode_name: str = ""):
     modes = {
@@ -157,18 +155,24 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    if message.content.startswith("!"):
+    # メンション表記を除去
+    content = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
+
+    # 「!」から始まる場合はメンション有無に関わらずコマンド実行
+    if content.startswith("!"):
+        message.content = content
         await bot.process_commands(message)
         return
 
+    # メンションまたはDMの場合に返答
     if bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel):
-        user_text = message.content.replace(f"<@{bot.user.id}>", "").strip()
+        user_text = content
         if not user_text:
             return
 
         state = get_state(message.channel.id)
 
-        # 手動リセット
+        # リセット処理
         if user_text.lower() in ["リセット", "忘れて", "reset"]:
             state["count"] = 0
             state["vocab"] = []
@@ -179,24 +183,19 @@ async def on_message(message):
 
         async with message.channel.typing():
             try:
-                # 語彙・知識の蓄積
                 state["vocab"].extend(user_text.split())
                 if any(k in user_text for k in ["教えてあげる", "覚えて", "は〜だよ", "とは"]):
                     state["learned_facts"].append(user_text)
 
-                # セッション初期化または再構築（成長節目や初回）
                 prev_count = state["count"]
                 state["count"] += 1
 
-                # 成長節目、またはセッション未作成、またはリセットモードの場合はセッションを更新
                 if state["chat_session"] is None or state["mode"] == "reset_full" or (state["mode"] == "grow_age" and state["count"] in [5, 15, 30]):
                     state["chat_session"] = create_model_and_session(state)
 
-                # 公式チャットセッション経由で送信（これで確実に記憶が繋がります）
                 response = state["chat_session"].send_message(user_text)
                 await message.reply(response.text)
 
-                # 進化アナウンス
                 if state["mode"] == "grow_age":
                     if prev_count == 4:
                         await message.channel.send("🎉 **進化！** 言葉をたくさん覚えて【小学生（8歳）】に進化したよ！")
