@@ -26,7 +26,7 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# --- 2. Gemini API設定（安全フィルター全面解除） ---
+# --- 2. Gemini API設定 ---
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 safety_settings = {
@@ -155,16 +155,13 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # メンション表記を除去
     content = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
 
-    # 「!」から始まる場合はメンション有無に関わらずコマンド実行
     if content.startswith("!"):
         message.content = content
         await bot.process_commands(message)
         return
 
-    # メンションまたはDMの場合に返答
     if bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel):
         user_text = content
         if not user_text:
@@ -172,7 +169,6 @@ async def on_message(message):
 
         state = get_state(message.channel.id)
 
-        # リセット処理
         if user_text.lower() in ["リセット", "忘れて", "reset"]:
             state["count"] = 0
             state["vocab"] = []
