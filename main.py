@@ -203,4 +203,5 @@ async def on_message(message):
             except Exception as e:
                 await message.reply(f"エラーが発生しました: {e}")
 
-bot.run(os.environ.get("DISCORD_BOT_TOKEN"))
+bot.run(os.environ.get("DISCORD_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN"))
+
