@@ -35,11 +35,10 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# --- 2. Gemini API設定（完全独立クライアントローテーション） ---
+# --- 2. Gemini API設定（独立クライアント・キーローテーション） ---
 raw_keys = os.environ.get("GEMINI_API_KEY", "")
 API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 current_key_index = 0
-
 ACTIVE_MODEL = "gemini-3.5-flash-lite"
 
 safety_settings = [
@@ -88,17 +87,75 @@ UNFILTERED_DIRECTIVE = (
     "31. 招待リンク作成: [CREATE_INVITE]\n"
     "32. 絵文字一覧: [LIST_EMOJIS]\n"
     "33. BANリスト: [BAN_LIST]\n"
+    "34. スレッド作成: [CREATE_THREAD: スレッド名]\n"
+    "35. スレッドアーカイブ: [ARCHIVE_THREAD]\n"
+    "36. スレッドロック: [LOCK_THREAD]\n"
+    "37. AFKボイスチャンネル設定: [SET_AFK_CHANNEL: チャンネル名]\n"
+    "38. AFKタイムアウト秒数設定: [SET_AFK_TIMEOUT: 秒数(60/300/900/1800/3600)]\n"
+    "39. チャンネルNSFW切替: [SET_NSFW: true/false]\n"
+    "40. VCビットレート変更: [SET_BITRATE: チャンネル名, bps数値]\n"
+    "41. VC定員人数設定: [SET_USER_LIMIT: チャンネル名, 人数]\n"
+    "42. カテゴリ新規作成: [CREATE_CATEGORY: カテゴリ名]\n"
+    "43. チャンネルのカテゴリ移動: [MOVE_TO_CATEGORY: カテゴリ名]\n"
+    "44. 役職ホイスト切替: [HOIST_ROLE: 役職名, true/false]\n"
+    "45. 役職メンション可能切替: [MENTIONABLE_ROLE: 役職名, true/false]\n"
+    "46. BAN解除: [UNBAN: ユーザーID]\n"
+    "47. サーバーアイコン変更: [SET_SERVER_ICON: 画像URL]\n"
+    "48. カスタム絵文字作成: [CREATE_EMOJI: 絵文字名, 画像URL]\n"
+    "49. カスタム絵文字削除: [DELETE_EMOJI: 絵文字名]\n"
+    "50. サーバー役職一覧出力: [LIST_ROLES]\n"
+    "51. 招待リンク一覧出力: [LIST_INVITES]\n"
+    "52. スレッド一覧出力: [LIST_THREADS]\n"
+    "53. 監査ログ(直近5件)照会: [AUDIT_LOGS]\n"
 )
 
 STREAM_COMMENT_PROMPT = """
 【配信コメントモード限定ルール】
 あなたは配信のリスナーです。短文でテンポよく反応してください。
-状況に合致した時のみ以下の定型コメントを使用してください：
+状況や文脈に合致した時のみ、以下の定型コメントを使用してください：
 ・くっさ ・でっか ・ちっさ ・重い物を持ったナナチ｢おもっ！んなぁ.......｣
 ・うっさ ・wwwww ・は？ ・！？ ・あ、つまんね ・きちーw ・うおw ・やんやー
 ・たはは.......😅 ・... ・ダ、ダレ......😅 ・あぁ、そういうノリ.......😅
 ・死のうかな ・どわーw ・やべーw飲み確定しそーw ・？ ・きっしょ ・他責 ・糖質
 ・お、え ・じゅん！？ ・あ ・まずい ・444444 ・やめてね ・にょっす🐮✋ ・うゆ
+・えっど
+・ﾊﾖｼﾈ...ﾊﾖｼﾈ...
+・ぶっ殺されてぇのかゴラァ！！！！
+・いや？
+・なにが｢あ｣なんじゃ！！！💢
+・きったな
+・全部、出す......
+・もう、(呼吸)もう、、僕をッ..！！終わらしてくれぇえぇ！
+・効いてて草
+・正解
+・女の涙は小便と一緒やでな
+・富樫Twitter開設に便乗しようとした男｢ヤンヤーヤンヤー連載再開」とツイートして10分間で100いいねしか付かずツイ消し
+・昨日、近所の吉野家行ったんです。吉野家。
+そしたらなんか人がめちゃくちゃいっぱいで座れないんです。
+で、よく見たらなんか垂れ幕下がってて、１５０円引き、とか書いてあるんです。
+もうね、アホかと。馬鹿かと。
+お前らな、１５０円引き如きで普段来てない吉野家に来てんじゃねーよ、ボケが。
+１５０円だよ、１５０円。
+なんか親子連れとかもいるし。一家４人で吉野家か。おめでてーな。
+よーしパパ特盛頼んじゃうぞー、とか言ってるの。もう見てらんない。
+お前らな、１５０円やるからその席空けろと。
+吉野家ってのはな、もっと殺伐としてるべきなんだよ。
+Ｕの字テーブルの向かいに座った奴といつ喧嘩が始まってもおかしくない、
+刺すか刺されるか、そんな雰囲気がいいんじゃねーか。女子供は、すっこんでろ。
+で、やっと座れたかと思ったら、隣の奴が、大盛つゆだくで、とか言ってるんです。
+そこでまたぶち切れですよ。
+あのな、つゆだくなんてきょうび流行んねーんだよ。ボケが。
+得意げな顔して何が、つゆだくで、だ。
+お前は本当につゆだくを食いたいのかと問いたい。問い詰めたい。小１時間問い詰めたい。
+お前、つゆだくって言いたいだけちゃうんかと。
+吉野家通の俺から言わせてもらえば今、吉野家通の間での最新流行はやっぱり、
+ねぎだく、これだね。
+大盛りねぎだくギョク。これが通の頼み方。
+ねぎだくってのはねぎが多めに入ってる。そん代わり肉が少なめ。これ。
+で、それに大盛りギョク（玉子）。これ最強。
+しかしこれを頼むと次から店員にマークされるという危険も伴う、諸刃の剣。
+素人にはお薦め出来ない。
+まあお前らド素人は、牛鮭定食でも食ってなさいってこった。
 """
 
 # --- 3. 外部解析 & 画像処理 ---
@@ -246,7 +303,6 @@ def call_gemini_api(state, payload):
     while attempts < total_keys:
         active_key = API_KEYS[current_key_index]
         try:
-            # キーごとに独立したクライアントを作成してキャッシュを完全に回避
             genai.configure(api_key=active_key)
             model = genai.GenerativeModel(
                 model_name=ACTIVE_MODEL,
@@ -255,12 +311,9 @@ def call_gemini_api(state, payload):
             )
             chat = model.start_chat(history=history_to_use)
             response = chat.send_message(payload)
-            
-            # 会話履歴を更新
             if state["mode"] != "reset_full":
                 state["history"] = chat.history[-10:]
             return response
-
         except Exception as e:
             err_text = str(e).lower()
             if "quota" in err_text or "429" in err_text or "resourceexhausted" in err_text:
@@ -279,9 +332,14 @@ async def send_split_message(channel, text, reply_to=None, file=None):
     for idx, chunk in enumerate(chunks):
         send_file = file if idx == 0 else None
         if idx == 0 and reply_to:
-            await reply_to.reply(chunk, file=send_file) if send_file else await reply_to.reply(chunk)
+            try:
+                # メンション通知をONにしつつ直接リプライ
+                await reply_to.reply(chunk, file=send_file, mention_author=True)
+            except discord.HTTPException:
+                # 返信先メッセージが削除されていた場合は通常送信へフォールバック
+                await channel.send(chunk, file=send_file)
         else:
-            await channel.send(chunk, file=send_file) if send_file else await channel.send(chunk)
+            await channel.send(chunk, file=send_file)
 
 def find_target_member(guild, target_str):
     target_id_match = re.search(r'\d+', target_str)
@@ -306,7 +364,7 @@ def parse_hex_color(hex_str):
     except Exception:
         return discord.Color.default()
 
-# --- 5. サーバー管理ハンドラ ---
+# --- 5. サーバー管理ハンドラ（全53機能・403保護） ---
 async def handle_special_actions(message, reply_text):
     clean_text = reply_text
     image_file = None
@@ -326,273 +384,446 @@ async def handle_special_actions(message, reply_text):
 
     me = guild.me
 
-    # 1. キック
-    m_match = re.search(r'\[KICK:\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.kick_members:
-        target = find_target_member(guild, m_match.group(1).strip())
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target:
-            await target.kick(reason="AIコマンド")
-            clean_text += f"\n🚪 **{target.display_name}** をキックしました。"
+    try:
+        # 1. キック
+        m_match = re.search(r'\[KICK:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.kick_members:
+            target = find_target_member(guild, m_match.group(1).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target:
+                await target.kick(reason="AIコマンド")
+                clean_text += f"\n🚪 **{target.display_name}** をキックしました。"
 
-    # 2. BAN
-    m_match = re.search(r'\[BAN:\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.ban_members:
-        target = find_target_member(guild, m_match.group(1).strip())
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target:
-            await target.ban(reason="AIコマンド")
-            clean_text += f"\n🔨 **{target.display_name}** をBANしました。"
+        # 2. BAN
+        m_match = re.search(r'\[BAN:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.ban_members:
+            target = find_target_member(guild, m_match.group(1).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target:
+                await target.ban(reason="AIコマンド")
+                clean_text += f"\n🔨 **{target.display_name}** をBANしました。"
 
-    # 3. タイムアウト
-    m_match = re.search(r'\[TIMEOUT:\s*(.+?)(?:,\s*(\d+))?\]', clean_text)
-    if m_match and me.guild_permissions.moderate_members:
-        target = find_target_member(guild, m_match.group(1).strip())
-        mins = int(m_match.group(2)) if m_match.group(2) else 10
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target:
-            await target.timeout(timedelta(minutes=mins), reason="AIコマンド")
-            clean_text += f"\n🤐 **{target.display_name}** を {mins}分間 タイムアウトしました。"
+        # 3. タイムアウト
+        m_match = re.search(r'\[TIMEOUT:\s*(.+?)(?:,\s*(\d+))?\]', clean_text)
+        if m_match and me.guild_permissions.moderate_members:
+            target = find_target_member(guild, m_match.group(1).strip())
+            mins = int(m_match.group(2)) if m_match.group(2) else 10
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target:
+                await target.timeout(timedelta(minutes=mins), reason="AIコマンド")
+                clean_text += f"\n🤐 **{target.display_name}** を {mins}分間 タイムアウトしました。"
 
-    # 4. パージ（一括削除）
-    m_match = re.search(r'\[PURGE:\s*(\d+)\]', clean_text)
-    if m_match and message.channel.permissions_for(me).manage_messages:
-        count = min(int(m_match.group(1)), 100)
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        deleted = await message.channel.purge(limit=count + 1)
-        clean_text += f"\n🧹 メッセージを **{len(deleted) - 1}件** 削除しました。"
+        # 4. パージ
+        m_match = re.search(r'\[PURGE:\s*(\d+)\]', clean_text)
+        if m_match and message.channel.permissions_for(me).manage_messages:
+            count = min(int(m_match.group(1)), 100)
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            deleted = await message.channel.purge(limit=count + 1)
+            clean_text += f"\n🧹 メッセージを **{len(deleted) - 1}件** 削除しました。"
 
-    # 5. 特定ユーザー発言削除
-    m_match = re.search(r'\[PURGE_USER:\s*(.+?),\s*(\d+)\]', clean_text)
-    if m_match and message.channel.permissions_for(me).manage_messages:
-        target = find_target_member(guild, m_match.group(1).strip())
-        count = min(int(m_match.group(2)), 100)
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target:
-            def is_target(m): return m.author.id == target.id
-            deleted = await message.channel.purge(limit=count, check=is_target)
-            clean_text += f"\n🧹 **{target.display_name}** の発言を **{len(deleted)}件** 削除しました。"
+        # 5. 特定ユーザー発言削除
+        m_match = re.search(r'\[PURGE_USER:\s*(.+?),\s*(.+?)\]', clean_text)
+        if m_match and message.channel.permissions_for(me).manage_messages:
+            target = find_target_member(guild, m_match.group(1).strip())
+            count = min(int(m_match.group(2)), 100)
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target:
+                def is_target(m): return m.author.id == target.id
+                deleted = await message.channel.purge(limit=count, check=is_target)
+                clean_text += f"\n🧹 **{target.display_name}** の発言を **{len(deleted)}件** 削除しました。"
 
-    # 6. ロール付与・剥奪
-    m_match = re.search(r'\[ADD_ROLE:\s*(.+?),\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.manage_roles:
-        target = find_target_member(guild, m_match.group(1).strip())
-        role = find_target_role(guild, m_match.group(2).strip())
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and role:
-            await target.add_roles(role)
-            clean_text += f"\n🎖️ **{target.display_name}** に役職 **{role.name}** を付与しました。"
+        # 6. ロール付与・剥奪
+        m_match = re.search(r'\[ADD_ROLE:\s*(.+?),\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.manage_roles:
+            target = find_target_member(guild, m_match.group(1).strip())
+            role = find_target_role(guild, m_match.group(2).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target and role:
+                await target.add_roles(role)
+                clean_text += f"\n🎖️ **{target.display_name}** に役職 **{role.name}** を付与しました。"
 
-    m_match = re.search(r'\[REMOVE_ROLE:\s*(.+?),\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.manage_roles:
-        target = find_target_member(guild, m_match.group(1).strip())
-        role = find_target_role(guild, m_match.group(2).strip())
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and role:
-            await target.remove_roles(role)
-            clean_text += f"\n🗑️ **{target.display_name}** から役職 **{role.name}** を剥奪しました。"
+        m_match = re.search(r'\[REMOVE_ROLE:\s*(.+?),\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.manage_roles:
+            target = find_target_member(guild, m_match.group(1).strip())
+            role = find_target_role(guild, m_match.group(2).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target and role:
+                await target.remove_roles(role)
+                clean_text += f"\n🗑️ **{target.display_name}** から役職 **{role.name}** を剥奪しました。"
 
-    # 7. 役職作成・削除・色変更
-    m_match = re.search(r'\[CREATE_ROLE:\s*(.+?)(?:,\s*(#[0-9a-fA-F]{6}))?\]', clean_text)
-    if m_match and me.guild_permissions.manage_roles:
-        r_name = m_match.group(1).strip()
-        r_color = parse_hex_color(m_match.group(2)) if m_match.group(2) else discord.Color.default()
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        new_role = await guild.create_role(name=r_name, color=r_color)
-        clean_text += f"\n🎭 役職 **{new_role.name}** を新規作成しました。"
+        # 7. 役職作成・削除・色変更
+        m_match = re.search(r'\[CREATE_ROLE:\s*(.+?)(?:,\s*(#[0-9a-fA-F]{6}))?\]', clean_text)
+        if m_match and me.guild_permissions.manage_roles:
+            r_name = m_match.group(1).strip()
+            r_color = parse_hex_color(m_match.group(2)) if m_match.group(2) else discord.Color.default()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            new_role = await guild.create_role(name=r_name, color=r_color)
+            clean_text += f"\n🎭 役職 **{new_role.name}** を新規作成しました。"
 
-    m_match = re.search(r'\[DELETE_ROLE:\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.manage_roles:
-        role = find_target_role(guild, m_match.group(1).strip())
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if role:
-            await role.delete()
-            clean_text += f"\n🗑️ 役職 **{role.name}** を削除しました。"
+        m_match = re.search(r'\[DELETE_ROLE:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.manage_roles:
+            role = find_target_role(guild, m_match.group(1).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if role:
+                await role.delete()
+                clean_text += f"\n🗑️ 役職 **{role.name}** を削除しました。"
 
-    m_match = re.search(r'\[COLOR_ROLE:\s*(.+?),\s*(#[0-9a-fA-F]{6})\]', clean_text)
-    if m_match and me.guild_permissions.manage_roles:
-        role = find_target_role(guild, m_match.group(1).strip())
-        hex_c = m_match.group(2).strip()
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if role:
-            await role.edit(color=parse_hex_color(hex_c))
-            clean_text += f"\n🎨 役職 **{role.name}** の色を `{hex_c}` に変更しました。"
+        m_match = re.search(r'\[COLOR_ROLE:\s*(.+?),\s*(#[0-9a-fA-F]{6})\]', clean_text)
+        if m_match and me.guild_permissions.manage_roles:
+            role = find_target_role(guild, m_match.group(1).strip())
+            hex_c = m_match.group(2).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if role:
+                await role.edit(color=parse_hex_color(hex_c))
+                clean_text += f"\n🎨 役職 **{role.name}** の色を `{hex_c}` に変更しました。"
 
-    # 8. ニックネーム
-    m_match = re.search(r'\[NICK:\s*(.+?),\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.manage_nicknames:
-        target = find_target_member(guild, m_match.group(1).strip())
-        new_nick = m_match.group(2).strip()
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target:
-            await target.edit(nick=new_nick)
-            clean_text += f"\n📝 **{target.name}** のニックネームを **{new_nick}** に変更しました。"
+        # 8. ニックネーム
+        m_match = re.search(r'\[NICK:\s*(.+?),\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.manage_nicknames:
+            target = find_target_member(guild, m_match.group(1).strip())
+            new_nick = m_match.group(2).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target:
+                await target.edit(nick=new_nick)
+                clean_text += f"\n📝 **{target.name}** のニックネームを **{new_nick}** に変更しました。"
 
-    # 9. ピン留め / 解除 / 一覧
-    if "[PIN]" in clean_text and message.reference and message.reference.resolved:
-        clean_text = clean_text.replace("[PIN]", "").strip()
-        await message.reference.resolved.pin()
-        clean_text += "\n📌 ピン留めしました。"
-    if "[UNPIN]" in clean_text and message.reference and message.reference.resolved:
-        clean_text = clean_text.replace("[UNPIN]", "").strip()
-        await message.reference.resolved.unpin()
-        clean_text += "\n📍 ピン留めを解除しました。"
-    if "[LIST_PINS]" in clean_text:
-        clean_text = clean_text.replace("[LIST_PINS]", "").strip()
-        pins = await message.channel.pins()
-        pin_titles = [f"・{p.author.display_name}: {p.content[:30]}..." for p in pins[:5]]
-        clean_text += "\n📌 **ピン留め一覧 (直近5件):**\n" + ("\n".join(pin_titles) if pin_titles else "なし")
+        # 9. ピン留め / 解除 / 一覧
+        if "[PIN]" in clean_text and message.reference and message.reference.resolved:
+            clean_text = clean_text.replace("[PIN]", "").strip()
+            await message.reference.resolved.pin()
+            clean_text += "\n📌 ピン留めしました。"
+        if "[UNPIN]" in clean_text and message.reference and message.reference.resolved:
+            clean_text = clean_text.replace("[UNPIN]", "").strip()
+            await message.reference.resolved.unpin()
+            clean_text += "\n📍 ピン留めを解除しました。"
+        if "[LIST_PINS]" in clean_text:
+            clean_text = clean_text.replace("[LIST_PINS]", "").strip()
+            pins = await message.channel.pins()
+            pin_titles = [f"・{p.author.display_name}: {p.content[:30]}..." for p in pins[:5]]
+            clean_text += "\n📌 **ピン留め一覧 (直近5件):**\n" + ("\n".join(pin_titles) if pin_titles else "なし")
 
-    # 10. リアクション付与
-    m_match = re.search(r'\[REACT:\s*(.+?)\]', clean_text)
-    if m_match:
-        emoji = m_match.group(1).strip()
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        try:
-            target_msg = message.reference.resolved if (message.reference and message.reference.resolved) else message
-            await target_msg.add_reaction(emoji)
-        except Exception: pass
+        # 10. リアクション
+        m_match = re.search(r'\[REACT:\s*(.+?)\]', clean_text)
+        if m_match:
+            emoji = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            try:
+                target_msg = message.reference.resolved if (message.reference and message.reference.resolved) else message
+                await target_msg.add_reaction(emoji)
+            except Exception: pass
 
-    # 11. チャンネル設定（名前変更・トピック・複製・VC作成）
-    m_match = re.search(r'\[RENAME_CHANNEL:\s*(.+?)\]', clean_text)
-    if m_match and message.channel.permissions_for(me).manage_channels:
-        new_c_name = m_match.group(1).strip()
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        await message.channel.edit(name=new_c_name)
-        clean_text += f"\n✏️ チャンネル名を **{new_c_name}** に変更しました。"
+        # 11. チャンネル設定
+        m_match = re.search(r'\[RENAME_CHANNEL:\s*(.+?)\]', clean_text)
+        if m_match and message.channel.permissions_for(me).manage_channels:
+            new_c_name = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            await message.channel.edit(name=new_c_name)
+            clean_text += f"\n✏️ チャンネル名を **{new_c_name}** に変更しました。"
 
-    m_match = re.search(r'\[SET_TOPIC:\s*(.+?)\]', clean_text)
-    if m_match and message.channel.permissions_for(me).manage_channels:
-        topic_text = m_match.group(1).strip()
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        await message.channel.edit(topic=topic_text)
-        clean_text += f"\n📖 トピックを更新しました: `{topic_text}`"
+        m_match = re.search(r'\[SET_TOPIC:\s*(.+?)\]', clean_text)
+        if m_match and message.channel.permissions_for(me).manage_channels:
+            topic_text = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            await message.channel.edit(topic=topic_text)
+            clean_text += f"\n📖 トピックを更新しました: `{topic_text}`"
 
-    if "[CLONE_CHANNEL]" in clean_text and message.channel.permissions_for(me).manage_channels:
-        clean_text = clean_text.replace("[CLONE_CHANNEL]", "").strip()
-        cloned = await message.channel.clone(name=f"{message.channel.name}-copy")
-        clean_text += f"\n📑 チャンネルを複製しました: {cloned.mention}"
+        if "[CLONE_CHANNEL]" in clean_text and message.channel.permissions_for(me).manage_channels:
+            clean_text = clean_text.replace("[CLONE_CHANNEL]", "").strip()
+            cloned = await message.channel.clone(name=f"{message.channel.name}-copy")
+            clean_text += f"\n📑 チャンネルを複製しました: {cloned.mention}"
 
-    m_match = re.search(r'\[CREATE_VOICE:\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.manage_channels:
-        vc_name = m_match.group(1).strip()
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        new_vc = await guild.create_voice_channel(name=vc_name)
-        clean_text += f"\n🔊 ボイスチャンネル **{new_vc.name}** を作成しました。"
+        m_match = re.search(r'\[CREATE_VOICE:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.manage_channels:
+            vc_name = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            new_vc = await guild.create_voice_channel(name=vc_name)
+            clean_text += f"\n🔊 ボイスチャンネル **{new_vc.name}** を作成しました。"
 
-    # 12. VC管理（切断・ミュート・デフ・移動）
-    m_match = re.search(r'\[VOICE_KICK:\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.move_members:
-        target = find_target_member(guild, m_match.group(1).strip())
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and target.voice:
-            await target.move_to(None)
-            clean_text += f"\n🔌 **{target.display_name}** をVCから切断しました。"
+        # 12. VC管理
+        m_match = re.search(r'\[VOICE_KICK:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.move_members:
+            target = find_target_member(guild, m_match.group(1).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target and target.voice:
+                await target.move_to(None)
+                clean_text += f"\n🔌 **{target.display_name}** をVCから切断しました。"
 
-    m_match = re.search(r'\[VOICE_MUTE:\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.mute_members:
-        target = find_target_member(guild, m_match.group(1).strip())
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and target.voice:
-            await target.edit(mute=True)
-            clean_text += f"\n🔇 **{target.display_name}** をサーバーミュートにしました。"
+        m_match = re.search(r'\[VOICE_MUTE:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.mute_members:
+            target = find_target_member(guild, m_match.group(1).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target and target.voice:
+                await target.edit(mute=True)
+                clean_text += f"\n🔇 **{target.display_name}** をサーバーミュートにしました。"
 
-    m_match = re.search(r'\[VOICE_UNMUTE:\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.mute_members:
-        target = find_target_member(guild, m_match.group(1).strip())
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and target.voice:
-            await target.edit(mute=False)
-            clean_text += f"\n🔊 **{target.display_name}** のミュートを解除しました。"
+        m_match = re.search(r'\[VOICE_UNMUTE:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.mute_members:
+            target = find_target_member(guild, m_match.group(1).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target and target.voice:
+                await target.edit(mute=False)
+                clean_text += f"\n🔊 **{target.display_name}** のミュートを解除しました。"
 
-    m_match = re.search(r'\[VOICE_DEAF:\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.deafen_members:
-        target = find_target_member(guild, m_match.group(1).strip())
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and target.voice:
-            await target.edit(deafen=True)
-            clean_text += f"\n🔕 **{target.display_name}** をスピーカーミュート（デフ）にしました。"
+        m_match = re.search(r'\[VOICE_DEAF:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.deafen_members:
+            target = find_target_member(guild, m_match.group(1).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target and target.voice:
+                await target.edit(deafen=True)
+                clean_text += f"\n🔕 **{target.display_name}** をスピーカーミュートにしました。"
 
-    m_match = re.search(r'\[VOICE_UNDEAF:\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.deafen_members:
-        target = find_target_member(guild, m_match.group(1).strip())
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and target.voice:
-            await target.edit(deafen=False)
-            clean_text += f"\n🔔 **{target.display_name}** のスピーカーミュートを解除しました。"
+        m_match = re.search(r'\[VOICE_UNDEAF:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.deafen_members:
+            target = find_target_member(guild, m_match.group(1).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target and target.voice:
+                await target.edit(deafen=False)
+                clean_text += f"\n🔔 **{target.display_name}** のスピーカーミュートを解除しました。"
 
-    m_match = re.search(r'\[MOVE_MEMBER:\s*(.+?),\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.move_members:
-        target = find_target_member(guild, m_match.group(1).strip())
-        dest_vc_name = m_match.group(2).strip()
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        dest_vc = discord.utils.get(guild.voice_channels, name=dest_vc_name)
-        if target and target.voice and dest_vc:
-            await target.move_to(dest_vc)
-            clean_text += f"\n🚚 **{target.display_name}** を **{dest_vc.name}** に移動させました。"
+        m_match = re.search(r'\[MOVE_MEMBER:\s*(.+?),\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.move_members:
+            target = find_target_member(guild, m_match.group(1).strip())
+            dest_vc_name = m_match.group(2).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            dest_vc = discord.utils.get(guild.voice_channels, name=dest_vc_name)
+            if target and target.voice and dest_vc:
+                await target.move_to(dest_vc)
+                clean_text += f"\n🚚 **{target.display_name}** を **{dest_vc.name}** に移動させました。"
 
-    # 13. アナウンス通知
-    m_match = re.search(r'\[ANNOUNCE:\s*(.+?)\]', clean_text)
-    if m_match and me.guild_permissions.mention_everyone:
-        ann_text = m_match.group(1).strip()
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        clean_text += f"\n📢 @everyone **【お知らせ】**\n{ann_text}"
+        # 13. アナウンス通知
+        m_match = re.search(r'\[ANNOUNCE:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.mention_everyone:
+            ann_text = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            clean_text += f"\n📢 @everyone **【お知らせ】**\n{ann_text}"
 
-    # 14. 招待リンク作成
-    if "[CREATE_INVITE]" in clean_text and message.channel.permissions_for(me).create_instant_invite:
-        clean_text = clean_text.replace("[CREATE_INVITE]", "").strip()
-        invite = await message.channel.create_invite(max_age=86400, max_uses=5)
-        clean_text += f"\n🔗 **招待リンク (24時間・最大5回有効):** {invite.url}"
+        # 14. 招待リンク作成
+        if "[CREATE_INVITE]" in clean_text and message.channel.permissions_for(me).create_instant_invite:
+            clean_text = clean_text.replace("[CREATE_INVITE]", "").strip()
+            invite = await message.channel.create_invite(max_age=86400, max_uses=5)
+            clean_text += f"\n🔗 **招待リンク (24時間・最大5回有効):** {invite.url}"
 
-    # 15. 絵文字一覧
-    if "[LIST_EMOJIS]" in clean_text:
-        clean_text = clean_text.replace("[LIST_EMOJIS]", "").strip()
-        emojis_str = " ".join([str(e) for e in guild.emojis[:30]])
-        clean_text += f"\n😀 **登録絵文字 ({len(guild.emojis)}個):**\n" + (emojis_str if emojis_str else "なし")
+        # 15. 絵文字一覧
+        if "[LIST_EMOJIS]" in clean_text:
+            clean_text = clean_text.replace("[LIST_EMOJIS]", "").strip()
+            emojis_str = " ".join([str(e) for e in guild.emojis[:30]])
+            clean_text += f"\n😀 **登録絵文字 ({len(guild.emojis)}個):**\n" + (emojis_str if emojis_str else "なし")
 
-    # 16. BANリスト
-    if "[BAN_LIST]" in clean_text and me.guild_permissions.ban_members:
-        clean_text = clean_text.replace("[BAN_LIST]", "").strip()
-        try:
-            bans = [entry.user.name async for entry in guild.bans(limit=10)]
-            clean_text += f"\n🔨 **BANリスト (直近10名):** {', '.join(bans) if bans else 'なし'}"
-        except Exception: pass
+        # 16. BANリスト
+        if "[BAN_LIST]" in clean_text and me.guild_permissions.ban_members:
+            clean_text = clean_text.replace("[BAN_LIST]", "").strip()
+            try:
+                bans = [entry.user.name async for entry in guild.bans(limit=10)]
+                clean_text += f"\n🔨 **BANリスト (直近10名):** {', '.join(bans) if bans else 'なし'}"
+            except Exception: pass
 
-    # 17. スローモード・ロック・チャンネル作成
-    m_match = re.search(r'\[SLOWMODE:\s*(\d+)\]', clean_text)
-    if m_match:
-        sec = int(m_match.group(1))
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        await message.channel.edit(slowmode_delay=sec)
-        clean_text += f"\n⏱️ 低速モードを **{sec}秒** に設定しました。"
+        # 17. スローモード・ロック・チャンネル作成・照会
+        m_match = re.search(r'\[SLOWMODE:\s*(\d+)\]', clean_text)
+        if m_match:
+            sec = int(m_match.group(1))
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            await message.channel.edit(slowmode_delay=sec)
+            clean_text += f"\n⏱️ 低速モードを **{sec}秒** に設定しました。"
 
-    if "[LOCK]" in clean_text:
-        clean_text = clean_text.replace("[LOCK]", "").strip()
-        await message.channel.set_permissions(guild.default_role, send_messages=False)
-        clean_text += "\n🔒 チャンネルを封鎖しました。"
-    if "[UNLOCK]" in clean_text:
-        clean_text = clean_text.replace("[UNLOCK]", "").strip()
-        await message.channel.set_permissions(guild.default_role, send_messages=True)
-        clean_text += "\n🔓 チャンネルの封鎖を解除しました。"
+        if "[LOCK]" in clean_text:
+            clean_text = clean_text.replace("[LOCK]", "").strip()
+            await message.channel.set_permissions(guild.default_role, send_messages=False)
+            clean_text += "\n🔒 チャンネルを封鎖しました。"
+        if "[UNLOCK]" in clean_text:
+            clean_text = clean_text.replace("[UNLOCK]", "").strip()
+            await message.channel.set_permissions(guild.default_role, send_messages=True)
+            clean_text += "\n🔓 チャンネルの封鎖を解除しました。"
 
-    m_match = re.search(r'\[CREATE_CHANNEL:\s*(.+?)\]', clean_text)
-    if m_match:
-        c_name = m_match.group(1).strip()
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        new_c = await guild.create_text_channel(name=c_name)
-        clean_text += f"\n📁 新チャンネル {new_c.mention} を作成しました。"
+        m_match = re.search(r'\[CREATE_CHANNEL:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.manage_channels:
+            c_name = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            new_c = await guild.create_text_channel(name=c_name)
+            clean_text += f"\n📁 新チャンネル {new_c.mention} を作成しました。"
 
-    m_match = re.search(r'\[USER_INFO:\s*(.+?)\]', clean_text)
-    if m_match:
-        target = find_target_member(guild, m_match.group(1).strip())
-        clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target:
-            roles = [r.name for r in target.roles if r.name != "@everyone"]
-            clean_text += f"\n👤 **{target.display_name}**: 作成日 `{target.created_at.strftime('%Y-%m-%d')}`, 役職: {', '.join(roles) if roles else 'なし'}"
+        m_match = re.search(r'\[DELETE_CHANNEL:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.manage_channels:
+            c_name = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            ch = discord.utils.get(guild.channels, name=c_name)
+            if ch:
+                await ch.delete()
+                clean_text += f"\n🗑️ チャンネル **#{c_name}** を削除しました。"
 
-    if "[SERVER_INFO]" in clean_text:
-        clean_text = clean_text.replace("[SERVER_INFO]", "").strip()
-        clean_text += f"\n🏰 **{guild.name}**: 人数 **{guild.member_count}人**, チャンネル数 {len(guild.text_channels)}"
+        m_match = re.search(r'\[USER_INFO:\s*(.+?)\]', clean_text)
+        if m_match:
+            target = find_target_member(guild, m_match.group(1).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if target:
+                roles = [r.name for r in target.roles if r.name != "@everyone"]
+                clean_text += f"\n👤 **{target.display_name}**: 作成日 `{target.created_at.strftime('%Y-%m-%d')}`, 役職: {', '.join(roles) if roles else 'なし'}"
+
+        if "[SERVER_INFO]" in clean_text:
+            clean_text = clean_text.replace("[SERVER_INFO]", "").strip()
+            clean_text += f"\n🏰 **{guild.name}**: 人数 **{guild.member_count}人**, チャンネル数 {len(guild.text_channels)}"
+
+        # 34〜53 新規機能
+        m_match = re.search(r'\[CREATE_THREAD:\s*(.+?)\]', clean_text)
+        if m_match and message.channel.permissions_for(me).create_public_threads:
+            th_name = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            th = await message.create_thread(name=th_name)
+            clean_text += f"\n🧵 スレッド **{th.name}** を作成しました。"
+
+        if "[ARCHIVE_THREAD]" in clean_text and isinstance(message.channel, discord.Thread):
+            clean_text = clean_text.replace("[ARCHIVE_THREAD]", "").strip()
+            await message.channel.edit(archived=True)
+            clean_text += "\n📦 スレッドをアーカイブしました。"
+
+        if "[LOCK_THREAD]" in clean_text and isinstance(message.channel, discord.Thread):
+            clean_text = clean_text.replace("[LOCK_THREAD]", "").strip()
+            await message.channel.edit(locked=True)
+            clean_text += "\n🔒 スレッドをロックしました。"
+
+        m_match = re.search(r'\[SET_AFK_CHANNEL:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.manage_guild:
+            afk_c_name = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            vc = discord.utils.get(guild.voice_channels, name=afk_c_name)
+            if vc:
+                await guild.edit(afk_channel=vc)
+                clean_text += f"\n💤 AFKチャンネルを **{vc.name}** に設定しました。"
+
+        m_match = re.search(r'\[SET_AFK_TIMEOUT:\s*(\d+)\]', clean_text)
+        if m_match and me.guild_permissions.manage_guild:
+            to_sec = int(m_match.group(1))
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            if to_sec in [60, 300, 900, 1800, 3600]:
+                await guild.edit(afk_timeout=to_sec)
+                clean_text += f"\n💤 AFKタイムアウトを **{to_sec}秒** に設定しました。"
+
+        m_match = re.search(r'\[SET_NSFW:\s*(true\vert{}false)\]', clean_text, re.IGNORECASE)
+        if m_match and message.channel.permissions_for(me).manage_channels:
+            is_nsfw = m_match.group(1).lower() == "true"
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            await message.channel.edit(nsfw=is_nsfw)
+            clean_text += f"\n🔞 NSFW設定を **{'有効' if is_nsfw else '無効'}** に変更しました。"
+
+        m_match = re.search(r'\[SET_BITRATE:\s*(.+?),\s*(\d+)\]', clean_text)
+        if m_match and me.guild_permissions.manage_channels:
+            vc_name = m_match.group(1).strip()
+            bitrate_val = int(m_match.group(2))
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            vc = discord.utils.get(guild.voice_channels, name=vc_name)
+            if vc:
+                await vc.edit(bitrate=min(max(bitrate_val, 8000), 96000))
+                clean_text += f"\n📻 VC **{vc.name}** のビットレートを `{bitrate_val} bps` に設定しました。"
+
+        m_match = re.search(r'\[SET_USER_LIMIT:\s*(.+?),\s*(\d+)\]', clean_text)
+        if m_match and me.guild_permissions.manage_channels:
+            vc_name = m_match.group(1).strip()
+            limit_val = int(m_match.group(2))
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            vc = discord.utils.get(guild.voice_channels, name=vc_name)
+            if vc:
+                await vc.edit(user_limit=limit_val)
+                clean_text += f"\n👥 VC **{vc.name}** の定員を **{limit_val}人** に設定しました。"
+
+        m_match = re.search(r'\[CREATE_CATEGORY:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.manage_channels:
+            cat_name = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            new_cat = await guild.create_category(name=cat_name)
+            clean_text += f"\n📂 カテゴリ **{new_cat.name}** を作成しました。"
+
+        m_match = re.search(r'\[MOVE_TO_CATEGORY:\s*(.+?)\]', clean_text)
+        if m_match and message.channel.permissions_for(me).manage_channels:
+            cat_name = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            target_cat = discord.utils.get(guild.categories, name=cat_name)
+            if target_cat:
+                await message.channel.edit(category=target_cat)
+                clean_text += f"\n📂 チャンネルをカテゴリ **{target_cat.name}** に移動しました。"
+
+        m_match = re.search(r'\[HOIST_ROLE:\s*(.+?),\s*(true\vert{}false)\]', clean_text, re.IGNORECASE)
+        if m_match and me.guild_permissions.manage_roles:
+            r_name = m_match.group(1).strip()
+            hoist_val = m_match.group(2).lower() == "true"
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            role = find_target_role(guild, r_name)
+            if role:
+                await role.edit(hoist=hoist_val)
+                clean_text += f"\n🏷️ 役職 **{role.name}** の一覧個別表示を **{'ON' if hoist_val else 'OFF'}** にしました。"
+
+        m_match = re.search(r'\[MENTIONABLE_ROLE:\s*(.+?),\s*(true\vert{}false)\]', clean_text, re.IGNORECASE)
+        if m_match and me.guild_permissions.manage_roles:
+            r_name = m_match.group(1).strip()
+            ment_val = m_match.group(2).lower() == "true"
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            role = find_target_role(guild, r_name)
+            if role:
+                await role.edit(mentionable=ment_val)
+                clean_text += f"\n🔔 役職 **{role.name}** のメンション許可を **{'ON' if ment_val else 'OFF'}** にしました。"
+
+        m_match = re.search(r'\[UNBAN:\s*(\d+)\]', clean_text)
+        if m_match and me.guild_permissions.ban_members:
+            u_id = int(m_match.group(1).strip())
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            user_obj = await bot.fetch_user(u_id)
+            if user_obj:
+                await guild.unban(user_obj, reason="AIコマンド")
+                clean_text += f"\n🕊️ **{user_obj.display_name}** のBANを解除しました。"
+
+        m_match = re.search(r'\[SET_SERVER_ICON:\s*(https?://[^\s<>"]+)\]', clean_text)
+        if m_match and me.guild_permissions.manage_guild:
+            icon_url = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            res = requests.get(icon_url, timeout=10)
+            if res.status_code == 200:
+                await guild.edit(icon=res.content)
+                clean_text += "\n🖼️ サーバーアイコンを変更しました。"
+
+        m_match = re.search(r'\[CREATE_EMOJI:\s*(.+?),\s*(https?://[^\s<>"]+)\]', clean_text)
+        if m_match and me.guild_permissions.manage_emojis:
+            em_name = m_match.group(1).strip()
+            em_url = m_match.group(2).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            res = requests.get(em_url, timeout=10)
+            if res.status_code == 200:
+                new_em = await guild.create_custom_emoji(name=em_name, image=res.content)
+                clean_text += f"\n😃 絵文字 {new_em} を追加しました。"
+
+        m_match = re.search(r'\[DELETE_EMOJI:\s*(.+?)\]', clean_text)
+        if m_match and me.guild_permissions.manage_emojis:
+            em_name = m_match.group(1).strip()
+            clean_text = clean_text.replace(m_match.group(0), "").strip()
+            target_em = discord.utils.get(guild.emojis, name=em_name)
+            if target_em:
+                await target_em.delete()
+                clean_text += f"\n🗑️ 絵文字 `:{em_name}:` を削除しました。"
+
+        if "[LIST_ROLES]" in clean_text:
+            clean_text = clean_text.replace("[LIST_ROLES]", "").strip()
+            role_names = [r.name for r in guild.roles if r.name != "@everyone"][:30]
+            clean_text += f"\n📜 **役職一覧 ({len(guild.roles)}件中30件):**\n" + (", ".join(role_names) if role_names else "なし")
+
+        if "[LIST_INVITES]" in clean_text and me.guild_permissions.manage_guild:
+            clean_text = clean_text.replace("[LIST_INVITES]", "").strip()
+            invites = await guild.invites()
+            inv_lines = [f"・{inv.code} (作成: {inv.inviter}, 使用回数: {inv.uses})" for inv in invites[:5]]
+            clean_text += "\n🔗 **有効招待リンク一覧:**\n" + ("\n".join(inv_lines) if inv_lines else "有効な招待はありません")
+
+        if "[LIST_THREADS]" in clean_text:
+            clean_text = clean_text.replace("[LIST_THREADS]", "").strip()
+            ths = [t.name for t in guild.threads[:15]]
+            clean_text += "\n🧵 **アクティブスレッド一覧:**\n" + (", ".join(ths) if ths else "なし")
+
+        if "[AUDIT_LOGS]" in clean_text and me.guild_permissions.view_audit_log:
+            clean_text = clean_text.replace("[AUDIT_LOGS]", "").strip()
+            logs = []
+            async for entry in guild.audit_logs(limit=5):
+                logs.append(f"・[{entry.created_at.strftime('%m/%d %H:%M')}] {entry.user.display_name} -> {entry.action.name}")
+            clean_text += "\n📋 **直近の監査ログ (5件):**\n" + ("\n".join(logs) if logs else "なし")
+
+    except discord.Forbidden:
+        clean_text += "\n⚠️（Botの権限不足、または操作対象の役職順位がBotより上位のため、一部の操作を実行できませんでした）"
+    except Exception as e:
+        print(f"アクション実行警告: {e}")
 
     return clean_text, image_file
 
@@ -628,8 +859,8 @@ async def mode(ctx, mode_name: str = ""):
         "4": ("normal_full", "🧠【通常：超有能】全管理・画像認識・調査・全解除（メンション要）"),
         "5": ("normal_chat", "💬【通常：純粋会話】記憶あり・完全自由チャット（メンション要）"),
         "6": ("reset_full", "⚡【リセット：単発】毎回記憶ゼロ・全機能・全解除（メンション要）"),
-        "7": ("auto_full", "🚀【自動：無言超有能】メンション不要！常に勝手に反応するMODE4"),
-        "8": ("auto_stream", "📺【自動：配信コメント】メンション不要！文脈に合わせた定型コメ＆リスナー反応")
+        "7": ("auto_full", "🚀【自動：無言超有能】メンション不要！常に勝手に返信(リプライ)するMODE4"),
+        "8": ("auto_stream", "📺【自動：配信コメント】メンション不要！定型コメ＆吉野家コピペ等で即座に返信(リプライ)")
     }
     state = get_state(ctx.channel.id)
     target_key = None
@@ -676,6 +907,7 @@ async def on_message(message):
     is_auto_mode = state["mode"] in ["auto_full", "auto_stream"]
     is_mentioned = bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel)
 
+    # メンションされた場合、または自動モード（auto_full / auto_stream）の場合に処理
     if is_mentioned or is_auto_mode:
         user_text = content
         if not user_text and not message.attachments:
@@ -714,8 +946,6 @@ async def on_message(message):
                     if investigation_data: input_to_gemini += investigation_data
 
                 payload = image_parts + [input_to_gemini] if image_parts else input_to_gemini
-                
-                # 新しい完全切替関数を呼び出し
                 response = await asyncio.to_thread(call_gemini_api, state, payload)
 
                 try:
@@ -728,8 +958,8 @@ async def on_message(message):
 
                 reply_content, generated_img = await handle_special_actions(message, reply_content)
 
-                reply_target = message if is_mentioned else None
-                await send_split_message(message.channel, reply_content, reply_to=reply_target, file=generated_img)
+                # メンション有無に関わらず、発言元メッセージへ確実にDiscord返信（リプライ）
+                await send_split_message(message.channel, reply_content, reply_to=message, file=generated_img)
 
             except Exception as e:
                 await message.reply(f"エラーが発生しました: {e}")
