@@ -15,6 +15,7 @@ import discord
 from discord.ext import commands
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from google.api_core.exceptions import ResourceExhausted
 
 # --- 1. UptimeRobot 常時起動用 Webサーバー ---
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -143,7 +144,7 @@ def _fetch_youtube_sync(video_id):
         try:
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ja', 'en'])
             text = " ".join([t['text'] for t in transcript_list])
-            summary_parts.append(f"■ 字幕・文字起こし:\n{text[:3000]}")
+            summary_parts.append(f"■ 字幕・文字起こし:\n{text[:2000]}")
         except Exception:
             api = YouTubeTranscriptApi()
             t_list = api.list_transcripts(video_id)
@@ -155,7 +156,7 @@ def _fetch_youtube_sync(video_id):
             if transcript:
                 data = transcript.fetch()
                 text = " ".join([t['text'] for t in data])
-                summary_parts.append(f"■ 自動字幕・文字起こし:\n{text[:3000]}")
+                summary_parts.append(f"■ 自動字幕・文字起こし:\n{text[:2000]}")
     except Exception as e:
         summary_parts.append(f"(※YouTube字幕取得制限: {e})")
 
@@ -178,7 +179,7 @@ def _fetch_web_sync(url):
         title = soup.title.string.strip() if soup.title and soup.title.string else "タイトルなし"
         body_text = soup.get_text(separator=" ", strip=True)
         body_text = re.sub(r'\s+', ' ', body_text)
-        return f"\n【参照Web ({url})】\n■ タイトル: {title}\n■ 本文:\n{body_text[:2500]}\n"
+        return f"\n【参照Web ({url})】\n■ タイトル: {title}\n■ 本文:\n{body_text[:1500]}\n"
     except Exception as e:
         return f"\n(URL参照不可: {e})\n"
 
@@ -292,6 +293,18 @@ def create_model_and_session(state):
         system_instruction=sys_instruction
     )
     return model.start_chat(history=[])
+
+# 429レート制限対策：自動待機＆再試行関数
+def send_message_with_retry(session, payload, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return session.send_message(payload)
+        except ResourceExhausted:
+            if attempt < max_retries - 1:
+                import time
+                time.sleep(3.5)
+            else:
+                raise
 
 async def send_split_message(channel, text, reply_to=None, file=None):
     if not text and not file:
@@ -507,7 +520,6 @@ async def handle_special_actions(message, reply_text):
 # --- 6. 過去ログ・チャット調査用サブ関数 ---
 async def fetch_context_investigation(message, text):
     extra_data = ""
-    # ユーザー過去ログ調査の事前取得
     user_match = re.search(r'(?:ログ|発言|チャット|履歴).*(?:調べ|確認|見て|探して|要約)', text)
     if user_match and message.guild:
         target_member = None
@@ -517,10 +529,10 @@ async def fetch_context_investigation(message, text):
                 break
         if target_member:
             found = []
-            async for m in message.channel.history(limit=150):
+            async for m in message.channel.history(limit=100):
                 if m.author.id == target_member.id and m.content:
                     found.append(f"[{m.created_at.strftime('%H:%M')}] {m.clean_content}")
-                if len(found) >= 20: break
+                if len(found) >= 15: break
             if found:
                 extra_data += f"\n【調査対象({target_member.display_name})の直近過去ログ】\n" + "\n".join(found) + "\n"
 
@@ -638,9 +650,14 @@ async def on_message(message):
                 if state["chat_session"] is None or state["mode"] == "reset_full" or (state["mode"] == "grow_age" and state["count"] in [5, 15, 30]):
                     state["chat_session"] = create_model_and_session(state)
 
-                # 4. Geminiへの送信（画像 + テキスト）
+                # 【429対策】履歴が16件を超えたら直近12件に自動スリム化
+                session = state["chat_session"]
+                if hasattr(session, "history") and len(session.history) > 16:
+                    session.history = session.history[-12:]
+
+                # 4. Geminiへの送信（自動リトライ付き）
                 payload = image_parts + [input_to_gemini] if image_parts else input_to_gemini
-                response = await asyncio.to_thread(state["chat_session"].send_message, payload)
+                response = await asyncio.to_thread(send_message_with_retry, session, payload)
 
                 try:
                     reply_content = response.text
