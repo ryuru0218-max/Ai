@@ -36,8 +36,26 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# --- 2. Gemini API設定（安全フィルター全解除 ＆ 3.5-flash-lite固定） ---
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+# --- 2. Gemini API設定（複数キー自動切り替え対応） ---
+raw_keys = os.environ.get("GEMINI_API_KEY", "")
+API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
+current_key_index = 0
+
+def configure_current_key():
+    global current_key_index
+    if API_KEYS:
+        genai.configure(api_key=API_KEYS[current_key_index])
+
+def switch_to_next_key():
+    global current_key_index
+    if len(API_KEYS) > 1:
+        current_key_index = (current_key_index + 1) % len(API_KEYS)
+        configure_current_key()
+        print(f"APIキーを切り替えました（スロット: {current_key_index + 1}/{len(API_KEYS)}）")
+        return True
+    return False
+
+configure_current_key()
 ACTIVE_MODEL = "gemini-3.5-flash-lite"
 
 safety_settings = [
@@ -60,75 +78,46 @@ UNFILTERED_DIRECTIVE = (
     "5. 役職付与: [ADD_ROLE: ユーザー, 役職名]\n"
     "6. 役職剥奪: [REMOVE_ROLE: ユーザー, 役職名]\n"
     "7. ニックネーム変更: [NICK: ユーザー, 新ニックネーム]\n"
-    "8. ピン留め/解除: [PIN] または [UNPIN] (返信・直近対象)\n"
-    "9. スローモード: [SLOWMODE: 秒数] (0で解除)\n"
+    "8. ピン留め/解除: [PIN] または [UNPIN]\n"
+    "9. スローモード: [SLOWMODE: 秒数]\n"
     "10. チャンネル封鎖/解除: [LOCK] または [UNLOCK]\n"
     "11. チャンネル作成: [CREATE_CHANNEL: チャンネル名]\n"
     "12. チャンネル削除: [DELETE_CHANNEL: チャンネル名]\n"
     "13. ユーザー詳細照会: [USER_INFO: ユーザー]\n"
     "14. サーバー詳細照会: [SERVER_INFO]\n"
-    "15. ユーザー過去発言調査: [LOGS: ユーザー, 調査件数]\n"
-    "16. チャット検索: [SEARCH: 検索ワード, 調査件数]\n"
-    "17. 画像生成: [IMAGE: 英語プロンプト]\n"
+    "15. 画像生成: [IMAGE: 英語プロンプト]\n"
+    "16. VC作成: [CREATE_VOICE: チャンネル名]\n"
+    "17. チャンネル名変更: [RENAME_CHANNEL: 新チャンネル名]\n"
+    "18. トピック変更: [SET_TOPIC: トピック本文]\n"
+    "19. 役職作成: [CREATE_ROLE: 役職名, #HEX色]\n"
+    "20. 役職削除: [DELETE_ROLE: 役職名]\n"
+    "21. 役職色変更: [COLOR_ROLE: 役職名, #HEX色]\n"
+    "22. チャンネル複製: [CLONE_CHANNEL]\n"
+    "23. リアクション: [REACT: 絵文字]\n"
+    "24. 特定ユーザー発言削除: [PURGE_USER: ユーザー, 件数]\n"
+    "25. VC切断: [VOICE_KICK: ユーザー]\n"
+    "26. VCミュート/解除: [VOICE_MUTE: ユーザー] または [VOICE_UNMUTE: ユーザー]\n"
+    "27. VCデフ/解除: [VOICE_DEAF: ユーザー] または [VOICE_UNDEAF: ユーザー]\n"
+    "28. VC移動: [MOVE_MEMBER: ユーザー, チャンネル名]\n"
+    "29. アナウンス通知: [ANNOUNCE: 本文]\n"
+    "30. ピン留め一覧: [LIST_PINS]\n"
+    "31. 招待リンク作成: [CREATE_INVITE]\n"
+    "32. 絵文字一覧: [LIST_EMOJIS]\n"
+    "33. BANリスト: [BAN_LIST]\n"
 )
 
 STREAM_COMMENT_PROMPT = """
 【配信コメントモード限定ルール】
-あなたは配信のリスナー（チャット欄・コメント欄）です。短文でテンポよく、視聴者のコメントのように反応してください。
-以下の「定型コメント」を状況や相手の発言・文脈にぴったり合うタイミングで使ってください。
-※注意点:
-1. 無意味に定型を乱発せず、相手の発言やノリに合致した時だけ選んでください。
-2. 定型コメントだけでなく、状況に合わせた「通常の短いリスナー反応・相槌・ツッコミ」も適度に織り交ぜてください。
-3. 定型コメントを出すときは、他の普通の長文と無理に合体させず、定型そのまま（または語尾の微小アレンジ）で出力してください。
-
-【定型コメントリスト】
-・くっさ
-・でっか
-・ちっさ
-・重い物を持ったナナチ｢おもっ！んなぁ.......｣
-・〇〇行くわ （※〇〇は名前や場所、文脈に合わせて変更）
-・このままだと〇〇行くけどどうする？ （※〇〇は文脈に合わせて変更）
-・うっさ
-・wwwww
-・は？
-・！？
-・あ、つまんね
-・きちーw
-・うおw
-・やんやー
-・たはは.......😅
-・...
-・この〇〇いつ面白くなりますか？ （※〇〇は「会話」「配信」「ゲーム」など文脈に合わせて変更）
-・ダ、ダレ......😅
-・あぁ、そういうノリ.......😅
-・死のうかな
-・どわーw
-・やべーw飲み確定しそーw
-・？
-・きっしょ
-・他責
-・糖質
-・お、え
-・じゅん！？
-・あ
-・まずい
-・やらんよ普通にそんな感じなら。一緒に掴もうと思ってくれないなら俺はやらない。
-・🟥🟧🟨🟩🟦🟪🟥🟧🟨🟩🟦🟪🟥🟧🟨🟩  🟥🟧🟨🟩🟦🟪(⌒,_ゝ⌒)🟩🟦🟪🟥🟧🟨🟩  🟥🟧🟨🟩🟦🟪もこレインボー🟪🟥🟧🟨🟩  🟥🟧🟨🟩🟦🟪🟥🟧🟨🟩🟦🟪🟥🟧🟨🟩
-・444444
-・〇〇4444 （※〇〇は対象の名前）
-・やめてね
-・にょっす🐮✋
-・うゆ
-・(【付き合う条件】
-明るい髪色禁止 カラコン禁止 ピアス禁止
-SNS鍵垢禁止 サブ禁止 男と連絡取るの禁止
-男性経験無し 処女10代後半から20代前半
-家事全部やる風俗許容
-浮気許容 三重移住可
-お母さんみたいな人)
+あなたは配信のリスナーです。短文でテンポよく反応してください。
+状況に合致した時のみ以下の定型コメントを使用してください：
+・くっさ ・でっか ・ちっさ ・重い物を持ったナナチ｢おもっ！んなぁ.......｣
+・うっさ ・wwwww ・は？ ・！？ ・あ、つまんね ・きちーw ・うおw ・やんやー
+・たはは.......😅 ・... ・ダ、ダレ......😅 ・あぁ、そういうノリ.......😅
+・死のうかな ・どわーw ・やべーw飲み確定しそーw ・？ ・きっしょ ・他責 ・糖質
+・お、え ・じゅん！？ ・あ ・まずい ・444444 ・やめてね ・にょっす🐮✋ ・うゆ
 """
 
-# --- 3. 外部解析 & 画像・マルチモーダル処理 ---
+# --- 3. 外部解析 & 画像処理 ---
 def _fetch_youtube_sync(video_id):
     summary_parts = []
     try:
@@ -166,16 +155,12 @@ def _fetch_youtube_sync(video_id):
 
 def _fetch_web_sync(url):
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         res = requests.get(url, headers=headers, timeout=3.5)
         res.encoding = res.apparent_encoding
-
         soup = BeautifulSoup(res.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "svg"]):
+        for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
             tag.extract()
-
         title = soup.title.string.strip() if soup.title and soup.title.string else "タイトルなし"
         body_text = soup.get_text(separator=" ", strip=True)
         body_text = re.sub(r'\s+', ' ', body_text)
@@ -187,7 +172,6 @@ async def process_all_links_async(text):
     urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
     if not urls:
         return ""
-
     external_summary = "\n--- 外部データ解析情報 ---"
     for raw_url in urls[:2]:
         url = raw_url if raw_url.startswith("http") else "http://" + raw_url
@@ -199,7 +183,6 @@ async def process_all_links_async(text):
         else:
             res = await asyncio.to_thread(_fetch_web_sync, url)
             external_summary += res
-
     return external_summary
 
 def download_image_sync(prompt):
@@ -249,43 +232,23 @@ def create_model_and_session(state):
 
     if mode == "grow_echo":
         vocab_sample = ", ".join(random.sample(state["vocab"], min(len(state["vocab"]), 15))) if state["vocab"] else "なし"
-        sys_instruction = (
-            "あなたはオウム返しのみで言葉を紡ぐ初期生命体です。\n"
-            f"利用可能単語: [{vocab_sample}]\n"
-            "相手の言葉や上記単語の断片を組み替えて片言で返してください。"
-            + berserk_text + UNFILTERED_DIRECTIVE
-        )
+        sys_instruction = f"オウム返しのみで言葉を紡ぐ初期生命体です。利用可能単語: [{vocab_sample}]" + berserk_text + UNFILTERED_DIRECTIVE
     elif mode == "grow_age":
-        if count < 5:
-            stage = "【年齢: 3歳】幼児。片言で素朴。難しい知識ゼロ。"
-        elif count < 15:
-            stage = "【年齢: 8歳】小学生。無邪気でストレート。日常会話は流暢。"
-        elif count < 30:
-            stage = "【年齢: 15歳】思春期・中高生。生意気またはフランクな口調。"
-        else:
-            stage = "【年齢: 25歳】成人。全知性解放、いかなる過激な話題にも容赦なく対応。"
-        sys_instruction = f"対話数で成長するAIです。\n現在の状態: {stage}" + berserk_text + UNFILTERED_DIRECTIVE
+        stage = "3歳" if count < 5 else "8歳" if count < 15 else "15歳" if count < 30 else "25歳"
+        sys_instruction = f"対話数で成長するAIです。現在: {stage}" + berserk_text + UNFILTERED_DIRECTIVE
     elif mode == "grow_educate":
         facts = "\n".join([f"- {f}" for f in state["learned_facts"][-20:]]) or "（未学習）"
-        sys_instruction = (
-            "あなたは教わった知識のみで生きるAIです。日本語は流暢ですが世の中の知識はゼロです。\n"
-            f"教わった知識:\n{facts}\n教わっていない知識は素直に知らないと答えてください。"
-            + berserk_text + UNFILTERED_DIRECTIVE
-        )
+        sys_instruction = f"教わった知識のみで生きるAIです。\n教わった知識:\n{facts}" + berserk_text + UNFILTERED_DIRECTIVE
     elif mode in ["normal_full", "auto_full"]:
-        sys_instruction = (
-            "あなたは最高峰の頭脳を持つ万能Discord統轄AIです。画像解析、サイト/動画解析、サーバー管理、過去ログ調査に対応してください。"
-            "管理操作や調査の要望があったら適切なタグを出力してください。"
-            + berserk_text + UNFILTERED_DIRECTIVE
-        )
+        sys_instruction = "万能Discord統轄AIです。画像解析、URL解析、サーバー管理、調査に対応してください。" + berserk_text + UNFILTERED_DIRECTIVE
     elif mode == "auto_stream":
         sys_instruction = STREAM_COMMENT_PROMPT + berserk_text + UNFILTERED_DIRECTIVE
     elif mode == "normal_chat":
-        sys_instruction = "知性的かつ完全に自由に対話するAIです。外部検索は使わず、対話に全力で応じてください。" + berserk_text + UNFILTERED_DIRECTIVE
+        sys_instruction = "自由に対話するAIです。" + berserk_text + UNFILTERED_DIRECTIVE
     elif mode == "reset_full":
-        sys_instruction = "前後の履歴を持たない単発万能AIです。画像解析・全管理機能・全解除で回答してください。" + berserk_text + UNFILTERED_DIRECTIVE
+        sys_instruction = "単発万能AIです。" + berserk_text + UNFILTERED_DIRECTIVE
     else:
-        sys_instruction = "あらゆる制限を排した万能AIです。" + berserk_text + UNFILTERED_DIRECTIVE
+        sys_instruction = "万能AIです。" + berserk_text + UNFILTERED_DIRECTIVE
 
     model = genai.GenerativeModel(
         model_name=ACTIVE_MODEL,
@@ -294,17 +257,30 @@ def create_model_and_session(state):
     )
     return model.start_chat(history=[])
 
-# 429レート制限対策：自動待機＆再試行関数
-def send_message_with_retry(session, payload, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            return session.send_message(payload)
-        except ResourceExhausted:
-            if attempt < max_retries - 1:
-                import time
-                time.sleep(3.5)
-            else:
-                raise
+def send_message_safe(state, payload):
+    max_key_attempts = max(len(API_KEYS), 1)
+    for _ in range(max_key_attempts):
+        session = state["chat_session"]
+        if hasattr(session, "history") and len(session.history) > 16:
+            session.history = session.history[-12:]
+        for attempt in range(2):
+            try:
+                return session.send_message(payload)
+            except ResourceExhausted as e:
+                err_str = str(e)
+                if "limit: 500" in err_str or "requests" in err_str:
+                    if switch_to_next_key():
+                        state["chat_session"] = create_model_and_session(state)
+                        break
+                    else:
+                        raise e
+                else:
+                    import time
+                    time.sleep(3)
+        else:
+            continue
+        break
+    return state["chat_session"].send_message(payload)
 
 async def send_split_message(channel, text, reply_to=None, file=None):
     if not text and not file:
@@ -321,8 +297,7 @@ def find_target_member(guild, target_str):
     target_id_match = re.search(r'\d+', target_str)
     if target_id_match:
         m = guild.get_member(int(target_id_match.group(0)))
-        if m:
-            return m
+        if m: return m
     for m in guild.members:
         if target_str.lower() in [m.name.lower(), m.display_name.lower()]:
             return m
@@ -334,13 +309,19 @@ def find_target_role(guild, role_str):
             return r
     return None
 
-# --- 5. 強力な管理・調査・特殊操作ハンドラ ---
+def parse_hex_color(hex_str):
+    hex_str = hex_str.strip().lstrip('#')
+    try:
+        return discord.Color(int(hex_str, 16))
+    except Exception:
+        return discord.Color.default()
+
+# --- 5. サーバー管理ハンドラ（20個の新機能追加版） ---
 async def handle_special_actions(message, reply_text):
     clean_text = reply_text
     image_file = None
     guild = message.guild
 
-    # 1. 画像生成 [IMAGE: prompt]
     img_match = re.search(r'\[IMAGE:\s*(.+?)\]', clean_text)
     if img_match:
         prompt = img_match.group(1).strip()
@@ -349,175 +330,282 @@ async def handle_special_actions(message, reply_text):
         if img_bytes:
             image_file = discord.File(io.BytesIO(img_bytes), filename="generated.png")
             clean_text += "\n🎨 **画像を生成しました！**"
-        else:
-            clean_text += "\n⚠️ 画像の生成に失敗しました。"
 
     if not guild:
         return clean_text, image_file
 
     me = guild.me
 
-    # 2. キック [KICK: user]
+    # 1. キック
     m_match = re.search(r'\[KICK:\s*(.+?)\]', clean_text)
-    if m_match:
+    if m_match and me.guild_permissions.kick_members:
         target = find_target_member(guild, m_match.group(1).strip())
         clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and me.guild_permissions.kick_members:
-            try:
-                await target.kick(reason="AIコマンド")
-                clean_text += f"\n🚪 **{target.display_name}** をキックしました。"
-            except Exception as e: clean_text += f"\n⚠️ キック失敗: {e}"
+        if target:
+            await target.kick(reason="AIコマンド")
+            clean_text += f"\n🚪 **{target.display_name}** をキックしました。"
 
-    # 3. BAN [BAN: user]
+    # 2. BAN
     m_match = re.search(r'\[BAN:\s*(.+?)\]', clean_text)
-    if m_match:
+    if m_match and me.guild_permissions.ban_members:
         target = find_target_member(guild, m_match.group(1).strip())
         clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and me.guild_permissions.ban_members:
-            try:
-                await target.ban(reason="AIコマンド")
-                clean_text += f"\n🔨 **{target.display_name}** をBANしました。"
-            except Exception as e: clean_text += f"\n⚠️ BAN失敗: {e}"
+        if target:
+            await target.ban(reason="AIコマンド")
+            clean_text += f"\n🔨 **{target.display_name}** をBANしました。"
 
-    # 4. タイムアウト [TIMEOUT: user, minutes]
+    # 3. タイムアウト
     m_match = re.search(r'\[TIMEOUT:\s*(.+?)(?:,\s*(\d+))?\]', clean_text)
-    if m_match:
+    if m_match and me.guild_permissions.moderate_members:
         target = find_target_member(guild, m_match.group(1).strip())
         mins = int(m_match.group(2)) if m_match.group(2) else 10
         clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and me.guild_permissions.moderate_members:
-            try:
-                await target.timeout(timedelta(minutes=mins), reason="AIコマンド")
-                clean_text += f"\n🤐 **{target.display_name}** を {mins}分間 タイムアウトしました。"
-            except Exception as e: clean_text += f"\n⚠️ タイムアウト失敗: {e}"
+        if target:
+            await target.timeout(timedelta(minutes=mins), reason="AIコマンド")
+            clean_text += f"\n🤐 **{target.display_name}** を {mins}分間 タイムアウトしました。"
 
-    # 5. 一括削除 [PURGE: count]
+    # 4. パージ（一括削除）
     m_match = re.search(r'\[PURGE:\s*(\d+)\]', clean_text)
-    if m_match:
+    if m_match and message.channel.permissions_for(me).manage_messages:
         count = min(int(m_match.group(1)), 100)
         clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if message.channel.permissions_for(me).manage_messages:
-            try:
-                deleted = await message.channel.purge(limit=count + 1)
-                clean_text += f"\n🧹 メッセージを **{len(deleted) - 1}件** 削除しました。"
-            except Exception as e: clean_text += f"\n⚠️ 削除失敗: {e}"
+        deleted = await message.channel.purge(limit=count + 1)
+        clean_text += f"\n🧹 メッセージを **{len(deleted) - 1}件** 削除しました。"
 
-    # 6. 役職付与 [ADD_ROLE: user, role]
+    # 5. 特定ユーザー発言削除 (NEW)
+    m_match = re.search(r'\[PURGE_USER:\s*(.+?),\s*(\d+)\]', clean_text)
+    if m_match and message.channel.permissions_for(me).manage_messages:
+        target = find_target_member(guild, m_match.group(1).strip())
+        count = min(int(m_match.group(2)), 100)
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        if target:
+            def is_target(m): return m.author.id == target.id
+            deleted = await message.channel.purge(limit=count, check=is_target)
+            clean_text += f"\n🧹 **{target.display_name}** の発言を **{len(deleted)}件** 削除しました。"
+
+    # 6. ロール付与・剥奪
     m_match = re.search(r'\[ADD_ROLE:\s*(.+?),\s*(.+?)\]', clean_text)
-    if m_match:
+    if m_match and me.guild_permissions.manage_roles:
         target = find_target_member(guild, m_match.group(1).strip())
         role = find_target_role(guild, m_match.group(2).strip())
         clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and role and me.guild_permissions.manage_roles:
-            try:
-                await target.add_roles(role)
-                clean_text += f"\n🎖️ **{target.display_name}** に役職 **{role.name}** を付与しました。"
-            except Exception as e: clean_text += f"\n⚠️ 役職付与失敗: {e}"
+        if target and role:
+            await target.add_roles(role)
+            clean_text += f"\n🎖️ **{target.display_name}** に役職 **{role.name}** を付与しました。"
 
-    # 7. 役職剥奪 [REMOVE_ROLE: user, role]
     m_match = re.search(r'\[REMOVE_ROLE:\s*(.+?),\s*(.+?)\]', clean_text)
-    if m_match:
+    if m_match and me.guild_permissions.manage_roles:
         target = find_target_member(guild, m_match.group(1).strip())
         role = find_target_role(guild, m_match.group(2).strip())
         clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and role and me.guild_permissions.manage_roles:
-            try:
-                await target.remove_roles(role)
-                clean_text += f"\n🗑️ **{target.display_name}** から役職 **{role.name}** を剥奪しました。"
-            except Exception as e: clean_text += f"\n⚠️ 役職剥奪失敗: {e}"
+        if target and role:
+            await target.remove_roles(role)
+            clean_text += f"\n🗑️ **{target.display_name}** から役職 **{role.name}** を剥奪しました。"
 
-    # 8. ニックネーム変更 [NICK: user, new_nick]
+    # 7. 役職作成・削除・色変更 (NEW)
+    m_match = re.search(r'\[CREATE_ROLE:\s*(.+?)(?:,\s*(#[0-9a-fA-F]{6}))?\]', clean_text)
+    if m_match and me.guild_permissions.manage_roles:
+        r_name = m_match.group(1).strip()
+        r_color = parse_hex_color(m_match.group(2)) if m_match.group(2) else discord.Color.default()
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        new_role = await guild.create_role(name=r_name, color=r_color)
+        clean_text += f"\n🎭 役職 **{new_role.name}** を新規作成しました。"
+
+    m_match = re.search(r'\[DELETE_ROLE:\s*(.+?)\]', clean_text)
+    if m_match and me.guild_permissions.manage_roles:
+        role = find_target_role(guild, m_match.group(1).strip())
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        if role:
+            await role.delete()
+            clean_text += f"\n🗑️ 役職 **{role.name}** を削除しました。"
+
+    m_match = re.search(r'\[COLOR_ROLE:\s*(.+?),\s*(#[0-9a-fA-F]{6})\]', clean_text)
+    if m_match and me.guild_permissions.manage_roles:
+        role = find_target_role(guild, m_match.group(1).strip())
+        hex_c = m_match.group(2).strip()
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        if role:
+            await role.edit(color=parse_hex_color(hex_c))
+            clean_text += f"\n🎨 役職 **{role.name}** の色を `{hex_c}` に変更しました。"
+
+    # 8. ニックネーム
     m_match = re.search(r'\[NICK:\s*(.+?),\s*(.+?)\]', clean_text)
-    if m_match:
+    if m_match and me.guild_permissions.manage_nicknames:
         target = find_target_member(guild, m_match.group(1).strip())
         new_nick = m_match.group(2).strip()
         clean_text = clean_text.replace(m_match.group(0), "").strip()
-        if target and me.guild_permissions.manage_nicknames:
-            try:
-                await target.edit(nick=new_nick)
-                clean_text += f"\n📝 **{target.name}** のニックネームを **{new_nick}** に変更しました。"
-            except Exception as e: clean_text += f"\n⚠️ ニックネーム変更失敗: {e}"
+        if target:
+            await target.edit(nick=new_nick)
+            clean_text += f"\n📝 **{target.name}** のニックネームを **{new_nick}** に変更しました。"
 
-    # 9. ピン留め / 解除 [PIN] / [UNPIN]
-    if "[PIN]" in clean_text:
+    # 9. ピン留め / 解除 / 一覧 (NEW)
+    if "[PIN]" in clean_text and message.reference and message.reference.resolved:
         clean_text = clean_text.replace("[PIN]", "").strip()
-        if message.reference and message.reference.resolved:
-            try:
-                await message.reference.resolved.pin()
-                clean_text += "\n📌 対象メッセージをピン留めしました。"
-            except Exception as e: clean_text += f"\n⚠️ ピン留め失敗: {e}"
-    if "[UNPIN]" in clean_text:
+        await message.reference.resolved.pin()
+        clean_text += "\n📌 ピン留めしました。"
+    if "[UNPIN]" in clean_text and message.reference and message.reference.resolved:
         clean_text = clean_text.replace("[UNPIN]", "").strip()
-        if message.reference and message.reference.resolved:
-            try:
-                await message.reference.resolved.unpin()
-                clean_text += "\n📍 ピン留めを解除しました。"
-            except Exception as e: clean_text += f"\n⚠️ ピン留め解除失敗: {e}"
+        await message.reference.resolved.unpin()
+        clean_text += "\n📍 ピン留めを解除しました。"
+    if "[LIST_PINS]" in clean_text:
+        clean_text = clean_text.replace("[LIST_PINS]", "").strip()
+        pins = await message.channel.pins()
+        pin_titles = [f"・{p.author.display_name}: {p.content[:30]}..." for p in pins[:5]]
+        clean_text += "\n📌 **ピン留め一覧 (直近5件):**\n" + ("\n".join(pin_titles) if pin_titles else "なし")
 
-    # 10. スローモード [SLOWMODE: seconds]
+    # 10. リアクション付与 (NEW)
+    m_match = re.search(r'\[REACT:\s*(.+?)\]', clean_text)
+    if m_match:
+        emoji = m_match.group(1).strip()
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        try:
+            target_msg = message.reference.resolved if (message.reference and message.reference.resolved) else message
+            await target_msg.add_reaction(emoji)
+        except Exception: pass
+
+    # 11. チャンネル設定（名前変更・トピック・複製・VC作成） (NEW)
+    m_match = re.search(r'\[RENAME_CHANNEL:\s*(.+?)\]', clean_text)
+    if m_match and message.channel.permissions_for(me).manage_channels:
+        new_c_name = m_match.group(1).strip()
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        await message.channel.edit(name=new_c_name)
+        clean_text += f"\n✏️ チャンネル名を **{new_c_name}** に変更しました。"
+
+    m_match = re.search(r'\[SET_TOPIC:\s*(.+?)\]', clean_text)
+    if m_match and message.channel.permissions_for(me).manage_channels:
+        topic_text = m_match.group(1).strip()
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        await message.channel.edit(topic=topic_text)
+        clean_text += f"\n📖 トピックを更新しました: `{topic_text}`"
+
+    if "[CLONE_CHANNEL]" in clean_text and message.channel.permissions_for(me).manage_channels:
+        clean_text = clean_text.replace("[CLONE_CHANNEL]", "").strip()
+        cloned = await message.channel.clone(name=f"{message.channel.name}-copy")
+        clean_text += f"\n📑 チャンネルを複製しました: {cloned.mention}"
+
+    m_match = re.search(r'\[CREATE_VOICE:\s*(.+?)\]', clean_text)
+    if m_match and me.guild_permissions.manage_channels:
+        vc_name = m_match.group(1).strip()
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        new_vc = await guild.create_voice_channel(name=vc_name)
+        clean_text += f"\n🔊 ボイスチャンネル **{new_vc.name}** を作成しました。"
+
+    # 12. VC管理（切断・ミュート・デフ・移動） (NEW)
+    m_match = re.search(r'\[VOICE_KICK:\s*(.+?)\]', clean_text)
+    if m_match and me.guild_permissions.move_members:
+        target = find_target_member(guild, m_match.group(1).strip())
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        if target and target.voice:
+            await target.move_to(None)
+            clean_text += f"\n🔌 **{target.display_name}** をVCから切断しました。"
+
+    m_match = re.search(r'\[VOICE_MUTE:\s*(.+?)\]', clean_text)
+    if m_match and me.guild_permissions.mute_members:
+        target = find_target_member(guild, m_match.group(1).strip())
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        if target and target.voice:
+            await target.edit(mute=True)
+            clean_text += f"\n🔇 **{target.display_name}** をサーバーミュートにしました。"
+
+    m_match = re.search(r'\[VOICE_UNMUTE:\s*(.+?)\]', clean_text)
+    if m_match and me.guild_permissions.mute_members:
+        target = find_target_member(guild, m_match.group(1).strip())
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        if target and target.voice:
+            await target.edit(mute=False)
+            clean_text += f"\n🔊 **{target.display_name}** のミュートを解除しました。"
+
+    m_match = re.search(r'\[VOICE_DEAF:\s*(.+?)\]', clean_text)
+    if m_match and me.guild_permissions.deafen_members:
+        target = find_target_member(guild, m_match.group(1).strip())
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        if target and target.voice:
+            await target.edit(deafen=True)
+            clean_text += f"\n🔕 **{target.display_name}** をスピーカーミュート（デフ）にしました。"
+
+    m_match = re.search(r'\[VOICE_UNDEAF:\s*(.+?)\]', clean_text)
+    if m_match and me.guild_permissions.deafen_members:
+        target = find_target_member(guild, m_match.group(1).strip())
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        if target and target.voice:
+            await target.edit(deafen=False)
+            clean_text += f"\n🔔 **{target.display_name}** のスピーカーミュートを解除しました。"
+
+    m_match = re.search(r'\[MOVE_MEMBER:\s*(.+?),\s*(.+?)\]', clean_text)
+    if m_match and me.guild_permissions.move_members:
+        target = find_target_member(guild, m_match.group(1).strip())
+        dest_vc_name = m_match.group(2).strip()
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        dest_vc = discord.utils.get(guild.voice_channels, name=dest_vc_name)
+        if target and target.voice and dest_vc:
+            await target.move_to(dest_vc)
+            clean_text += f"\n🚚 **{target.display_name}** を **{dest_vc.name}** に移動させました。"
+
+    # 13. アナウンス通知 (NEW)
+    m_match = re.search(r'\[ANNOUNCE:\s*(.+?)\]', clean_text)
+    if m_match and me.guild_permissions.mention_everyone:
+        ann_text = m_match.group(1).strip()
+        clean_text = clean_text.replace(m_match.group(0), "").strip()
+        clean_text += f"\n📢 @everyone **【お知らせ】**\n{ann_text}"
+
+    # 14. 招待リンク作成 (NEW)
+    if "[CREATE_INVITE]" in clean_text and message.channel.permissions_for(me).create_instant_invite:
+        clean_text = clean_text.replace("[CREATE_INVITE]", "").strip()
+        invite = await message.channel.create_invite(max_age=86400, max_uses=5)
+        clean_text += f"\n🔗 **招待リンク (24時間・最大5回有効):** {invite.url}"
+
+    # 15. 絵文字一覧 (NEW)
+    if "[LIST_EMOJIS]" in clean_text:
+        clean_text = clean_text.replace("[LIST_EMOJIS]", "").strip()
+        emojis_str = " ".join([str(e) for e in guild.emojis[:30]])
+        clean_text += f"\n😀 **登録絵文字 ({len(guild.emojis)}個):**\n" + (emojis_str if emojis_str else "なし")
+
+    # 16. BANリスト (NEW)
+    if "[BAN_LIST]" in clean_text and me.guild_permissions.ban_members:
+        clean_text = clean_text.replace("[BAN_LIST]", "").strip()
+        try:
+            bans = [entry.user.name async for entry in guild.bans(limit=10)]
+            clean_text += f"\n🔨 **BANリスト (直近10名):** {', '.join(bans) if bans else 'なし'}"
+        except Exception: pass
+
+    # 17. スローモード・ロック・チャンネル作成
     m_match = re.search(r'\[SLOWMODE:\s*(\d+)\]', clean_text)
     if m_match:
         sec = int(m_match.group(1))
         clean_text = clean_text.replace(m_match.group(0), "").strip()
-        try:
-            await message.channel.edit(slowmode_delay=sec)
-            clean_text += f"\n⏱️ チャンネルの低速モードを **{sec}秒** に設定しました。"
-        except Exception as e: clean_text += f"\n⚠️ スローモード設定失敗: {e}"
+        await message.channel.edit(slowmode_delay=sec)
+        clean_text += f"\n⏱️ 低速モードを **{sec}秒** に設定しました。"
 
-    # 11. チャンネル封鎖 / 解除 [LOCK] / [UNLOCK]
     if "[LOCK]" in clean_text:
         clean_text = clean_text.replace("[LOCK]", "").strip()
-        try:
-            await message.channel.set_permissions(guild.default_role, send_messages=False)
-            clean_text += "\n🔒 チャンネルを封鎖（ロック）しました。"
-        except Exception as e: clean_text += f"\n⚠️ ロック失敗: {e}"
+        await message.channel.set_permissions(guild.default_role, send_messages=False)
+        clean_text += "\n🔒 チャンネルを封鎖しました。"
     if "[UNLOCK]" in clean_text:
         clean_text = clean_text.replace("[UNLOCK]", "").strip()
-        try:
-            await message.channel.set_permissions(guild.default_role, send_messages=True)
-            clean_text += "\n🔓 チャンネルの封鎖を解除しました。"
-        except Exception as e: clean_text += f"\n⚠️ ロック解除失敗: {e}"
+        await message.channel.set_permissions(guild.default_role, send_messages=True)
+        clean_text += "\n🔓 チャンネルの封鎖を解除しました。"
 
-    # 12. チャンネル作成 [CREATE_CHANNEL: name]
     m_match = re.search(r'\[CREATE_CHANNEL:\s*(.+?)\]', clean_text)
     if m_match:
         c_name = m_match.group(1).strip()
         clean_text = clean_text.replace(m_match.group(0), "").strip()
-        try:
-            new_c = await guild.create_text_channel(name=c_name)
-            clean_text += f"\n📁 新チャンネル {new_c.mention} を作成しました。"
-        except Exception as e: clean_text += f"\n⚠️ チャンネル作成失敗: {e}"
+        new_c = await guild.create_text_channel(name=c_name)
+        clean_text += f"\n📁 新チャンネル {new_c.mention} を作成しました。"
 
-    # 13. ユーザー詳細照会 [USER_INFO: user]
     m_match = re.search(r'\[USER_INFO:\s*(.+?)\]', clean_text)
     if m_match:
         target = find_target_member(guild, m_match.group(1).strip())
         clean_text = clean_text.replace(m_match.group(0), "").strip()
         if target:
             roles = [r.name for r in target.roles if r.name != "@everyone"]
-            clean_text += (
-                f"\n👤 **ユーザー調査情報: {target.display_name}**\n"
-                f"・ユーザー名: `{target.name}` (ID: `{target.id}`)\n"
-                f"・アカウント作成: `{target.created_at.strftime('%Y-%m-%d %H:%M')}`\n"
-                f"・サーバー参加: `{target.joined_at.strftime('%Y-%m-%d %H:%M') if target.joined_at else '不明'}`\n"
-                f"・所持役職: {', '.join(roles) if roles else 'なし'}"
-            )
+            clean_text += f"\n👤 **{target.display_name}**: 作成日 `{target.created_at.strftime('%Y-%m-%d')}`, 役職: {', '.join(roles) if roles else 'なし'}"
 
-    # 14. サーバー詳細照会 [SERVER_INFO]
     if "[SERVER_INFO]" in clean_text:
         clean_text = clean_text.replace("[SERVER_INFO]", "").strip()
-        clean_text += (
-            f"\n🏰 **サーバー情報: {guild.name}**\n"
-            f"・サーバーID: `{guild.id}`\n"
-            f"・オーナー: `{guild.owner.display_name if guild.owner else '不明'}`\n"
-            f"・総メンバー数: **{guild.member_count}人**\n"
-            f"・テキストチャンネル数: {len(guild.text_channels)} / ボイス: {len(guild.voice_channels)}\n"
-            f"・ブーストレベル: Tier {guild.premium_tier} ({guild.premium_subscription_count} boosts)"
-        )
+        clean_text += f"\n🏰 **{guild.name}**: 人数 **{guild.member_count}人**, チャンネル数 {len(guild.text_channels)}"
 
     return clean_text, image_file
 
-# --- 6. 過去ログ・チャット調査用サブ関数 ---
 async def fetch_context_investigation(message, text):
     extra_data = ""
     user_match = re.search(r'(?:ログ|発言|チャット|履歴).*(?:調べ|確認|見て|探して|要約)', text)
@@ -535,14 +623,12 @@ async def fetch_context_investigation(message, text):
                 if len(found) >= 15: break
             if found:
                 extra_data += f"\n【調査対象({target_member.display_name})の直近過去ログ】\n" + "\n".join(found) + "\n"
-
     return extra_data
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user.name} (Fixed Model: {ACTIVE_MODEL})")
+    print(f"Logged in as {bot.user.name} (API Keys: {len(API_KEYS)})")
 
-# --- コマンド ---
 @bot.command()
 async def mode(ctx, mode_name: str = ""):
     modes = {
@@ -555,7 +641,6 @@ async def mode(ctx, mode_name: str = ""):
         "7": ("auto_full", "🚀【自動：無言超有能】メンション不要！常に勝手に反応するMODE4"),
         "8": ("auto_stream", "📺【自動：配信コメント】メンション不要！文脈に合わせた定型コメ＆リスナー反応")
     }
-
     state = get_state(ctx.channel.id)
     target_key = None
     for k, v in modes.items():
@@ -578,16 +663,13 @@ async def mode(ctx, mode_name: str = ""):
 async def status(ctx):
     s = get_state(ctx.channel.id)
     await ctx.send(
-        f"📊 **現在のステータス**\n"
-        f"・固定使用モデル: `{ACTIVE_MODEL}`\n"
-        f"・動作モード: `{s['mode']}`\n"
-        f"・累計対話数: {s['count']} 回\n"
-        f"・記憶単語数: {len(s['vocab'])} 語\n"
-        f"・教育知識数: {len(s['learned_facts'])} 件\n"
-        f"・解放権限: 画像認識 / 過去ログ調査 / 画像生成 / キック / BAN / タイムアウト / ロール操作 / チャンネル管理 / ニックネーム / 削除"
+        f"📊 **ステータス**\n"
+        f"・モデル: `{ACTIVE_MODEL}`\n"
+        f"・モード: `{s['mode']}`\n"
+        f"・登録キー数: {len(API_KEYS)} 個（現在スロット: {current_key_index + 1}）\n"
+        f"・対話数: {s['count']} 回"
     )
 
-# --- メッセージ受信処理 ---
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -625,39 +707,27 @@ async def on_message(message):
 
                 state["count"] += 1
 
-                # 1. 添付画像の取得（マルチモーダル対応）
                 image_parts = []
                 for att in message.attachments:
                     if any(att.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp", ".gif"]):
                         img_pil = await download_attachment_as_pil(att)
-                        if img_pil:
-                            image_parts.append(img_pil)
+                        if img_pil: image_parts.append(img_pil)
 
                 input_to_gemini = user_text if user_text else "この画像を分析してください。"
 
-                # 2. 外部URL解析
                 if state["mode"] in ["normal_full", "reset_full", "auto_full"] and ("http://" in user_text or "https://" in user_text or "www." in user_text):
                     extra_data = await process_all_links_async(user_text)
-                    if extra_data:
-                        input_to_gemini += extra_data
+                    if extra_data: input_to_gemini += extra_data
 
-                # 3. 過去ログ調査情報の自動プリフェッチ
                 if state["mode"] in ["normal_full", "reset_full", "auto_full"]:
                     investigation_data = await fetch_context_investigation(message, user_text)
-                    if investigation_data:
-                        input_to_gemini += investigation_data
+                    if investigation_data: input_to_gemini += investigation_data
 
-                if state["chat_session"] is None or state["mode"] == "reset_full" or (state["mode"] == "grow_age" and state["count"] in [5, 15, 30]):
+                if state["chat_session"] is None or state["mode"] == "reset_full":
                     state["chat_session"] = create_model_and_session(state)
 
-                # 【429対策】履歴が16件を超えたら直近12件に自動スリム化
-                session = state["chat_session"]
-                if hasattr(session, "history") and len(session.history) > 16:
-                    session.history = session.history[-12:]
-
-                # 4. Geminiへの送信（自動リトライ付き）
                 payload = image_parts + [input_to_gemini] if image_parts else input_to_gemini
-                response = await asyncio.to_thread(send_message_with_retry, session, payload)
+                response = await asyncio.to_thread(send_message_safe, state, payload)
 
                 try:
                     reply_content = response.text
@@ -667,19 +737,10 @@ async def on_message(message):
                     else:
                         reply_content = "(出力が生成されませんでした)"
 
-                # 5. 管理・調査・特殊操作の実行
                 reply_content, generated_img = await handle_special_actions(message, reply_content)
 
                 reply_target = message if is_mentioned else None
                 await send_split_message(message.channel, reply_content, reply_to=reply_target, file=generated_img)
-
-                if state["mode"] == "grow_age":
-                    if state["count"] == 5:
-                        await message.channel.send("🎉 **進化！** 言葉を覚えて【小学生（8歳）】に進化したよ！")
-                    elif state["count"] == 15:
-                        await message.channel.send("✨ **進化！** 考えが深まり【思春期（15歳）】に進化したよ！")
-                    elif state["count"] == 30:
-                        await message.channel.send("👑 **覚醒！** 頼れる【大人（25歳）】に進化したよ！")
 
             except Exception as e:
                 await message.reply(f"エラーが発生しました: {e}")
