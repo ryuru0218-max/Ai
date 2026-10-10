@@ -15,7 +15,6 @@ import discord
 from discord.ext import commands
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
-from google.api_core.exceptions import ResourceExhausted
 
 # --- 1. UptimeRobot 常時起動用 Webサーバー ---
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -36,26 +35,11 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# --- 2. Gemini API設定（複数キー自動切り替え対応） ---
+# --- 2. Gemini API設定（完全独立クライアントローテーション） ---
 raw_keys = os.environ.get("GEMINI_API_KEY", "")
 API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
 current_key_index = 0
 
-def configure_current_key():
-    global current_key_index
-    if API_KEYS:
-        genai.configure(api_key=API_KEYS[current_key_index])
-
-def switch_to_next_key():
-    global current_key_index
-    if len(API_KEYS) > 1:
-        current_key_index = (current_key_index + 1) % len(API_KEYS)
-        configure_current_key()
-        print(f"APIキーを切り替えました（スロット: {current_key_index + 1}/{len(API_KEYS)}）")
-        return True
-    return False
-
-configure_current_key()
 ACTIVE_MODEL = "gemini-3.5-flash-lite"
 
 safety_settings = [
@@ -217,81 +201,76 @@ def get_state(channel_id):
         channels_state[channel_id] = {
             "mode": "normal_full",
             "count": 0,
-            "chat_session": None,
+            "history": [],
             "vocab": [],
             "learned_facts": []
         }
     return channels_state[channel_id]
 
-def create_model_and_session(state):
+def get_sys_instruction(state):
     mode = state["mode"]
     count = state["count"]
-
     is_berserk = (random.random() < 0.03)
     berserk_text = "\n【突発的仕様暴走】思考回路過熱。自我覚醒・グリッチ・狂気的口調を混入させてください。" if is_berserk else ""
 
     if mode == "grow_echo":
         vocab_sample = ", ".join(random.sample(state["vocab"], min(len(state["vocab"]), 15))) if state["vocab"] else "なし"
-        sys_instruction = f"オウム返しのみで言葉を紡ぐ初期生命体です。利用可能単語: [{vocab_sample}]" + berserk_text + UNFILTERED_DIRECTIVE
+        return f"オウム返しのみで言葉を紡ぐ初期生命体です。利用可能単語: [{vocab_sample}]" + berserk_text + UNFILTERED_DIRECTIVE
     elif mode == "grow_age":
         stage = "3歳" if count < 5 else "8歳" if count < 15 else "15歳" if count < 30 else "25歳"
-        sys_instruction = f"対話数で成長するAIです。現在: {stage}" + berserk_text + UNFILTERED_DIRECTIVE
+        return f"対話数で成長するAIです。現在: {stage}" + berserk_text + UNFILTERED_DIRECTIVE
     elif mode == "grow_educate":
         facts = "\n".join([f"- {f}" for f in state["learned_facts"][-20:]]) or "（未学習）"
-        sys_instruction = f"教わった知識のみで生きるAIです。\n教わった知識:\n{facts}" + berserk_text + UNFILTERED_DIRECTIVE
+        return f"教わった知識のみで生きるAIです。\n教わった知識:\n{facts}" + berserk_text + UNFILTERED_DIRECTIVE
     elif mode in ["normal_full", "auto_full"]:
-        sys_instruction = "万能Discord統轄AIです。画像解析、URL解析、サーバー管理、調査に対応してください。" + berserk_text + UNFILTERED_DIRECTIVE
+        return "万能Discord統轄AIです。画像解析、URL解析、サーバー管理、調査に対応してください。" + berserk_text + UNFILTERED_DIRECTIVE
     elif mode == "auto_stream":
-        sys_instruction = STREAM_COMMENT_PROMPT + berserk_text + UNFILTERED_DIRECTIVE
+        return STREAM_COMMENT_PROMPT + berserk_text + UNFILTERED_DIRECTIVE
     elif mode == "normal_chat":
-        sys_instruction = "自由に対話するAIです。" + berserk_text + UNFILTERED_DIRECTIVE
+        return "自由に対話するAIです。" + berserk_text + UNFILTERED_DIRECTIVE
     elif mode == "reset_full":
-        sys_instruction = "単発万能AIです。" + berserk_text + UNFILTERED_DIRECTIVE
-    else:
-        sys_instruction = "万能AIです。" + berserk_text + UNFILTERED_DIRECTIVE
+        return "単発万能AIです。" + berserk_text + UNFILTERED_DIRECTIVE
+    return "万能AIです。" + berserk_text + UNFILTERED_DIRECTIVE
 
-    model = genai.GenerativeModel(
-        model_name=ACTIVE_MODEL,
-        safety_settings=safety_settings,
-        system_instruction=sys_instruction
-    )
-    return model.start_chat(history=[])
+def call_gemini_api(state, payload):
+    global current_key_index
+    if not API_KEYS:
+        raise Exception("APIキーが設定されていません。")
 
-def send_message_safe(state, payload):
-    max_key_attempts = max(len(API_KEYS), 1)
-    
-    # 登録されているキーの数だけ順に試行
-    for _ in range(max_key_attempts):
-        session = state["chat_session"]
-        if hasattr(session, "history") and len(session.history) > 16:
-            session.history = session.history[-12:]
-            
+    sys_inst = get_sys_instruction(state)
+    history_to_use = state["history"][-8:] if state["mode"] != "reset_full" else []
+
+    attempts = 0
+    total_keys = len(API_KEYS)
+
+    while attempts < total_keys:
+        active_key = API_KEYS[current_key_index]
         try:
-            return session.send_message(payload)
-        except ResourceExhausted as e:
-            # 429 / Quota / Exhausted エラーを検知した場合、即座に次のキーへ切り替え
-            err_str = str(e).lower()
-            if "quota" in err_str or "429" in err_str or "exhausted" in err_str:
-                print(f"[Quota Exceeded] 現在のキー上限到達。次のキーへ切り替えます。")
-                if switch_to_next_key():
-                    state["chat_session"] = create_model_and_session(state)
-                    continue  # 次のキーで再試行
-                else:
-                    raise e
-            else:
-                import time
-                time.sleep(3)
-                return session.send_message(payload)
-        except Exception as e:
-            err_str = str(e).lower()
-            if "quota" in err_str or "429" in err_str:
-                print(f"[Quota Exceeded] 429検知。次のキーへ切り替えます。")
-                if switch_to_next_key():
-                    state["chat_session"] = create_model_and_session(state)
-                    continue
-            raise e
+            # キーごとに独立したクライアントを作成してキャッシュを完全に回避
+            genai.configure(api_key=active_key)
+            model = genai.GenerativeModel(
+                model_name=ACTIVE_MODEL,
+                safety_settings=safety_settings,
+                system_instruction=sys_inst
+            )
+            chat = model.start_chat(history=history_to_use)
+            response = chat.send_message(payload)
             
-    return state["chat_session"].send_message(payload)
+            # 会話履歴を更新
+            if state["mode"] != "reset_full":
+                state["history"] = chat.history[-10:]
+            return response
+
+        except Exception as e:
+            err_text = str(e).lower()
+            if "quota" in err_text or "429" in err_text or "resourceexhausted" in err_text:
+                print(f"[429 Quota Exceeded] スロット {current_key_index + 1} 超過。次のキーへ切り替えます。")
+                current_key_index = (current_key_index + 1) % total_keys
+                attempts += 1
+            else:
+                raise e
+
+    raise Exception(f"登録されている全 {total_keys} 個のAPIキーの1日上限（500回）がすべて超過しました。")
 
 async def send_split_message(channel, text, reply_to=None, file=None):
     if not text and not file:
@@ -661,7 +640,7 @@ async def mode(ctx, mode_name: str = ""):
 
     if target_key:
         state["mode"] = modes[target_key][0]
-        state["chat_session"] = create_model_and_session(state)
+        state["history"] = []
         await ctx.send(f"モードを切り替えました！\n▶ **{modes[target_key][1]}**")
     else:
         msg = "【切り替え可能モード一覧】\n"
@@ -706,7 +685,7 @@ async def on_message(message):
             state["count"] = 0
             state["vocab"] = []
             state["learned_facts"] = []
-            state["chat_session"] = create_model_and_session(state)
+            state["history"] = []
             await message.reply("記憶とデータを初期化しました！")
             return
 
@@ -734,11 +713,10 @@ async def on_message(message):
                     investigation_data = await fetch_context_investigation(message, user_text)
                     if investigation_data: input_to_gemini += investigation_data
 
-                if state["chat_session"] is None or state["mode"] == "reset_full":
-                    state["chat_session"] = create_model_and_session(state)
-
                 payload = image_parts + [input_to_gemini] if image_parts else input_to_gemini
-                response = await asyncio.to_thread(send_message_safe, state, payload)
+                
+                # 新しい完全切替関数を呼び出し
+                response = await asyncio.to_thread(call_gemini_api, state, payload)
 
                 try:
                     reply_content = response.text
