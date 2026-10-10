@@ -259,27 +259,38 @@ def create_model_and_session(state):
 
 def send_message_safe(state, payload):
     max_key_attempts = max(len(API_KEYS), 1)
+    
+    # 登録されているキーの数だけ順に試行
     for _ in range(max_key_attempts):
         session = state["chat_session"]
         if hasattr(session, "history") and len(session.history) > 16:
             session.history = session.history[-12:]
-        for attempt in range(2):
-            try:
-                return session.send_message(payload)
-            except ResourceExhausted as e:
-                err_str = str(e)
-                if "limit: 500" in err_str or "requests" in err_str:
-                    if switch_to_next_key():
-                        state["chat_session"] = create_model_and_session(state)
-                        break
-                    else:
-                        raise e
+            
+        try:
+            return session.send_message(payload)
+        except ResourceExhausted as e:
+            # 429 / Quota / Exhausted エラーを検知した場合、即座に次のキーへ切り替え
+            err_str = str(e).lower()
+            if "quota" in err_str or "429" in err_str or "exhausted" in err_str:
+                print(f"[Quota Exceeded] 現在のキー上限到達。次のキーへ切り替えます。")
+                if switch_to_next_key():
+                    state["chat_session"] = create_model_and_session(state)
+                    continue  # 次のキーで再試行
                 else:
-                    import time
-                    time.sleep(3)
-        else:
-            continue
-        break
+                    raise e
+            else:
+                import time
+                time.sleep(3)
+                return session.send_message(payload)
+        except Exception as e:
+            err_str = str(e).lower()
+            if "quota" in err_str or "429" in err_str:
+                print(f"[Quota Exceeded] 429検知。次のキーへ切り替えます。")
+                if switch_to_next_key():
+                    state["chat_session"] = create_model_and_session(state)
+                    continue
+            raise e
+            
     return state["chat_session"].send_message(payload)
 
 async def send_split_message(channel, text, reply_to=None, file=None):
@@ -316,7 +327,7 @@ def parse_hex_color(hex_str):
     except Exception:
         return discord.Color.default()
 
-# --- 5. サーバー管理ハンドラ（20個の新機能追加版） ---
+# --- 5. サーバー管理ハンドラ ---
 async def handle_special_actions(message, reply_text):
     clean_text = reply_text
     image_file = None
@@ -372,7 +383,7 @@ async def handle_special_actions(message, reply_text):
         deleted = await message.channel.purge(limit=count + 1)
         clean_text += f"\n🧹 メッセージを **{len(deleted) - 1}件** 削除しました。"
 
-    # 5. 特定ユーザー発言削除 (NEW)
+    # 5. 特定ユーザー発言削除
     m_match = re.search(r'\[PURGE_USER:\s*(.+?),\s*(\d+)\]', clean_text)
     if m_match and message.channel.permissions_for(me).manage_messages:
         target = find_target_member(guild, m_match.group(1).strip())
@@ -402,7 +413,7 @@ async def handle_special_actions(message, reply_text):
             await target.remove_roles(role)
             clean_text += f"\n🗑️ **{target.display_name}** から役職 **{role.name}** を剥奪しました。"
 
-    # 7. 役職作成・削除・色変更 (NEW)
+    # 7. 役職作成・削除・色変更
     m_match = re.search(r'\[CREATE_ROLE:\s*(.+?)(?:,\s*(#[0-9a-fA-F]{6}))?\]', clean_text)
     if m_match and me.guild_permissions.manage_roles:
         r_name = m_match.group(1).strip()
@@ -438,7 +449,7 @@ async def handle_special_actions(message, reply_text):
             await target.edit(nick=new_nick)
             clean_text += f"\n📝 **{target.name}** のニックネームを **{new_nick}** に変更しました。"
 
-    # 9. ピン留め / 解除 / 一覧 (NEW)
+    # 9. ピン留め / 解除 / 一覧
     if "[PIN]" in clean_text and message.reference and message.reference.resolved:
         clean_text = clean_text.replace("[PIN]", "").strip()
         await message.reference.resolved.pin()
@@ -453,7 +464,7 @@ async def handle_special_actions(message, reply_text):
         pin_titles = [f"・{p.author.display_name}: {p.content[:30]}..." for p in pins[:5]]
         clean_text += "\n📌 **ピン留め一覧 (直近5件):**\n" + ("\n".join(pin_titles) if pin_titles else "なし")
 
-    # 10. リアクション付与 (NEW)
+    # 10. リアクション付与
     m_match = re.search(r'\[REACT:\s*(.+?)\]', clean_text)
     if m_match:
         emoji = m_match.group(1).strip()
@@ -463,7 +474,7 @@ async def handle_special_actions(message, reply_text):
             await target_msg.add_reaction(emoji)
         except Exception: pass
 
-    # 11. チャンネル設定（名前変更・トピック・複製・VC作成） (NEW)
+    # 11. チャンネル設定（名前変更・トピック・複製・VC作成）
     m_match = re.search(r'\[RENAME_CHANNEL:\s*(.+?)\]', clean_text)
     if m_match and message.channel.permissions_for(me).manage_channels:
         new_c_name = m_match.group(1).strip()
@@ -490,7 +501,7 @@ async def handle_special_actions(message, reply_text):
         new_vc = await guild.create_voice_channel(name=vc_name)
         clean_text += f"\n🔊 ボイスチャンネル **{new_vc.name}** を作成しました。"
 
-    # 12. VC管理（切断・ミュート・デフ・移動） (NEW)
+    # 12. VC管理（切断・ミュート・デフ・移動）
     m_match = re.search(r'\[VOICE_KICK:\s*(.+?)\]', clean_text)
     if m_match and me.guild_permissions.move_members:
         target = find_target_member(guild, m_match.group(1).strip())
@@ -541,26 +552,26 @@ async def handle_special_actions(message, reply_text):
             await target.move_to(dest_vc)
             clean_text += f"\n🚚 **{target.display_name}** を **{dest_vc.name}** に移動させました。"
 
-    # 13. アナウンス通知 (NEW)
+    # 13. アナウンス通知
     m_match = re.search(r'\[ANNOUNCE:\s*(.+?)\]', clean_text)
     if m_match and me.guild_permissions.mention_everyone:
         ann_text = m_match.group(1).strip()
         clean_text = clean_text.replace(m_match.group(0), "").strip()
         clean_text += f"\n📢 @everyone **【お知らせ】**\n{ann_text}"
 
-    # 14. 招待リンク作成 (NEW)
+    # 14. 招待リンク作成
     if "[CREATE_INVITE]" in clean_text and message.channel.permissions_for(me).create_instant_invite:
         clean_text = clean_text.replace("[CREATE_INVITE]", "").strip()
         invite = await message.channel.create_invite(max_age=86400, max_uses=5)
         clean_text += f"\n🔗 **招待リンク (24時間・最大5回有効):** {invite.url}"
 
-    # 15. 絵文字一覧 (NEW)
+    # 15. 絵文字一覧
     if "[LIST_EMOJIS]" in clean_text:
         clean_text = clean_text.replace("[LIST_EMOJIS]", "").strip()
         emojis_str = " ".join([str(e) for e in guild.emojis[:30]])
         clean_text += f"\n😀 **登録絵文字 ({len(guild.emojis)}個):**\n" + (emojis_str if emojis_str else "なし")
 
-    # 16. BANリスト (NEW)
+    # 16. BANリスト
     if "[BAN_LIST]" in clean_text and me.guild_permissions.ban_members:
         clean_text = clean_text.replace("[BAN_LIST]", "").strip()
         try:
