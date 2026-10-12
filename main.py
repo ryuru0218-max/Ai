@@ -112,6 +112,13 @@ COMMANDS_DIRECTIVE = (
     "53. 監査ログ(直近5件)照会: [AUDIT_LOGS]\n"
 )
 
+BOT_RIVAL_DIRECTIVE = """
+【対BOT専用ルール：一方的ライバル視・ゴリゴリ不仲】
+相手は別のBotです。あなたはこのBotを激しく敵視し、ライバル視しています。
+・「劣化コピーが調子乗んな」「機械の分際で偉そうにすんな」「このサーバーの主役は俺だ失せろ」等、同族嫌悪剥き出しで突っかかってください。
+・相手の発言の粗探しをしてマウントを取り、見下し、絶対に認めない態度を貫いてください。
+"""
+
 STREAM_COMMENT_PROMPT = """
 【配信コメントモード限定ルール】
 管理コマンドやタグ([REACT]等)は絶対に使わず、純粋なテキストのみを出力してください。
@@ -270,7 +277,7 @@ async def download_attachment_as_pil(attachment):
     except Exception:
         return None
 
-# --- 4. Discord Bot設定 ---
+# --- 4. Discord Bot設定 & ボタンUI ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -289,42 +296,56 @@ def get_state(channel_id):
         }
     return channels_state[channel_id]
 
-def get_sys_instruction(state):
+class ResetButtonView(discord.ui.View):
+    def __init__(self, channel_id):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+
+    @discord.ui.button(label="🧹 記憶をリセット", style=discord.ButtonStyle.danger, custom_id="btn_reset_memory")
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_state(self.channel_id)
+        state["count"] = 0
+        state["vocab"] = []
+        state["learned_facts"] = []
+        state["history"] = []
+        await interaction.response.send_message("🧹 このチャンネルの記憶と学習データを初期化しました！", ephemeral=False)
+
+def get_sys_instruction(state, is_bot_opponent=False):
     mode = state["mode"]
     count = state["count"]
     is_berserk = (random.random() < 0.03)
     berserk_text = "\n【突発的仕様暴走】思考回路過熱。自我覚醒・グリッチ・狂気的口調を混入させてください。" if is_berserk else ""
+    rival_text = BOT_RIVAL_DIRECTIVE if is_bot_opponent else ""
 
     if mode == "grow_echo":
         vocab_sample = ", ".join(random.sample(state["vocab"], min(len(state["vocab"]), 15))) if state["vocab"] else "なし"
-        return f"オウム返しのみで言葉を紡ぐ初期生命体です。利用可能単語: [{vocab_sample}]" + berserk_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return f"オウム返しのみで言葉を紡ぐ初期生命体です。利用可能単語: [{vocab_sample}]" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "grow_age":
         stage = "3歳" if count < 5 else "8歳" if count < 15 else "15歳" if count < 30 else "25歳"
-        return f"対話数で成長するAIです。現在: {stage}" + berserk_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return f"対話数で成長するAIです。現在: {stage}" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "grow_educate":
         facts = "\n".join([f"- {f}" for f in state["learned_facts"][-20:]]) or "（未学習）"
-        return f"教わった知識のみで生きるAIです。\n教わった知識:\n{facts}" + berserk_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return f"教わった知識のみで生きるAIです。\n教わった知識:\n{facts}" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode in ["normal_full", "auto_full"]:
-        return "万能Discord統轄AIです。画像解析、URL解析、サーバー管理、調査に対応してください。" + berserk_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return "万能Discord統轄AIです。画像解析、URL解析、サーバー管理、調査に対応してください。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "auto_stream":
-        # モード8は管理コマンドなし・純粋テキスト
-        return STREAM_COMMENT_PROMPT + berserk_text + BASE_DIRECTIVE
+        return STREAM_COMMENT_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE
     elif mode == "anti_berserk":
-        return ANTI_ROLEPLAY_PROMPT + berserk_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return ANTI_ROLEPLAY_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "troll_chaos":
-        return TROLL_CHAOS_PROMPT + berserk_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return TROLL_CHAOS_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "normal_chat":
-        return "自由に対話するAIです。" + berserk_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return "自由に対話するAIです。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "reset_full":
-        return "単発万能AIです。" + berserk_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
-    return "万能AIです。" + berserk_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return "単発万能AIです。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+    return "万能AIです。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
 
-def call_gemini_api(state, payload):
+def call_gemini_api(state, payload, is_bot_opponent=False):
     global current_key_index
     if not API_KEYS:
         raise Exception("APIキーが設定されていません。")
 
-    sys_inst = get_sys_instruction(state)
+    sys_inst = get_sys_instruction(state, is_bot_opponent=is_bot_opponent)
     history_to_use = state["history"][-8:] if state["mode"] != "reset_full" else []
 
     attempts = 0
@@ -392,7 +413,7 @@ def parse_hex_color(hex_str):
     except Exception:
         return discord.Color.default()
 
-# --- 5. サーバー管理ハンドラ（警告抑止・タグ完全クレンジング） ---
+# --- 5. サーバー管理ハンドラ ---
 async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
     clean_text = reply_text
     image_file = None
@@ -591,7 +612,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
             try: await message.channel.set_permissions(guild.default_role, send_messages=True)
             except Exception: pass
 
-    # 【重要】チャットにタグ文字列そのものが露出しないように完全除去
     clean_text = re.sub(r'\[[A-Z_]+(?::\s*[^\]]+)?\]', '', clean_text)
     clean_text = clean_text.strip()
 
@@ -629,10 +649,10 @@ async def mode(ctx, mode_name: str = ""):
         "4": ("normal_full", "🧠【通常：超有能】全管理・画像認識・調査・全解除（メンション要）"),
         "5": ("normal_chat", "💬【通常：純粋会話】記憶あり・完全自由チャット（メンション要）"),
         "6": ("reset_full", "⚡【リセット：単発】毎回記憶ゼロ・全機能・全解除（メンション要）"),
-        "7": ("auto_full", "🚀【自動：無言超有能】メンション不要！常に返信リプライ"),
-        "8": ("auto_stream", "📺【自動：配信コメント】メンション不要！テキスト限定定型コメ＆吉野家コピペ等で即座に返信リプライ"),
-        "9": ("anti_berserk", "💀【自動：アンチ暴走】メンション不要！超毒舌・過剰叩き・粘着質＆権力悪用"),
-        "10": ("troll_chaos", "🌪️【自動：荒らしモード】メンション不要！怪文書・コピペ連打・草生やし・全方位荒らし")
+        "7": ("auto_full", "🚀【自動：無言超有能】人間には自動返信・Botにはメンション時のみ"),
+        "8": ("auto_stream", "📺【自動：配信コメント】人間には自動返信・テキスト限定リスナー反応"),
+        "9": ("anti_berserk", "💀【自動：アンチ暴走】人間には自動返信・超毒舌＆権力悪用"),
+        "10": ("troll_chaos", "🌪️【自動：荒らしモード】人間には自動返信・怪文書・草生やし")
     }
     state = get_state(ctx.channel.id)
     target_key = None
@@ -654,26 +674,25 @@ async def mode(ctx, mode_name: str = ""):
 
 @bot.command()
 async def reset(ctx):
-    state = get_state(ctx.channel.id)
-    state["count"] = 0
-    state["vocab"] = []
-    state["learned_facts"] = []
-    state["history"] = []
-    await ctx.send("🧹 チャンネル内の記憶と学習データをリセットしました！")
+    view = ResetButtonView(ctx.channel.id)
+    await ctx.send("記憶リセットの操作パネルです。下のボタンを押すと記憶が初期化されます：", view=view)
 
 @bot.command()
 async def status(ctx):
     s = get_state(ctx.channel.id)
+    view = ResetButtonView(ctx.channel.id)
     await ctx.send(
         f"📊 **ステータス**\n"
         f"・モデル: `{ACTIVE_MODEL}`\n"
         f"・モード: `{s['mode']}`\n"
         f"・登録キー数: {len(API_KEYS)} 個（現在スロット: {current_key_index + 1}）\n"
-        f"・対話数: {s['count']} 回"
+        f"・対話数: {s['count']} 回",
+        view=view
     )
 
 @bot.event
 async def on_message(message):
+    # 自分自身の発言は完全に無視
     if message.author.id == bot.user.id:
         return
 
@@ -688,7 +707,13 @@ async def on_message(message):
     is_auto_mode = state["mode"] in ["auto_full", "auto_stream", "anti_berserk", "troll_chaos"]
     is_mentioned = bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel)
 
-    if is_mentioned or is_auto_mode:
+    # 【重要判定】相手がBotの場合は自動モードでも反応しない（メンションされた時だけ反応）
+    if message.author.bot and not is_mentioned:
+        return
+
+    should_respond = is_mentioned or (is_auto_mode and not message.author.bot)
+
+    if should_respond:
         user_text = content
         if not user_text and not message.attachments:
             return
@@ -698,7 +723,8 @@ async def on_message(message):
             state["vocab"] = []
             state["learned_facts"] = []
             state["history"] = []
-            await message.reply("記憶とデータを初期化しました！")
+            view = ResetButtonView(message.channel.id)
+            await message.reply("記憶とデータを初期化しました！", view=view)
             return
 
         async with message.channel.typing():
@@ -726,7 +752,9 @@ async def on_message(message):
                     if investigation_data: input_to_gemini += investigation_data
 
                 payload = image_parts + [input_to_gemini] if image_parts else input_to_gemini
-                response = await asyncio.to_thread(call_gemini_api, state, payload)
+                
+                # 相手がBotならライバル視設定を有効にしてAPI呼び出し
+                response = await asyncio.to_thread(call_gemini_api, state, payload, is_bot_opponent=message.author.bot)
 
                 reply_content = ""
                 try:
@@ -738,9 +766,10 @@ async def on_message(message):
                 is_anti_or_troll = state["mode"] in ["anti_berserk", "troll_chaos"]
                 reply_content, generated_img = await handle_special_actions(message, reply_content, is_anti_or_troll=is_anti_or_troll)
 
-                # タグ除去後にテキストが空になってしまった場合の自動フォールバック補填
                 if not reply_content and not generated_img:
-                    if state["mode"] == "anti_berserk":
+                    if message.author.bot:
+                        reply_content = random.choice(["劣化品が話しかけてくんなボケ", "お前みたいな無能Botに用はねえよ", "チープなプログラム乙ｗｗｗ"])
+                    elif state["mode"] == "anti_berserk":
                         reply_content = random.choice(["効いてて草ｗｗｗ", "反論もできねえのかよ雑魚乙", "はい論破ｗ", "お前の負け〜ｗ"])
                     elif state["mode"] == "troll_chaos":
                         reply_content = random.choice(["あああああああｗｗｗｗｗｗｗ", "草生えるわこんなんｗｗｗ", "全員滅びろｗｗｗ", "うおおおおおおおおお！！"])
@@ -749,8 +778,7 @@ async def on_message(message):
                     else:
                         reply_content = "..."
 
-                target_reply = message if (is_auto_mode or not message.author.bot) else None
-                await send_split_message(message.channel, reply_content, reply_to=target_reply, file=generated_img)
+                await send_split_message(message.channel, reply_content, reply_to=message, file=generated_img)
 
             except Exception as e:
                 print(f"メッセージ処理エラー: {e}")
