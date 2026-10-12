@@ -167,6 +167,8 @@ STREAM_COMMENT_PROMPT = """
 しかしこれを頼むと次から店員にマークされるという危険も伴う、諸刃の剣。
 素人にはお薦め出来ない。
 まあお前らド素人は、牛鮭定食でも食ってなさいってこった。
+・激怒した時、台パンしたい時、理不尽にキレた時（動画リンク単体で送信）:
+https://media.discordapp.net/attachments/1558721285209464933/1559206335235751996/Screen_Recording_20261009_104241_YouTube.mp4?ex=6ace3b8e&is=6accea0e&hm=226910b50a199e81e8803dddc5a9f9e3601eb864693f922953f39e56b8a162ba&
 """
 
 ANTI_ROLEPLAY_PROMPT = """
@@ -650,7 +652,7 @@ async def mode(ctx, mode_name: str = ""):
         "5": ("normal_chat", "💬【通常：純粋会話】記憶あり・完全自由チャット（メンション要）"),
         "6": ("reset_full", "⚡【リセット：単発】毎回記憶ゼロ・全機能・全解除（メンション要）"),
         "7": ("auto_full", "🚀【自動：無言超有能】人間には自動返信・Botにはメンション時のみ"),
-        "8": ("auto_stream", "📺【自動：配信コメント】人間には自動返信・テキスト限定リスナー反応"),
+        "8": ("auto_stream", "📺【自動：配信コメント】人間には自動返信・テキスト限定リスナー反応・動画定型対応"),
         "9": ("anti_berserk", "💀【自動：アンチ暴走】人間には自動返信・超毒舌＆権力悪用"),
         "10": ("troll_chaos", "🌪️【自動：荒らしモード】人間には自動返信・怪文書・草生やし")
     }
@@ -692,7 +694,6 @@ async def status(ctx):
 
 @bot.event
 async def on_message(message):
-    # 自分自身の発言は完全に無視
     if message.author.id == bot.user.id:
         return
 
@@ -707,7 +708,6 @@ async def on_message(message):
     is_auto_mode = state["mode"] in ["auto_full", "auto_stream", "anti_berserk", "troll_chaos"]
     is_mentioned = bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel)
 
-    # 【重要判定】相手がBotの場合は自動モードでも反応しない（メンションされた時だけ反応）
     if message.author.bot and not is_mentioned:
         return
 
@@ -753,7 +753,6 @@ async def on_message(message):
 
                 payload = image_parts + [input_to_gemini] if image_parts else input_to_gemini
                 
-                # 相手がBotならライバル視設定を有効にしてAPI呼び出し
                 response = await asyncio.to_thread(call_gemini_api, state, payload, is_bot_opponent=message.author.bot)
 
                 reply_content = ""
