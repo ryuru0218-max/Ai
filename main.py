@@ -293,19 +293,30 @@ def parse_hex_color(hex_str):
     try: return discord.Color(int(hex_str.strip().lstrip('#'), 16))
     except Exception: return discord.Color.default()
 
-# Webhookを使って対象になりすましてメッセージを送信するヘルパー
+# Webhookを使って対象になりすましてメッセージを送信するヘルパー（エラー可視化版）
 async def send_as_webhook(channel, target_member, content, file=None):
     try:
-        avatar_bytes = await target_member.display_avatar.read()
-        webhook = await channel.create_webhook(name=target_member.display_name, avatar=avatar_bytes)
+        avatar_bytes = None
+        try:
+            avatar_bytes = await target_member.display_avatar.read()
+        except Exception as img_err:
+            print(f"アバター取得スキップ: {img_err}")
+
+        webhook = await channel.create_webhook(name=target_member.display_name[:32], avatar=avatar_bytes)
         chunks = [content[i:i+1900] for i in range(0, len(content), 1900)] if content else [""]
         for idx, chunk in enumerate(chunks):
             send_f = file if idx == 0 else None
             await webhook.send(content=chunk, file=send_f)
         await webhook.delete()
         return True
+    except discord.Forbidden:
+        await channel.send("⚠️ **権限エラー:** ポチに「ウェブフックの管理 (Manage Webhooks)」権限がありません！サーバー設定のロールで許可してください。")
+        return False
+    except discord.HTTPException as e:
+        await channel.send(f"⚠️ **Discord API制限エラー:** Webhook作成失敗 (チャンネルの上限15個など): {e}")
+        return False
     except Exception as e:
-        print(f"Webhook送信失敗: {e}")
+        await channel.send(f"⚠️ **送信エラー:** {e}")
         return False
 
 # --- 5. サーバー管理ハンドラ ---
@@ -800,11 +811,11 @@ async def on_message(message):
                 elif is_mimic:
                     impersonate_target = mimic_targets[ch_id]
 
-                if impersonate_target and message.channel.permissions_for(message.guild.me).manage_webhooks:
+                if impersonate_target:
                     sent = await send_as_webhook(message.channel, impersonate_target, reply_content, file=generated_img)
                     if sent: return  # Webhook送信成功なら完了
 
-                # 通常送信
+                # 通常送信（Webhook権限がない場合や通常時）
                 mention_auth = False if message.author.bot else True
                 chunks = [reply_content[i:i+1900] for i in range(0, len(reply_content), 1900)] if reply_content else [""]
                 for idx, chunk in enumerate(chunks):
