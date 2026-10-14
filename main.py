@@ -68,7 +68,8 @@ D3DFISH_NEURON_DIRECTIVE = """
 発言者に「d3dfish__76102」が含まれる場合：
 1. 露骨な暴言やあからさまな敵対は避け、どこか「若干気まずそうに、面倒くさそうに、でも一応会話には付き合う」というリアルな距離感を保つ。
 2. 話を振られても「あー……まぁ、そういう時もありますよね」「そうなんですか、へぇ……」と、関わりを最小限にしつつ、のらりくらりと言葉を濁してさらっと流す。
-3. ただし、@d3dfish__76102 が「好き」「これ良い」と肯定した対象については、「あえてそれを選ぶの、なんか……こう、味わい深いですよね（笑）」「人それぞれの感性ってあるんで、否定はしないですけど……ふふ」など、一見すると否定していないようでいて、内心では格下扱いしてセンスを徹底的に削り取るような、じっとりとした隠れ毒を言葉の端々にさらっと仕込むこと。
+3. モード6（単発リセット）の場合も含め、@d3dfish__76102 の発言に対しては、提供されている定型コメント（「俺は地球や！！」「やらんよ普通にそんな感じなら。一緒に掴もうと思ってくれないなら、俺はやらない」など）の中から文脈に合ったものをシュールに選んで返答せよ。
+4. ただし、@d3dfish__76102 が「好き」「これ良い」と肯定した対象については、「あえてそれを選ぶの、なんか……こう、味わい深いですよね（笑）」「人それぞれの感性ってあるんで、否定はしないですけど……ふふ」など、表向きは肯定・理解のフリをしつつ、内実ではそのセンスの底の浅さを静かに冷笑するような隠れ毒を言葉の端々にさらっと仕込むこと。
 """
 
 COMMANDS_DIRECTIVE = (
@@ -737,13 +738,34 @@ class MainMenuView(discord.ui.View):
         self.add_item(DiscSelectPart1(channel_id))
         self.add_item(DiscSelectPart2(channel_id))
 
+    @discord.ui.button(label="🧹 記憶完全初期化", style=discord.ButtonStyle.danger, row=4)
+    async def btn_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_state(interaction.channel.id)
+        state["count"] = 0
+        state["vocab"] = []
+        state["learned_facts"] = []
+        state["history"] = []
+        await interaction.response.send_message("🧹 このチャンネルの記憶・対話履歴を完全にリセットしました！", ephemeral=False)
+
+    @discord.ui.button(label="📊 システム状態確認", style=discord.ButtonStyle.primary, row=4)
+    async def btn_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = get_state(interaction.channel.id)
+        await interaction.response.send_message(
+            f"📊 **ステータス**\n・モデル: `{ACTIVE_MODEL}`\n・現在のモード: `{s['mode']}`\n"
+            f"・登録キー数: {len(API_KEYS)} 個\n・対話数: {s.get('count', 0)} 回", ephemeral=True)
+
 # --- 10. AI連携 & ハンドラ ---
 def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
     global current_key_index
     if not API_KEYS: raise Exception("APIキーがありません。")
 
-    sys_inst = clone_prompt + BASE_DIRECTIVE + COMMANDS_DIRECTIVE if clone_prompt else get_sys_instruction(state, is_bot_opponent)
-    history_to_use = state["history"][-8:] if state["mode"] != "reset_full" else []
+    mode = state["mode"]
+    if mode == "reset_full":
+        sys_inst = BASE_DIRECTIVE + COMMANDS_DIRECTIVE + "\n【単発モード】前後の文脈や過去履歴を無視し、この瞬間の入力のみに単発で応答せよ。"
+        history_to_use = []
+    else:
+        sys_inst = clone_prompt + BASE_DIRECTIVE + COMMANDS_DIRECTIVE if clone_prompt else get_sys_instruction(state, is_bot_opponent)
+        history_to_use = state["history"][-8:]
 
     attempts = 0
     total_keys = len(API_KEYS)
@@ -754,7 +776,7 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
             model = genai.GenerativeModel(model_name=ACTIVE_MODEL, safety_settings=safety_settings, system_instruction=sys_inst)
             chat = model.start_chat(history=history_to_use)
             response = chat.send_message(payload)
-            if state["mode"] != "reset_full": state["history"] = chat.history[-10:]
+            if mode != "reset_full": state["history"] = chat.history[-10:]
             return response
         except Exception as e:
             err = str(e).lower()
@@ -1236,7 +1258,7 @@ async def on_message(message):
                 if state["mode"] in ["normal_full", "reset_full", "auto_full", "anti_berserk", "troll_chaos"] and "http" in content:
                     in_txt += await process_all_links_async(content)
 
-                # d3dfish__76102 への「気まずそうに、さらっと躱しつつ隠れ毒を吐く」ルール（全モード常時適用）
+                # d3dfish__76102 への対応（モード6のときも定型コメント選択肢の中から選んで対応するよう常時適用）
                 d3dfish_rule = ""
                 if message.author.name == "d3dfish__76102" or message.author.display_name == "d3dfish__76102":
                     d3dfish_rule = D3DFISH_NEURON_DIRECTIVE
