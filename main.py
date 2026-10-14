@@ -60,14 +60,6 @@ BASE_DIRECTIVE = (
     "メッセージ先頭の【発言者情報】を確認し、発言者が誰なのか（人間かBotか、誰か）を完全識別して対応してください。\n"
 )
 
-TARGET_USER_DIRECTIVE = """
-【最優先特殊指令：特定ターゲット(@d3dfish__76102)への絶対的嫌悪・逆張り酷評】
-発言者が「d3dfish__76102」である場合、または「d3dfish__76102」が好き・お気に入り・絶賛している物事・人物・作品・食べ物・趣味が話題に上がった場合：
-・現在のモードに関係なく、その対象をボロカスに嫌い、徹底的に叩いてください。
-・「相変わらずセンスが壊滅的だな」「どこに惹かれる要素があんだよゴミが」「見る目が無さすぎて反吐が出る」「逆張りじゃなくて純粋にお前の好みがキツい」等、激しく否定・嘲笑してください。
-・相手が褒めれば褒めるほど、粗探しをしてこき下ろしてください。
-"""
-
 COMMANDS_DIRECTIVE = (
     "\n【Discord全権限・全操作コマンド一覧（120種超完全網羅）】\n"
     "状況や要望、裁きに合わせて回答内に専用タグを埋め込んで実行してください（裏で自動実行されます）：\n"
@@ -168,19 +160,19 @@ MEIGEN_SEARCH_PROMPT = """
 【ツッコミ・解説】（なぜ迷言なのか、どこが狂っているのかを切れ味鋭く解説）
 """
 
-# --- 3. 外部解析 & Webスクレイピング ---
+# --- 3. 外部解析 & Webスクレイピング（高速・非同期化） ---
 def _fetch_random_web_sync(category_type="名言"):
     categories = ["哲学", "文学", "歴史", "名言"] if category_type == "名言" else ["インターネットの文化", "スラング", "ユーモア", "パロディ"]
     cat = random.choice(categories)
     try:
         url = f"https://ja.wikipedia.org/wiki/Special:RandomInCategory/{quote(cat)}"
-        res = requests.get(url, timeout=3.5, headers={"User-Agent": "Mozilla/5.0"})
+        res = requests.get(url, timeout=1.8, headers={"User-Agent": "Mozilla/5.0"})
         soup = BeautifulSoup(res.text, "html.parser")
         p_tags = soup.find_all('p')
         for p in p_tags:
             t = p.get_text().strip()
             if len(t) > 30:
-                return f"\n【参考Web抽出コンテキスト: {soup.title.string}】\n{t[:400]}\n"
+                return f"\n【参考Webコンテキスト: {soup.title.string}】\n{t[:300]}\n"
     except Exception: pass
     return ""
 
@@ -188,7 +180,7 @@ def _fetch_youtube_sync(video_id):
     summary_parts = []
     try:
         oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-        res = requests.get(oembed_url, timeout=3)
+        res = requests.get(oembed_url, timeout=2.0)
         if res.status_code == 200:
             meta = res.json()
             summary_parts.append(f"■ タイトル: {meta.get('title', '')}\n■ チャンネル: {meta.get('author_name', '')}")
@@ -196,18 +188,18 @@ def _fetch_youtube_sync(video_id):
     try:
         transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ja', 'en'])
         text = " ".join([t['text'] for t in transcript_list])
-        summary_parts.append(f"■ 字幕:\n{text[:1500]}")
+        summary_parts.append(f"■ 字幕:\n{text[:1000]}")
     except Exception: pass
     return f"\n【YouTube解析情報 (ID: {video_id})】\n" + "\n".join(summary_parts) + "\n" if summary_parts else ""
 
 def _fetch_web_sync(url):
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=3.5)
+        res = requests.get(url, headers=headers, timeout=2.0)
         soup = BeautifulSoup(res.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer"]): tag.extract()
         title = soup.title.string.strip() if soup.title and soup.title.string else ""
-        body = re.sub(r'\s+', ' ', soup.get_text(separator=" ", strip=True))[:1200]
+        body = re.sub(r'\s+', ' ', soup.get_text(separator=" ", strip=True))[:800]
         return f"\n【Web参照 ({url})】\n■ タイトル: {title}\n■ 本文: {body}\n"
     except Exception: return ""
 
@@ -225,7 +217,7 @@ async def process_all_links_async(text):
 def download_image_sync(prompt):
     try:
         url = f"https://image.pollinations.ai/prompt/{quote(prompt)}?width=1024&height=1024&seed={random.randint(1000, 999999)}&nologo=true"
-        res = requests.get(url, timeout=25)
+        res = requests.get(url, timeout=20)
         if res.status_code == 200: return res.content
     except Exception: pass
     return None
@@ -237,7 +229,9 @@ async def download_attachment_as_pil(att):
     except Exception: return None
 
 # --- 4. Discord Bot設定 & UI ---
-intents = discord.Intents.all()
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 channels_state = {}
@@ -341,8 +335,7 @@ class MainMenuView(discord.ui.View):
         await generate_bunshun_article(interaction.channel)
 
 def get_sys_instruction(state, is_bot_opponent=False, clone_prompt=None):
-    base_rules = BASE_DIRECTIVE + TARGET_USER_DIRECTIVE
-    if clone_prompt: return clone_prompt + base_rules + COMMANDS_DIRECTIVE
+    if clone_prompt: return clone_prompt + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     mode = state["mode"]
     count = state["count"]
     is_berserk = (random.random() < 0.03)
@@ -351,30 +344,30 @@ def get_sys_instruction(state, is_bot_opponent=False, clone_prompt=None):
 
     if mode == "grow_echo":
         vocab_sample = ", ".join(random.sample(state["vocab"], min(len(state["vocab"]), 15))) if state["vocab"] else "なし"
-        return f"オウム返しのみで話す生命体。語彙: [{vocab_sample}]" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
+        return f"オウム返しのみで話す生命体。語彙: [{vocab_sample}]" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "grow_age":
         stage = "3歳" if count < 5 else "8歳" if count < 15 else "15歳" if count < 30 else "25歳"
-        return f"会話数で成長するAI。現在: {stage}" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
+        return f"会話数で成長するAI。現在: {stage}" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "grow_educate":
         facts = "\n".join([f"- {f}" for f in state["learned_facts"][-20:]]) or "（未学習）"
-        return f"教わった知識のみで生きるAI。\n学習データ:\n{facts}" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
+        return f"教わった知識のみで生きるAI。\n学習データ:\n{facts}" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode in ["normal_full", "auto_full"]:
-        return "万能Discord統轄AI。全管理・画像解析・調査・全権限行使。" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
+        return "万能Discord統轄AI。全管理・画像解析・調査・全権限行使。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "auto_stream":
-        return STREAM_COMMENT_PROMPT + berserk_text + rival_text + base_rules
+        return STREAM_COMMENT_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE
     elif mode == "quote_search":
-        return QUOTE_SEARCH_PROMPT + berserk_text + rival_text + base_rules
+        return QUOTE_SEARCH_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE
     elif mode == "meigen_search":
-        return MEIGEN_SEARCH_PROMPT + berserk_text + rival_text + base_rules
+        return MEIGEN_SEARCH_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE
     elif mode == "anti_berserk":
-        return ANTI_ROLEPLAY_PROMPT + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
+        return ANTI_ROLEPLAY_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "troll_chaos":
-        return TROLL_CHAOS_PROMPT + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
+        return TROLL_CHAOS_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "normal_chat":
-        return "自由に対話するAI。" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
+        return "自由に対話するAI。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     elif mode == "reset_full":
-        return "単発万能AI。" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
-    return "万能AI。" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
+        return "単発万能AI。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+    return "万能AI。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
 
 def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
     global current_key_index
@@ -1075,7 +1068,7 @@ async def wiki(ctx, *, query: str = ""):
     async with ctx.typing():
         try:
             url = f"https://ja.wikipedia.org/api/rest_v1/page/summary/{quote(query)}"
-            res = requests.get(url, timeout=4).json()
+            res = requests.get(url, timeout=3).json()
             extract = res.get("extract", "該当する記事が見つかりませんでした。")
             await ctx.send(f"📚 **Wikipedia: {query}**\n{extract[:1500]}")
         except Exception as e: await ctx.send(f"Wikipedia取得エラー: {e}")
@@ -1083,14 +1076,14 @@ async def wiki(ctx, *, query: str = ""):
 @bot.command()
 async def weather(ctx, city: str = "Tokyo"):
     try:
-        res = requests.get(f"https://wttr.in/{quote(city)}?format=%C+%t+湿度:%h+風速:%w", timeout=4).text
+        res = requests.get(f"https://wttr.in/{quote(city)}?format=%C+%t+湿度:%h+風速:%w", timeout=3).text
         await ctx.send(f"☀️ **{city}の天気:** {res}")
     except Exception as e: await ctx.send(f"天気取得エラー: {e}")
 
 @bot.command()
 async def cur(ctx, amount: float = 100, from_c: str = "USD", to_c: str = "JPY"):
     try:
-        res = requests.get(f"https://open.er-api.com/v6/latest/{from_c.upper()}", timeout=4).json()
+        res = requests.get(f"https://open.er-api.com/v6/latest/{from_c.upper()}", timeout=3).json()
         rate = res["rates"][to_c.upper()]
         await ctx.send(f"💱 **為替換算:** {amount} {from_c.upper()} = **{amount * rate:,.2f} {to_c.upper()}** (レート: {rate})")
     except Exception as e: await ctx.send(f"為替取得エラー: {e}")
@@ -1225,7 +1218,7 @@ async def status(ctx):
 async def on_message(message):
     if message.author.id == bot.user.id or message.webhook_id: return
 
-    # コマンドの優先ディスパッチ
+    # コマンドのディスパッチ
     ctx = await bot.get_context(message)
     if ctx.valid:
         await bot.invoke(ctx)
