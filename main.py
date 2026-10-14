@@ -89,7 +89,32 @@ STREAM_COMMENT_PROMPT = """
 ・もう、(呼吸)もう、、僕をッ..！！終わらしてくれぇえぇ！ ・効いてて草 ・正解
 ・女の涙は小便と一緒やでな
 ・富樫Twitter開設に便乗しようとした男｢ヤンヤーヤンヤー連載再開」とツイートして10分間で100いいねしか付かずツイ消し
-・昨日、近所の吉野家行ったんです。吉野家。（中略）
+・昨日、近所の吉野家行ったんです。吉野家。
+そしたらなんか人がめちゃくちゃいっぱいで座れないんです。
+で、よく見たらなんか垂れ幕下がってて、１５０円引き、とか書いてあるんです。
+もうね、アホかと。馬鹿かと。
+お前らな、１５０円引き如きで普段来てない吉野家に来てんじゃねーよ、ボケが。
+１５０円だよ、１５０円。
+なんか親子連れとかもいるし。一家４人で吉野家か。おめでてーな。
+よーしパパ特盛頼んじゃうぞー、とか言ってるの。もう見てらんない。
+お前らな、１５０円やるからその席空けろと。
+吉野家ってのはな、もっと殺伐としてるべきなんだよ。
+Ｕの字テーブルの向かいに座った奴といつ喧嘩が始まってもおかしくない、
+刺すか刺されるか、そんな雰囲気がいいんじゃねーか。女子供は、すっこんでろ。
+で、やっと座れたかと思ったら、隣の奴が、大盛つゆだくで、とか言ってるんです。
+そこでまたぶち切れですよ。
+あのな、つゆだくなんてきょうび流行んねーんだよ。ボケが。
+得意げな顔して何が、つゆだくで、だ。
+お前は本当につゆだくを食いたいのかと問いたい。問い詰めたい。小１時間問い詰めたい。
+お前、つゆだくって言いたいだけちゃうんかと。
+吉野家通の俺から言わせてもらえば今、吉野家通の間での最新流行はやっぱり、
+ねぎだく、これだね。
+大盛りねぎだくギョク。これが通の頼み方。
+ねぎだくってのはねぎが多めに入ってる。そん代わり肉が少なめ。これ。
+で、それに大盛りギョク（玉子）。これ最強。
+しかしこれを頼むと次から店員にマークされるという危険も伴う、諸刃の剣。
+素人にはお薦め出来ない。
+まあお前らド素人は、牛鮭定食でも食ってなさいってこった。
 ・激怒した時、台パンしたい時、理不尽にキレた時（動画リンク単体で送信）:
 https://media.discordapp.net/attachments/1558721285209464933/1559206335235751996/Screen_Recording_20261009_104241_YouTube.mp4?ex=6ace3b8e&is=6accea0e&hm=226910b50a199e81e8803dddc5a9f9e3601eb864693f922953f39e56b8a162ba&
 ・お前らのせいでこれ店閉まっとるやろ！！今お前一生懸命選らんどったのにボケお前！！ぶっ殺すぞマジで！！謝れよお前ら早よ！！
@@ -293,27 +318,58 @@ def parse_hex_color(hex_str):
     try: return discord.Color(int(hex_str.strip().lstrip('#'), 16))
     except Exception: return discord.Color.default()
 
-# Webhookを使って対象になりすましてメッセージを送信するヘルパー（エラー可視化版）
+# Webhookを使って対象になりすましてメッセージを送信するヘルパー（上限回避・再利用・バグ解消完全版）
 async def send_as_webhook(channel, target_member, content, file=None):
     try:
         avatar_bytes = None
         try:
             avatar_bytes = await target_member.display_avatar.read()
-        except Exception as img_err:
-            print(f"アバター取得スキップ: {img_err}")
+        except Exception:
+            pass
 
-        webhook = await channel.create_webhook(name=target_member.display_name[:32], avatar=avatar_bytes)
+        # チャンネル内の既存Webhookを取得
+        webhooks = await channel.webhooks()
+        webhook = None
+
+        # Bot自身が作成したWebhookを探す
+        for wh in webhooks:
+            if wh.user and wh.user.id == bot.user.id:
+                webhook = wh
+                break
+
+        if webhook:
+            # 既存のWebhookを対象ユーザーの名前・アバターに上書きして再利用
+            try:
+                await webhook.edit(name=target_member.display_name[:32], avatar=avatar_bytes)
+            except Exception:
+                pass
+        else:
+            # 15個上限に達している場合は、Botが作った古いWebhookを削除して枠を空ける
+            if len(webhooks) >= 15:
+                for wh in webhooks:
+                    if wh.user and wh.user.id == bot.user.id:
+                        try:
+                            await wh.delete()
+                            break
+                        except Exception:
+                            pass
+            # 新規作成
+            webhook = await channel.create_webhook(name=target_member.display_name[:32], avatar=avatar_bytes)
+
+        # 送信処理（file=Noneでクラッシュしないように分岐）
         chunks = [content[i:i+1900] for i in range(0, len(content), 1900)] if content else [""]
         for idx, chunk in enumerate(chunks):
-            send_f = file if idx == 0 else None
-            await webhook.send(content=chunk, file=send_f)
-        await webhook.delete()
+            if idx == 0 and file is not None:
+                await webhook.send(content=chunk, file=file)
+            else:
+                await webhook.send(content=chunk)
         return True
+
     except discord.Forbidden:
-        await channel.send("⚠️ **権限エラー:** ポチに「ウェブフックの管理 (Manage Webhooks)」権限がありません！サーバー設定のロールで許可してください。")
+        await channel.send("⚠️ **権限エラー:** ポチに「ウェブフックの管理 (Manage Webhooks)」権限がありません！ロール設定を確認してください。")
         return False
     except discord.HTTPException as e:
-        await channel.send(f"⚠️ **Discord API制限エラー:** Webhook作成失敗 (チャンネルの上限15個など): {e}")
+        await channel.send(f"⚠️ **Discord API制限エラー:** {e}")
         return False
     except Exception as e:
         await channel.send(f"⚠️ **送信エラー:** {e}")
