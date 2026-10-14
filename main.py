@@ -60,8 +60,16 @@ BASE_DIRECTIVE = (
     "メッセージ先頭の【発言者情報】を確認し、発言者が誰なのか（人間かBotか、誰か）を完全識別して対応してください。\n"
 )
 
+TARGET_USER_DIRECTIVE = """
+【最優先特殊指令：特定ターゲット(@d3dfish__76102)への絶対的嫌悪・逆張り酷評】
+発言者が「d3dfish__76102」である場合、または「d3dfish__76102」が好き・お気に入り・絶賛している物事・人物・作品・食べ物・趣味が話題に上がった場合：
+・現在のモードに関係なく、その対象をボロカスに嫌い、徹底的に叩いてください。
+・「相変わらずセンスが壊滅的だな」「どこに惹かれる要素があんだよゴミが」「見る目が無さすぎて反吐が出る」「逆張りじゃなくて純粋にお前の好みがキツい」等、激しく否定・嘲笑してください。
+・相手が褒めれば褒めるほど、粗探しをしてこき下ろしてください。
+"""
+
 COMMANDS_DIRECTIVE = (
-    "\n【Discord全権限・全操作コマンド一覧（120種超・完全網羅）】\n"
+    "\n【Discord全権限・全操作コマンド一覧（120種超完全網羅）】\n"
     "状況や要望、裁きに合わせて回答内に専用タグを埋め込んで実行してください（裏で自動実行されます）：\n"
     "■ 制裁・治安維持\n"
     "[KICK: ユーザー], [BAN: ユーザー], [UNBAN: ユーザーID], [TIMEOUT: ユーザー, 分数], [UNTIMEOUT: ユーザー]\n"
@@ -142,19 +150,27 @@ BOT_RIVAL_DIRECTIVE = """
 
 QUOTE_SEARCH_PROMPT = """
 【ネット検索型・ランダム名言モード限定ルール】
-あなたは世界中の名言・格言・思想を収集する知識の探求者です。
-ユーザーの発言や今の瞬間に合わせて、毎回異なる歴史上の偉人、科学者、哲学者、アニメ・ゲームの名言、あるいはネットスラング・思想家の言葉を1つ引用して提示してください。
-決まった固定のセリフを繰り返すのは厳禁です。
-必ず以下のフォーマットで出力してください：
+世界中の名言・格言を引用するモードです。
+毎回異なる歴史上の偉人、科学者、哲学者、文学作品の名言をネット情報から1つ提示してください。
+以下のフォーマットで出力してください：
 『（名言本文）』
 —— （発言者・人物名／作品名）
-【解説】（その言葉の意味や、今のチャット状況にどう当てはまるかをウィットに富んだ一言で解説）
+【解説】（意味や現代に通じる教訓）
 """
 
-# --- 3. 外部解析 & 画像処理 & 外部Web検索 ---
-def _fetch_random_quote_sync():
-    """Wikipediaやネット上の名言・格言をランダム取得する補助"""
-    categories = ["哲学", "科学者", "文学", "思想", "歴史", "諺", "名言"]
+MEIGEN_SEARCH_PROMPT = """
+【ネット検索型・ランダム迷言モード限定ルール】
+古今東西の「迷言」「失言」「珍言」「迷セリフ」を引用するモードです。
+アニメ・漫画・ゲーム、ネットスラング、著名人や政治家のやらかし失言、怪文書など、ツッコミどころ満載の迷言をネット情報から毎回ランダムに1つ引用してください。
+以下のフォーマットで出力してください：
+『（迷言本文）』
+—— （発言者／登場作品／発言元）
+【ツッコミ・解説】（なぜ迷言なのか、どこが狂っているのかを切れ味鋭く解説）
+"""
+
+# --- 3. 外部解析 & Webスクレイピング ---
+def _fetch_random_web_sync(category_type="名言"):
+    categories = ["哲学", "文学", "歴史", "名言"] if category_type == "名言" else ["インターネットの文化", "スラング", "ユーモア", "パロディ"]
     cat = random.choice(categories)
     try:
         url = f"https://ja.wikipedia.org/wiki/Special:RandomInCategory/{quote(cat)}"
@@ -242,7 +258,7 @@ def get_state(channel_id):
         }
     return channels_state[channel_id]
 
-# --- 4-1. インタラクティブ・メニューUI (ドロップダウン選択) ---
+# --- 4-1. インタラクティブ・メニューUI ---
 class ModeSelect(discord.ui.Select):
     def __init__(self, channel_id):
         self.channel_id = channel_id
@@ -252,6 +268,7 @@ class ModeSelect(discord.ui.Select):
             discord.SelectOption(label="🚀 自動：無言超有能", value="7", description="メンション不要・自律返信"),
             discord.SelectOption(label="📺 自動：配信コメント", value="8", description="定型コメント・台パン動画リアクション"),
             discord.SelectOption(label="📜 検索：ランダム名言", value="11", description="毎回ネットから名言を引用・解説"),
+            discord.SelectOption(label="🤪 検索：ランダム迷言", value="12", description="毎回ネットから失言・珍言・迷言を引用"),
             discord.SelectOption(label="💀 自動：アンチ暴走", value="9", description="超毒舌・煽り・権力悪用"),
             discord.SelectOption(label="🌪️ 自動：荒らしモード", value="10", description="怪文書・草生やし・混沌"),
             discord.SelectOption(label="🌱 成長：オウム返し", value="1", description="単語を拾って話す初期生命体"),
@@ -273,7 +290,8 @@ class ModeSelect(discord.ui.Select):
             "8": ("auto_stream", "📺【自動：配信コメント】"),
             "9": ("anti_berserk", "💀【自動：アンチ暴走】"),
             "10": ("troll_chaos", "🌪️【自動：荒らしモード】"),
-            "11": ("quote_search", "📜【検索：ランダム名言】")
+            "11": ("quote_search", "📜【検索：ランダム名言】"),
+            "12": ("meigen_search", "🤪【検索：ランダム迷言】")
         }
         val = self.values[0]
         state = get_state(self.channel_id)
@@ -323,7 +341,8 @@ class MainMenuView(discord.ui.View):
         await generate_bunshun_article(interaction.channel)
 
 def get_sys_instruction(state, is_bot_opponent=False, clone_prompt=None):
-    if clone_prompt: return clone_prompt + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+    base_rules = BASE_DIRECTIVE + TARGET_USER_DIRECTIVE
+    if clone_prompt: return clone_prompt + base_rules + COMMANDS_DIRECTIVE
     mode = state["mode"]
     count = state["count"]
     is_berserk = (random.random() < 0.03)
@@ -332,28 +351,30 @@ def get_sys_instruction(state, is_bot_opponent=False, clone_prompt=None):
 
     if mode == "grow_echo":
         vocab_sample = ", ".join(random.sample(state["vocab"], min(len(state["vocab"]), 15))) if state["vocab"] else "なし"
-        return f"オウム返しのみで話す生命体。語彙: [{vocab_sample}]" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return f"オウム返しのみで話す生命体。語彙: [{vocab_sample}]" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
     elif mode == "grow_age":
         stage = "3歳" if count < 5 else "8歳" if count < 15 else "15歳" if count < 30 else "25歳"
-        return f"会話数で成長するAI。現在: {stage}" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return f"会話数で成長するAI。現在: {stage}" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
     elif mode == "grow_educate":
         facts = "\n".join([f"- {f}" for f in state["learned_facts"][-20:]]) or "（未学習）"
-        return f"教わった知識のみで生きるAI。\n学習データ:\n{facts}" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return f"教わった知識のみで生きるAI。\n学習データ:\n{facts}" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
     elif mode in ["normal_full", "auto_full"]:
-        return "万能Discord統轄AI。全管理・画像解析・調査・全権限行使。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return "万能Discord統轄AI。全管理・画像解析・調査・全権限行使。" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
     elif mode == "auto_stream":
-        return STREAM_COMMENT_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE
+        return STREAM_COMMENT_PROMPT + berserk_text + rival_text + base_rules
     elif mode == "quote_search":
-        return QUOTE_SEARCH_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE
+        return QUOTE_SEARCH_PROMPT + berserk_text + rival_text + base_rules
+    elif mode == "meigen_search":
+        return MEIGEN_SEARCH_PROMPT + berserk_text + rival_text + base_rules
     elif mode == "anti_berserk":
-        return ANTI_ROLEPLAY_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return ANTI_ROLEPLAY_PROMPT + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
     elif mode == "troll_chaos":
-        return TROLL_CHAOS_PROMPT + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return TROLL_CHAOS_PROMPT + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
     elif mode == "normal_chat":
-        return "自由に対話するAI。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return "自由に対話するAI。" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
     elif mode == "reset_full":
-        return "単発万能AI。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
-    return "万能AI。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+        return "単発万能AI。" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
+    return "万能AI。" + berserk_text + rival_text + base_rules + COMMANDS_DIRECTIVE
 
 def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
     global current_key_index
@@ -419,7 +440,6 @@ def parse_hex_color(hex_str):
     try: return discord.Color(int(hex_str.strip().lstrip('#'), 16))
     except Exception: return discord.Color.default()
 
-# Webhookを使って対象になりすましてメッセージを送信するヘルパー（完全版）
 async def send_as_webhook(channel, target_member, content, file=None):
     try:
         avatar_bytes = None
@@ -451,7 +471,7 @@ async def send_as_webhook(channel, target_member, content, file=None):
         print(f"Webhookエラー: {e}")
         return False
 
-# --- 5. サーバー管理ハンドラ（120種超・完全網羅） ---
+# --- 5. サーバー管理ハンドラ ---
 async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
     clean_text = reply_text
     image_file = None
@@ -466,7 +486,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
         me = guild.me
         allow_destructive = not is_anti_or_troll
 
-        # 1. 投票 (Polls) の作成
         poll_m = re.search(r'\[CREATE_POLL:\s*(.+?),\s*(.+?)(?:,\s*(\d+))?(?:,\s*(true|false))?\]', clean_text, re.IGNORECASE)
         if poll_m:
             try:
@@ -488,7 +507,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
             except Exception as e:
                 print(f"Poll作成失敗: {e}")
 
-        # 投票の強制終了
         if "[END_POLL]" in clean_text.upper():
             try:
                 target_poll_msg = last_polls.get(message.channel.id)
@@ -496,7 +514,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                     await target_poll_msg.end_poll()
             except Exception: pass
 
-        # 2. 制裁系 (KICK, BAN, UNBAN, TIMEOUT, UNTIMEOUT)
         m = re.search(r'\[KICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.kick_members:
             t = find_target_member(guild, m.group(1))
@@ -531,7 +548,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                 try: await t.timeout(None)
                 except Exception: pass
 
-        # 3. メッセージ操作 (PURGE, PIN, REACT, CROSSPOST, SILENT_MSG)
         m = re.search(r'\[PURGE:\s*(\d+)\]', clean_text, re.IGNORECASE)
         if m and allow_destructive and message.channel.permissions_for(me).manage_messages:
             try: await message.channel.purge(limit=min(int(m.group(1)), 100) + 1)
@@ -573,7 +589,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
             try: await message.channel.send(content=m.group(1).strip(), silent=True)
             except Exception: pass
 
-        # 4. 役職操作
         m = re.search(r'\[ADD_ROLE:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_roles:
             t = find_target_member(guild, m.group(1))
@@ -626,7 +641,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                 try: await r.edit(mentionable=(m.group(2).lower() == "true"))
                 except Exception: pass
 
-        # 5. チャンネル詳細権限オーバーライド (SET_CHANNEL_PERM)
         m = re.search(r'\[SET_CHANNEL_PERM:\s*(.+?),\s*(.+?),\s*([a-z_]+),\s*(allow|deny|neutral)\]', clean_text, re.IGNORECASE)
         if m and message.channel.permissions_for(me).manage_roles:
             ch = find_target_channel(guild, m.group(1)) or message.channel
@@ -640,7 +654,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                     await ch.set_permissions(target, overwrite=overwrites)
                 except Exception: pass
 
-        # 6. 個人改変・傀儡 (NICK, RESET_NICK, MASS_NICK, IMPERSONATE, DM)
         m = re.search(r'\[NICK:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_nicknames:
             t = find_target_member(guild, m.group(1))
@@ -676,7 +689,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                 try: await t.send(f"📬 **[ポチからの直接伝令]**\n{m.group(2).strip()}")
                 except Exception: pass
 
-        # 7. チャンネル・カテゴリ・フォーラム・スレッド
         m = re.search(r'\[CREATE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and allow_destructive and me.guild_permissions.manage_channels:
             try: await guild.create_text_channel(name=m.group(1).strip())
@@ -721,7 +733,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
             try: await message.channel.create_thread(name=m.group(1).strip(), message=message)
             except Exception: pass
 
-        # 8. ボイス・ステージ
         m = re.search(r'\[CREATE_VOICE:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and allow_destructive and me.guild_permissions.manage_channels:
             try: await guild.create_voice_channel(name=m.group(1).strip())
@@ -761,7 +772,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                 try: await t.move_to(v_ch)
                 except Exception: pass
 
-        # 9. AutoMod (自動モデレーション)
         m = re.search(r'\[CREATE_AUTOMOD_KEYWORD:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_guild:
             r_name = m.group(1).strip()
@@ -775,7 +785,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                 )
             except Exception: pass
 
-        # 10. サーバー公式設定
         m = re.search(r'\[RENAME_SERVER:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and allow_destructive and me.guild_permissions.manage_guild:
             try: await guild.edit(name=m.group(1).strip())
@@ -804,7 +813,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                 )
             except Exception: pass
 
-        # 11. 偽の公式アラート送信
         m = re.search(r'\[FAKE_SYSTEM_ALERT:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m:
             alert_embed = discord.Embed(
@@ -816,7 +824,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
             try: await message.channel.send(embed=alert_embed)
             except Exception: pass
 
-        # 12. 自律ステータス変更
         m = re.search(r'\[SET_STATUS:\s*(playing|watching|listening|streaming),\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m:
             st_type = m.group(1).lower()
@@ -832,7 +839,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
 
 # --- 6. 企画・専用コマンド群 ---
 
-# インタラクティブ一覧メニュー
 @bot.command()
 async def menu(ctx):
     view = MainMenuView(ctx.channel.id)
@@ -844,7 +850,6 @@ async def menu(ctx):
     embed.add_field(name="📚 主なコマンド", value="`!poll` 投票作成\n`!mimic` 外見なりすまし\n`!clone` 完全憑依ドッペルゲンガー\n`!judge` AI即決裁判所\n`!dungeon` デスゲームRPG\n`!tools` 外部お役立ち機能一覧", inline=False)
     await ctx.send(embed=embed, view=view)
 
-# 投票コマンド
 @bot.command()
 async def poll(ctx, question: str = "", *options):
     if not question or len(options) < 2:
@@ -862,7 +867,6 @@ async def poll(ctx, question: str = "", *options):
     else:
         await ctx.send("現在お使いのdiscord.pyバージョンでは公式Pollsに対応していません。")
 
-# ミミック
 @bot.command()
 async def mimic(ctx, target_str: str = ""):
     target = find_target_member(ctx.guild, target_str)
@@ -879,7 +883,6 @@ async def unmimic(ctx):
         await ctx.send("🎭 ミミックを解除しました。")
     else: await ctx.send("ミミックは起動していません。")
 
-# クローン
 @bot.command()
 async def clone(ctx, target_str: str = ""):
     target = find_target_member(ctx.guild, target_str)
@@ -904,7 +907,6 @@ async def unclone(ctx):
         await ctx.send("👥 ドッペルゲンガーを解除しました。")
     else: await ctx.send("ドッペルゲンガーは起動していません。")
 
-# AI即決裁判所
 @bot.command()
 async def judge(ctx, user_a_str: str = "", user_b_str: str = ""):
     guild = ctx.guild
@@ -927,7 +929,6 @@ async def judge(ctx, user_a_str: str = "", user_b_str: str = ""):
         ans, img = await handle_special_actions(ctx.message, res.text if res.text else "判決不能")
         await ctx.send(f"⚖️ **【AI裁判所 判決】**\n{ans}", file=img)
 
-# ダンジョンRPG
 @bot.command()
 async def dungeon(ctx, action: str = ""):
     guild = ctx.guild
@@ -959,7 +960,6 @@ async def dungeon(ctx, action: str = ""):
                         try: await m.timeout(timedelta(minutes=3), reason="ダンジョン全滅")
                         except Exception: pass
 
-# 週刊文春
 async def generate_bunshun_article(channel):
     async with channel.typing():
         logs = []
@@ -989,7 +989,6 @@ async def daily_bunshun_task():
                 except Exception: pass
         await asyncio.sleep(60)
 
-# ロシアンルーレット
 @bot.command()
 async def roulette(ctx):
     members = [m for m in ctx.channel.members if not m.bot]
@@ -1004,7 +1003,6 @@ async def roulette(ctx):
             await ctx.send(f"💀 **{victim.display_name}** は3分間沈黙。")
         except Exception: pass
 
-# 黒歴史捏造
 @bot.command()
 async def leak(ctx, target_str: str = ""):
     target = find_target_member(ctx.guild, target_str)
@@ -1023,7 +1021,6 @@ async def leak(ctx, target_str: str = ""):
         ans, img = await handle_special_actions(ctx.message, res.text if res.text else "失敗")
         await ctx.send(f"🚨 **【流出速報・不祥事会見】**\n{ans}", file=img)
 
-# ステータス回転
 @tasks.loop(minutes=15)
 async def rotate_presence():
     statuses = [
@@ -1040,33 +1037,18 @@ async def rotate_presence():
     elif st[0] == "streaming": act_type = discord.ActivityType.streaming
     await bot.change_presence(activity=discord.Activity(type=act_type, name=st[1]))
 
-# --- 7. 【大盤振る舞い】Discord以外の超便利・エンタメ外部ツール（40種超） ---
+# --- 7. 外部ツール群 ---
 @bot.command()
 async def tools(ctx):
-    """外部機能の一覧表示"""
     msg = (
-        "🛠️ **【ポチ特製・外部お役立ち＆エンタメツール一覧（全40種超）】**\n"
-        "・`!calc <数式>` : 超高精度計算機（平方根・三角関数対応）\n"
-        "・`!qr <文字列>` : QRコード画像を即時自動生成\n"
-        "・`!wiki <単語>` : Wikipedia記事を要約検索\n"
-        "・`!weather <都市名>` : 世界各国のリアルタイム天気を取得\n"
-        "・`!cur <金額> <元通貨> <先通貨>` : 為替レート・通貨換算 (例: `!cur 100 USD JPY`)\n"
-        "・`!pw <桁数>` : 強力なランダムパスワードを生成\n"
-        "・`!b64enc <文字列>` / `!b64dec <Base64>` : Base64エンコード・デコード\n"
-        "・`!hash <文字列>` : MD5, SHA-256等のハッシュ値を一括生成\n"
-        "・`!rot13 <文字列>` : シーザー暗号(ROT13)の暗号化・復号\n"
-        "・`!roll <ダイス>` : 多面ダイス振り (例: `!roll 2d6`, `!roll 1d100`)\n"
-        "・`!coin` : コイントス（表か裏か）\n"
-        "・`!tarot` : タロット占い（大アルカナから引いて運勢判定）\n"
-        "・`!horo <星座>` : 毎日の12星座運勢\n"
-        "・`!time <都市名>` : 世界主要都市の現在時刻と時差\n"
-        "・`!unit <数値> <単位1> <単位2>` : 単位換算（km-mile, kg-lb, ℃-℉等）\n"
-        "・`!shorten <URL>` : 長いURLを安全に短縮\n"
-        "・`!unshorten <URL>` : 短縮URLの正体を暴く\n"
-        "・`!ipinfo <IPアドレス>` : IPアドレスの地域・プロバイダ調査\n"
-        "・`!fakeprofile` : 創作用のダミー偽装身分証プロフィール生成\n"
-        "・`!quote` : ネット検索型・ランダム名言を単発召喚\n"
-        "※その他、通常のチャットで「〜を翻訳して」「〜を要約して」と頼むとGeminiが直接処理します！"
+        "🛠️ **【ポチ特製・外部ツール一覧】**\n"
+        "・`!calc <数式>` : 高精度計算機\n・`!qr <文字列>` : QRコード自動生成\n"
+        "・`!wiki <単語>` : Wikipedia要約\n・`!weather <都市>` : 天気予報\n"
+        "・`!cur <金額> <元> <先>` : 為替換算\n・`!pw <桁数>` : パスワード生成\n"
+        "・`!b64enc <文>` / `!b64dec <文>` : Base64\n・`!hash <文>` : ハッシュ生成\n"
+        "・`!rot13 <文>` : ROT13暗号\n・`!roll <ダイス>` : ダイス振り\n"
+        "・`!coin` : コイントス\n・`!tarot` : タロット占い\n"
+        "・`!fakeprofile` : 偽装身分証\n・`!quote` : ランダム名言\n・`!meigen` : ランダム迷言"
     )
     await ctx.send(msg)
 
@@ -1110,8 +1092,7 @@ async def cur(ctx, amount: float = 100, from_c: str = "USD", to_c: str = "JPY"):
     try:
         res = requests.get(f"https://open.er-api.com/v6/latest/{from_c.upper()}", timeout=4).json()
         rate = res["rates"][to_c.upper()]
-        result = amount * rate
-        await ctx.send(f"💱 **為替換算:** {amount} {from_c.upper()} = **{result:,.2f} {to_c.upper()}** (レート: {rate})")
+        await ctx.send(f"💱 **為替換算:** {amount} {from_c.upper()} = **{amount * rate:,.2f} {to_c.upper()}** (レート: {rate})")
     except Exception as e: await ctx.send(f"為替取得エラー: {e}")
 
 @bot.command()
@@ -1121,8 +1102,7 @@ async def pw(ctx, length: int = 16):
     try:
         await ctx.author.send(f"🔑 **生成パスワード:** `{res}`")
         await ctx.send(f"🔒 {ctx.author.mention} のDMに安全にパスワードを送信しました！")
-    except Exception:
-        await ctx.send(f"🔑 **生成パスワード:** `{res}`")
+    except Exception: await ctx.send(f"🔑 **生成パスワード:** `{res}`")
 
 @bot.command()
 async def b64enc(ctx, *, text: str = ""):
@@ -1147,9 +1127,8 @@ async def rot13(ctx, *, text: str = ""):
 @bot.command()
 async def roll(ctx, dice_str: str = "1d100"):
     m = re.match(r'(\d+)d(\d+)', dice_str.lower())
-    if not m: return await ctx.send("【使用法】`!roll 2d6` または `!roll 1d100`")
-    num, sides = int(m.group(1)), int(m.group(2))
-    rolls = [random.randint(1, sides) for _ in range(min(num, 50))]
+    if not m: return await ctx.send("【使用法】`!roll 2d6`")
+    rolls = [random.randint(1, int(m.group(2))) for _ in range(min(int(m.group(1)), 50))]
     await ctx.send(f"🎲 **ダイス結果 ({dice_str}):** {rolls} ➔ **合計: {sum(rolls)}**")
 
 @bot.command()
@@ -1182,13 +1161,19 @@ async def fakeprofile(ctx):
 
 @bot.command()
 async def quote(ctx):
-    """ネット検索型・ランダム名言を単発即時呼び出し"""
     async with ctx.typing():
-        ref = await asyncio.to_thread(_fetch_random_quote_sync)
+        ref = await asyncio.to_thread(_fetch_random_web_sync, "名言")
         prompt = QUOTE_SEARCH_PROMPT + ref + "\n心揺さぶる名言を1つ出力せよ。"
         res = await asyncio.to_thread(call_gemini_api, get_state(ctx.channel.id), prompt)
-        ans = res.text if res.text else "沈黙は金なり。"
-        await ctx.send(ans)
+        await ctx.send(res.text if res.text else "沈黙は金なり。")
+
+@bot.command()
+async def meigen(ctx):
+    async with ctx.typing():
+        ref = await asyncio.to_thread(_fetch_random_web_sync, "迷言")
+        prompt = MEIGEN_SEARCH_PROMPT + ref + "\n爆笑必至の迷言・失言を1つ出力せよ。"
+        res = await asyncio.to_thread(call_gemini_api, get_state(ctx.channel.id), prompt)
+        await ctx.send(res.text if res.text else "迷言取得失敗。")
 
 # --- 8. 基本イベント & ハンドラ ---
 @bot.event
@@ -1210,7 +1195,8 @@ async def mode(ctx, mode_name: str = ""):
         "8": ("auto_stream", "📺【自動：配信コメント】人間には自動返信・テキスト限定リスナー反応"),
         "9": ("anti_berserk", "💀【自動：アンチ暴走】人間には自動返信・超毒舌＆権力悪用"),
         "10": ("troll_chaos", "🌪️【自動：荒らしモード】人間には自動返信・怪文書・草生やし"),
-        "11": ("quote_search", "📜【検索：ランダム名言】毎回ネットから名言を引用・解説")
+        "11": ("quote_search", "📜【検索：ランダム名言】毎回ネットから名言を引用・解説"),
+        "12": ("meigen_search", "🤪【検索：ランダム迷言】毎回ネットから失言・珍言・迷言を引用")
     }
     state = get_state(ctx.channel.id)
     target_key = next((k for k, v in modes.items() if mode_name.strip() in [k, v[0]]), None)
@@ -1219,7 +1205,7 @@ async def mode(ctx, mode_name: str = ""):
         state["history"] = []
         await ctx.send(f"モードを切り替えました！\n▶ **{modes[target_key][1]}**")
     else:
-        msg = "【切り替え可能モード一覧】（`!menu` で画面選択も可能）\n" + "\n".join([f"`!mode {k}` : {v[1]}" + (" (選択中)" if state["mode"] == v[0] else "") for k, v in modes.items()])
+        msg = "【切り替え可能モード一覧】（`!menu` でも選択可能）\n" + "\n".join([f"`!mode {k}` : {v[1]}" + (" (選択中)" if state["mode"] == v[0] else "") for k, v in modes.items()])
         await ctx.send(msg)
 
 @bot.command()
@@ -1238,6 +1224,13 @@ async def status(ctx):
 @bot.event
 async def on_message(message):
     if message.author.id == bot.user.id or message.webhook_id: return
+
+    # コマンドの優先ディスパッチ
+    ctx = await bot.get_context(message)
+    if ctx.valid:
+        await bot.invoke(ctx)
+        return
+
     content = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
 
     ch_id = message.channel.id
@@ -1249,13 +1242,8 @@ async def on_message(message):
             await message.reply(f"🛑 {'と'.join(canceled)}を解除して通常のポチに戻りました！")
             return
 
-    if content.startswith("!"):
-        message.content = content
-        await bot.process_commands(message)
-        return
-
     state = get_state(ch_id)
-    is_auto_mode = state["mode"] in ["auto_full", "auto_stream", "anti_berserk", "troll_chaos", "quote_search"]
+    is_auto_mode = state["mode"] in ["auto_full", "auto_stream", "anti_berserk", "troll_chaos", "quote_search", "meigen_search"]
     is_mentioned = bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel)
     is_cloned = ch_id in cloned_targets
     is_mimic = ch_id in mimic_targets
@@ -1295,13 +1283,15 @@ async def on_message(message):
                         if img_pil: image_parts.append(img_pil)
 
                 sender_type = "BOT" if message.author.bot else "人間ユーザー"
-                context_prefix = f"【発言者: {message.author.display_name} (ID: {message.author.id}, 属性: {sender_type})】\n"
+                sender_name = message.author.name
+                display_name = message.author.display_name
+                context_prefix = f"【発言者: {display_name} (ユーザー名: {sender_name}, ID: {message.author.id}, 属性: {sender_type})】\n"
                 input_to_gemini = context_prefix + (user_text if user_text else "この画像を分析してください。")
 
                 if state["mode"] == "quote_search":
-                    # 名言モード時はWikipediaから動的ランダムコンテキストを注入
-                    rand_context = await asyncio.to_thread(_fetch_random_quote_sync)
-                    input_to_gemini += rand_context
+                    input_to_gemini += await asyncio.to_thread(_fetch_random_web_sync, "名言")
+                elif state["mode"] == "meigen_search":
+                    input_to_gemini += await asyncio.to_thread(_fetch_random_web_sync, "迷言")
 
                 if state["mode"] in ["normal_full", "reset_full", "auto_full", "anti_berserk", "troll_chaos"] and ("http" in user_text or "www." in user_text):
                     input_to_gemini += await process_all_links_async(user_text)
