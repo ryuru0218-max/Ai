@@ -277,7 +277,7 @@ class ActionContext:
         self.author = interaction.user
         self.reference = None
 
-# --- 6. 動的モーダルUI ---
+# --- 6. 動的モーダルUI (即時応答型) ---
 class ActionInputModal(discord.ui.Modal):
     def __init__(self, action, title, labels):
         super().__init__(title=title[:45])
@@ -289,7 +289,8 @@ class ActionInputModal(discord.ui.Modal):
             self.inputs.append(inp)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+        # 3秒制限対策として即座にackを返す
+        await interaction.response.defer(ephemeral=True)
         vals = [i.value.strip() for i in self.inputs]
         ch = interaction.channel
         guild = interaction.guild
@@ -408,9 +409,9 @@ class ActionInputModal(discord.ui.Modal):
 
                 if tag_str:
                     await handle_special_actions(ctx_mock, tag_str)
-                    await interaction.followup.send(f"✅ 実行完了: `{tag_str}`")
+                    await interaction.followup.send(f"✅ 実行完了: `{tag_str}`", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"⚠️ 実行時エラー: {e}")
+            await interaction.followup.send(f"⚠️ 実行時エラー: {e}", ephemeral=True)
 
 # --- 7. タイマン＆バトロワのコアロジック ---
 async def execute_duel(channel, fighter1, fighter2):
@@ -536,10 +537,11 @@ class ModeSelect(discord.ui.Select):
         super().__init__(placeholder="【1】人格・動作モード選択 (全12種)", min_values=1, max_values=1, options=opts, row=0)
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         m_map = {"1": "grow_echo", "2": "grow_age", "3": "grow_educate", "4": "normal_full", "5": "normal_chat", "6": "reset_full", "7": "auto_full", "8": "auto_stream", "9": "anti_berserk", "10": "troll_chaos", "11": "quote_search", "12": "meigen_search"}
         get_state(self.channel_id)["mode"] = m_map[self.values[0]]
         get_state(self.channel_id)["history"] = []
-        await interaction.response.send_message(f"モードを `{m_map[self.values[0]]}` に切り替えました！", ephemeral=False)
+        await interaction.followup.send(f"モードを `{m_map[self.values[0]]}` に切り替えました！", ephemeral=True)
 
 class EntSelect(discord.ui.Select):
     def __init__(self, channel_id):
@@ -568,13 +570,12 @@ class EntSelect(discord.ui.Select):
         elif val == "leak": await interaction.response.send_modal(ActionInputModal("leak", "黒歴史捏造", ["対象ユーザー"]))
         elif val == "silent": await interaction.response.send_modal(ActionInputModal("silent", "サイレントメッセージ", ["送信するテキスト"]))
         else:
-            await interaction.response.defer()
+            await interaction.response.defer(ephemeral=True)
             ch = interaction.channel
             ctx_mock = ActionContext(interaction)
             if val == "royale":
                 await execute_battle_royale(ch)
             elif val == "bunshun":
-                await interaction.followup.send("📰 文春砲を装填中...")
                 prompt = "極悪記者。ログから痛い発言のスクープを書け。\n末尾に [IMAGE: tabloid scandal newspaper headline art] をつけろ。"
                 res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), prompt)
                 ans, img = await handle_special_actions(ctx_mock, res.text if res.text else "")
@@ -583,25 +584,25 @@ class EntSelect(discord.ui.Select):
                 members = [m for m in ch.members if not m.bot]
                 if len(members) < 2: return await interaction.followup.send("参加者不足")
                 vic = random.choice(members)
-                await interaction.followup.send(f"🎰 **【ルーレット】** 被弾: **{vic.display_name}**")
+                await ch.send(f"🎰 **【ルーレット】** 被弾: **{vic.display_name}**")
                 if interaction.guild.me.guild_permissions.moderate_members and vic.top_role < interaction.guild.me.top_role and interaction.guild.owner_id != vic.id:
                     try: await vic.timeout(timedelta(minutes=3))
                     except Exception: pass
             elif val == "dungeon":
                 active_dungeons[ch.id] = {"hp": 100, "floor": 1}
-                await interaction.followup.send("🏰 **【AIダンジョン 開幕】** `!dungeon <行動>` で進め！")
+                await ch.send("🏰 **【AIダンジョン 開幕】** `!dungeon <行動>` で進め！")
             elif val == "unmimic":
                 if ch.id in mimic_targets: del mimic_targets[ch.id]
                 if ch.id in cloned_targets: del cloned_targets[ch.id]
-                await interaction.followup.send("🎭 憑依・偽装を解除しました。")
+                await interaction.followup.send("🎭 憑依・偽装を解除しました。", ephemeral=True)
             elif val == "fake_id":
-                await interaction.followup.send(f"🪪 **【ダミー身分証】** 氏名: 山田太郎\n偽装コード: `{hashlib.md5(str(random.random()).encode()).hexdigest()[:8].upper()}`")
-            elif val == "tarot": await interaction.followup.send(f"🔮 **【タロット】** カード: **{random.choice(['愚者', '魔術師', '死神', '太陽', '塔'])}**")
-            elif val == "coin": await interaction.followup.send(f"🪙 **コイントス:** **{'表' if random.random() < 0.5 else '裏'}**！")
-            elif val == "dice": await interaction.followup.send(f"🎲 **1d100:** `{random.randint(1, 100)}`")
+                await ch.send(f"🪪 **【ダミー身分証】** 氏名: 山田太郎\n偽装コード: `{hashlib.md5(str(random.random()).encode()).hexdigest()[:8].upper()}`")
+            elif val == "tarot": await ch.send(f"🔮 **【タロット】** カード: **{random.choice(['愚者', '魔術師', '死神', '太陽', '塔'])}**")
+            elif val == "coin": await ch.send(f"🪙 **コイントス:** **{'表' if random.random() < 0.5 else '裏'}**！")
+            elif val == "dice": await ch.send(f"🎲 **1d100:** `{random.randint(1, 100)}`")
             elif val == "fake_alert":
                 emb = discord.Embed(title="⚠️ Discord System Critical Alert", description="不正なAPIアクティビティが検知されました。", color=discord.Color.red())
-                await interaction.followup.send(embed=emb)
+                await ch.send(embed=emb)
 
 class ExtSelect(discord.ui.Select):
     def __init__(self, channel_id):
@@ -629,16 +630,16 @@ class ExtSelect(discord.ui.Select):
         elif val == "hash": await interaction.response.send_modal(ActionInputModal("hash", "ハッシュ生成", ["テキスト"]))
         elif val == "rot13": await interaction.response.send_modal(ActionInputModal("rot13", "ROT13暗号化", ["テキスト"]))
         else:
-            await interaction.response.defer()
+            await interaction.response.defer(ephemeral=True)
             ch_id = self.channel_id
             if val == "quote":
                 ref = await asyncio.to_thread(_fetch_random_web_sync, "名言")
                 res = await asyncio.to_thread(call_gemini_api, get_state(ch_id), QUOTE_SEARCH_PROMPT + ref + "\n名言を出力。")
-                await interaction.followup.send(res.text if res.text else "沈黙")
+                await interaction.followup.send(res.text if res.text else "沈黙", ephemeral=True)
             elif val == "meigen":
                 ref = await asyncio.to_thread(_fetch_random_web_sync, "迷言")
                 res = await asyncio.to_thread(call_gemini_api, get_state(ch_id), MEIGEN_SEARCH_PROMPT + ref + "\n迷言を出力。")
-                await interaction.followup.send(res.text if res.text else "失敗")
+                await interaction.followup.send(res.text if res.text else "失敗", ephemeral=True)
 
 class DiscSelectPart1(discord.ui.Select):
     def __init__(self, channel_id):
@@ -684,25 +685,25 @@ class DiscSelectPart1(discord.ui.Select):
         elif val == "automod_kw": await interaction.response.send_modal(ActionInputModal("automod_kw", "AutoMod禁止ワード", ["ルール名", "禁止ワード(スラッシュ区切り)"]))
         elif val == "announce": await interaction.response.send_modal(ActionInputModal("announce", "アナウンス送信", ["本文"]))
         else:
-            await interaction.response.defer()
+            await interaction.response.defer(ephemeral=True)
             ch = interaction.channel
             guild = interaction.guild
             if val == "act_end_poll":
                 if ch.id in last_polls and last_polls[ch.id].poll:
-                    try: await last_polls[ch.id].end_poll(); await interaction.followup.send("⛔ 投票を締め切りました。")
+                    try: await last_polls[ch.id].end_poll(); await interaction.followup.send("⛔ 投票を締め切りました。", ephemeral=True)
                     except Exception: pass
             elif val == "act_lock":
                 if ch.permissions_for(guild.me).manage_roles:
                     await ch.set_permissions(guild.default_role, send_messages=False)
-                    await interaction.followup.send("⛔ チャンネルを緊急封鎖しました！")
+                    await interaction.followup.send("⛔ チャンネルを緊急封鎖しました！", ephemeral=True)
             elif val == "act_unlock":
                 if ch.permissions_for(guild.me).manage_roles:
                     await ch.set_permissions(guild.default_role, send_messages=True)
-                    await interaction.followup.send("✅ チャンネル封鎖を解除しました！")
+                    await interaction.followup.send("✅ チャンネル封鎖を解除しました！", ephemeral=True)
             elif val == "act_invite":
                 if ch.permissions_for(guild.me).create_instant_invite:
                     inv = await ch.create_invite(max_age=3600, max_uses=5)
-                    await interaction.followup.send(f"📎 招待リンク: {inv.url}")
+                    await interaction.followup.send(f"📎 招待リンク: {inv.url}", ephemeral=True)
 
 class DiscSelectPart2(discord.ui.Select):
     def __init__(self, channel_id):
@@ -740,12 +741,13 @@ class MainMenuView(discord.ui.View):
 
     @discord.ui.button(label="🧹 記憶完全初期化", style=discord.ButtonStyle.danger, row=4)
     async def btn_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         state = get_state(interaction.channel.id)
         state["count"] = 0
         state["vocab"] = []
         state["learned_facts"] = []
         state["history"] = []
-        await interaction.response.send_message("🧹 このチャンネルの記憶・対話履歴を完全にリセットしました！", ephemeral=False)
+        await interaction.followup.send("🧹 このチャンネルの記憶・対話履歴を完全にリセットしました！", ephemeral=True)
 
     @discord.ui.button(label="📊 システム状態確認", style=discord.ButtonStyle.primary, row=4)
     async def btn_status(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1258,7 +1260,7 @@ async def on_message(message):
                 if state["mode"] in ["normal_full", "reset_full", "auto_full", "anti_berserk", "troll_chaos"] and "http" in content:
                     in_txt += await process_all_links_async(content)
 
-                # d3dfish__76102 への対応（モード6のときも定型コメント選択肢の中から選んで対応するよう常時適用）
+                # d3dfish__76102 への対応（モード6のときも定型コメントの中から選んで対応するよう常時適用）
                 d3dfish_rule = ""
                 if message.author.name == "d3dfish__76102" or message.author.display_name == "d3dfish__76102":
                     d3dfish_rule = D3DFISH_NEURON_DIRECTIVE
