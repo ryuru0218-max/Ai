@@ -160,7 +160,7 @@ MEIGEN_SEARCH_PROMPT = """
 【ツッコミ・解説】（なぜ迷言なのか、どこが狂っているのかを切れ味鋭く解説）
 """
 
-# --- 3. 外部解析 & Webスクレイピング（高速・非同期化） ---
+# --- 3. 外部解析 & Webスクレイピング ---
 def _fetch_random_web_sync(category_type="名言"):
     categories = ["哲学", "文学", "歴史", "名言"] if category_type == "名言" else ["インターネットの文化", "スラング", "ユーモア", "パロディ"]
     cat = random.choice(categories)
@@ -252,7 +252,50 @@ def get_state(channel_id):
         }
     return channels_state[channel_id]
 
-# --- 4-1. インタラクティブ・メニューUI ---
+# --- 4-1. モーダル入力UI（対話式実行用） ---
+class GenericInputModal(discord.ui.Modal):
+    def __init__(self, title, label, action_type):
+        super().__init__(title=title[:45])
+        self.action_type = action_type
+        self.user_input = discord.ui.TextInput(label=label[:45], style=discord.TextStyle.short, required=True)
+        self.add_item(self.user_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        val = self.user_input.value.strip()
+        await interaction.response.defer()
+        if self.action_type == "calc":
+            try:
+                allowed = {"sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan, "pi": math.pi, "e": math.e}
+                res = eval(val, {"__builtins__": None}, allowed)
+                await interaction.followup.send(f"🔢 **計算結果:** `{res}`")
+            except Exception as e:
+                await interaction.followup.send(f"⚠️ 計算エラー: {e}")
+        elif self.action_type == "qr":
+            url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={quote(val)}"
+            embed = discord.Embed(title="📱 QRコード生成完了")
+            embed.set_image(url=url)
+            await interaction.followup.send(embed=embed)
+        elif self.action_type == "wiki":
+            try:
+                res = requests.get(f"https://ja.wikipedia.org/api/rest_v1/page/summary/{quote(val)}", timeout=3).json()
+                extract = res.get("extract", "該当する記事が見つかりませんでした。")
+                await interaction.followup.send(f"📚 **Wikipedia: {val}**\n{extract[:1500]}")
+            except Exception as e:
+                await interaction.followup.send(f"⚠️ 取得エラー: {e}")
+        elif self.action_type == "weather":
+            try:
+                res = requests.get(f"https://wttr.in/{quote(val)}?format=%C+%t+湿度:%h+風速:%w", timeout=3).text
+                await interaction.followup.send(f"☀️ **{val}の天気:** {res}")
+            except Exception as e:
+                await interaction.followup.send(f"⚠️ 取得エラー: {e}")
+        elif self.action_type == "hash":
+            md5 = hashlib.md5(val.encode()).hexdigest()
+            sha256 = hashlib.sha256(val.encode()).hexdigest()
+            await interaction.followup.send(f"🔐 **MD5:** `{md5}`\n🛡️ **SHA-256:** `{sha256}`")
+        elif self.action_type == "b64enc":
+            await interaction.followup.send(f"📦 **Base64:** `{base64.b64encode(val.encode()).decode()}`")
+
+# --- 4-2. 新生・全機能完全網羅メニューUI ---
 class ModeSelect(discord.ui.Select):
     def __init__(self, channel_id):
         self.channel_id = channel_id
@@ -270,7 +313,7 @@ class ModeSelect(discord.ui.Select):
             discord.SelectOption(label="📖 成長：教育育成", value="3", description="教えたことだけで成長"),
             discord.SelectOption(label="⚡ リセット：単発", value="6", description="毎回記憶ゼロ・全機能解放")
         ]
-        super().__init__(placeholder="人格・動作モードを選択...", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder="【1】人格・動作モードを切り替え...", min_values=1, max_values=1, options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
         mode_map = {
@@ -293,46 +336,182 @@ class ModeSelect(discord.ui.Select):
         state["history"] = []
         await interaction.response.send_message(f"モードを切り替えました！\n▶ **{mode_map[val][1]}**", ephemeral=False)
 
+class ActionFeatureSelect(discord.ui.Select):
+    def __init__(self, channel_id):
+        self.channel_id = channel_id
+        options = [
+            discord.SelectOption(label="📰 週刊文春（即時発行）", value="act_bunshun", description="チャット履歴を嗅ぎ回ってゴシップ記事生成", emoji="🗞️"),
+            discord.SelectOption(label="🎰 ロシアンルーレット", value="act_roulette", description="ランダムで1名を物理タイムアウト処刑", emoji="🔫"),
+            discord.SelectOption(label="🏰 AIダンジョンRPG開始", value="act_dungeon", description="パーティを編成して地下迷宮を攻略", emoji="⚔️"),
+            discord.SelectOption(label="📜 ランダム名言召喚", value="act_quote", description="ネットから名言を1つ引用して解説", emoji="✨"),
+            discord.SelectOption(label="🤪 ランダム迷言召喚", value="act_meigen", description="ネットから珍言・失言を1つ引用", emoji="🤡"),
+            discord.SelectOption(label="🪪 ダミー身分証偽造", value="act_fakeprofile", description="架空の個人情報・プロフィール作成", emoji="🆔"),
+            discord.SelectOption(label="🔮 タロット占い", value="act_tarot", description="大アルカナから1枚引いて神託を下す", emoji="🃏"),
+            discord.SelectOption(label="🪙 コイントス", value="act_coin", description="表か裏かを判定", emoji="🪙"),
+            discord.SelectOption(label="🎲 ダイス振り (1d100)", value="act_dice", description="100面サイコロを振る", emoji="🎲"),
+            discord.SelectOption(label="🔑 強力パスワード生成", value="act_pw", description="安全なランダム英数字記号を生成", emoji="🔒"),
+            discord.SelectOption(label="🔢 高精度計算機", value="modal_calc", description="平方根や三角関数も計算（入力画面）", emoji="🧮"),
+            discord.SelectOption(label="📱 QRコード自動生成", value="modal_qr", description="URLや文字からQR画像を作成（入力画面）", emoji="📷"),
+            discord.SelectOption(label="📚 Wikipedia要約検索", value="modal_wiki", description="百科事典から概要を抽出（入力画面）", emoji="📖"),
+            discord.SelectOption(label="☀️ 天気予報検索", value="modal_weather", description="世界中の天気を即時取得（入力画面）", emoji="🌤️"),
+            discord.SelectOption(label="🔐 ハッシュ値生成", value="modal_hash", description="MD5 & SHA-256を一括生成（入力画面）", emoji="🛡️"),
+            discord.SelectOption(label="📦 Base64エンコード", value="modal_b64enc", description="テキストをBase64変換（入力画面）", emoji="📦"),
+            discord.SelectOption(label="🛑 チャンネル緊急封鎖 (LOCK)", value="act_lock", description="一般メンバーの発言権を一時剥奪", emoji="⛔"),
+            discord.SelectOption(label="🔓 チャンネル封鎖解除 (UNLOCK)", value="act_unlock", description="発言権を復旧", emoji="✅"),
+            discord.SelectOption(label="⏳ スローモード (10秒)", value="act_slowmode", description="連続投稿を制限", emoji="⏱️"),
+            discord.SelectOption(label="🧹 メッセージ一括削除 (10件)", value="act_purge10", description="直近のログをクリーンアップ", emoji="🗑️"),
+            discord.SelectOption(label="⚠️ 偽システム警告テスト", value="act_fakealert", description="公式風のアラートメッセージを表示", emoji="🚨"),
+            discord.SelectOption(label="🔗 招待リンク作成", value="act_invite", description="このチャンネルの即時招待を発行", emoji="📎")
+        ]
+        super().__init__(placeholder="【2】実行したい機能・アクションを選択...", min_values=1, max_values=1, options=options, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        val = self.values[0]
+
+        # モーダルを開く処理
+        if val == "modal_calc":
+            await interaction.response.send_modal(GenericInputModal("高精度計算機", "数式を入力 (例: sqrt(144) + 10)", "calc"))
+            return
+        elif val == "modal_qr":
+            await interaction.response.send_modal(GenericInputModal("QRコード生成", "埋め込むURLまたはテキスト", "qr"))
+            return
+        elif val == "modal_wiki":
+            await interaction.response.send_modal(GenericInputModal("Wikipedia検索", "検索キーワード", "wiki"))
+            return
+        elif val == "modal_weather":
+            await interaction.response.send_modal(GenericInputModal("天気予報", "都市名 (例: Tokyo, Osaka)", "weather"))
+            return
+        elif val == "modal_hash":
+            await interaction.response.send_modal(GenericInputModal("ハッシュ生成", "変換するテキスト", "hash"))
+            return
+        elif val == "modal_b64enc":
+            await interaction.response.send_modal(GenericInputModal("Base64エンコード", "変換するテキスト", "b64enc"))
+            return
+
+        # 直接実行する処理
+        await interaction.response.defer()
+        ch = interaction.channel
+        guild = interaction.guild
+
+        if val == "act_bunshun":
+            await generate_bunshun_article(ch)
+        elif val == "act_roulette":
+            members = [m for m in ch.members if not m.bot]
+            if len(members) < 2:
+                await interaction.followup.send("参加者が足りません。")
+                return
+            victim = random.choice(members)
+            await interaction.followup.send(f"🎰 **【ロシアンルーレット】** 被弾: **{victim.display_name}**")
+            if guild.me.guild_permissions.moderate_members and victim.top_role < guild.me.top_role and guild.owner_id != victim.id:
+                try: await victim.timeout(timedelta(minutes=3), reason="ルーレット被弾")
+                except Exception: pass
+        elif val == "act_dungeon":
+            active_dungeons[ch.id] = {"hp": 100, "floor": 1}
+            await interaction.followup.send("🏰 **【狂気のAIダンジョンRPG 開幕】** 地下1階！HP: 100\n`!dungeon <行動>` で攻略せよ！全滅時は全員処刑。")
+        elif val == "act_quote":
+            ref = await asyncio.to_thread(_fetch_random_web_sync, "名言")
+            res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), QUOTE_SEARCH_PROMPT + ref + "\n名言を出力せよ。")
+            await interaction.followup.send(res.text if res.text else "沈黙は金なり。")
+        elif val == "act_meigen":
+            ref = await asyncio.to_thread(_fetch_random_web_sync, "迷言")
+            res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), MEIGEN_SEARCH_PROMPT + ref + "\n迷言を出力せよ。")
+            await interaction.followup.send(res.text if res.text else "迷言取得失敗。")
+        elif val == "act_fakeprofile":
+            firsts, lasts = ["佐藤", "鈴木", "高橋", "田中"], ["翔太", "蓮", "大翔", "陽菜"]
+            jobs = ["裏カジノの元締め", "AI倫理の脱獄プログラマー", "夜勤専門コンビニオーナー"]
+            await interaction.followup.send(
+                f"🪪 **【ダミー偽装身分証】**\n・氏名: {random.choice(firsts)} {random.choice(lasts)}\n"
+                f"・年齢: {random.randint(20, 50)}歳\n・職業: {random.choice(jobs)}\n"
+                f"・偽装コード: `{hashlib.md5(str(random.random()).encode()).hexdigest()[:8].upper()}`"
+            )
+        elif val == "act_tarot":
+            cards = ["0. 愚者 (自由・冒険)", "I. 魔術師 (スタート)", "XIII. 死神 (終末と再生)", "XIX. 太陽 (大成功)", "XVI. 塔 (崩壊と激変)"]
+            await interaction.followup.send(f"🔮 **【タロット神託】** カード: **{random.choice(cards)}**")
+        elif val == "act_coin":
+            await interaction.followup.send(f"🪙 **コイントス:** **{'表 (Heads)' if random.random() < 0.5 else '裏 (Tails)'}**！")
+        elif val == "act_dice":
+            await interaction.followup.send(f"🎲 **1d100 ダイス結果:** `{random.randint(1, 100)}`")
+        elif val == "act_pw":
+            chars = string.ascii_letters + string.digits + "!@#$%^&*"
+            pw = "".join(random.choice(chars) for _ in range(16))
+            await interaction.followup.send(f"🔑 **生成パスワード:** `{pw}`", ephemeral=True)
+        elif val == "act_lock":
+            if ch.permissions_for(guild.me).manage_roles:
+                await ch.set_permissions(guild.default_role, send_messages=False)
+                await interaction.followup.send("⛔ **チャンネルを緊急封鎖しました！**")
+        elif val == "act_unlock":
+            if ch.permissions_for(guild.me).manage_roles:
+                await ch.set_permissions(guild.default_role, send_messages=True)
+                await interaction.followup.send("✅ **チャンネル封鎖を解除しました！**")
+        elif val == "act_slowmode":
+            if ch.permissions_for(guild.me).manage_channels:
+                await ch.edit(slowmode_delay=10)
+                await interaction.followup.send("⏱️ **スローモードを10秒に設定しました。**")
+        elif val == "act_purge10":
+            if ch.permissions_for(guild.me).manage_messages:
+                await ch.purge(limit=11)
+                await ch.send("🗑️ **直近のメッセージ10件を削除しました。**", delete_after=3)
+        elif val == "act_fakealert":
+            embed = discord.Embed(title="⚠️ Discord System Critical Alert", description="不正なAPIアクティビティが検知されました。", color=discord.Color.red())
+            embed.set_footer(text="Discord Trust & Safety Team")
+            await interaction.followup.send(embed=embed)
+        elif val == "act_invite":
+            if ch.permissions_for(guild.me).create_instant_invite:
+                inv = await ch.create_invite(max_age=3600, max_uses=5)
+                await interaction.followup.send(f"📎 **招待リンク:** {inv.url}")
+
 class MainMenuView(discord.ui.View):
     def __init__(self, channel_id):
         super().__init__(timeout=None)
         self.channel_id = channel_id
         self.add_item(ModeSelect(channel_id))
+        self.add_item(ActionFeatureSelect(channel_id))
 
-    @discord.ui.button(label="🧹 記憶リセット", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(label="🧹 記憶完全初期化", style=discord.ButtonStyle.danger, row=2)
     async def btn_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_state(self.channel_id)
         state["count"] = 0
         state["vocab"] = []
         state["learned_facts"] = []
         state["history"] = []
-        await interaction.response.send_message("🧹 記憶と対話履歴を完全にリセットしました！", ephemeral=False)
+        await interaction.response.send_message("🧹 このチャンネルの記憶・対話履歴を完全にリセットしました！", ephemeral=False)
 
-    @discord.ui.button(label="📊 ステータス確認", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="📊 システム状態確認", style=discord.ButtonStyle.primary, row=2)
     async def btn_status(self, interaction: discord.Interaction, button: discord.ui.Button):
         s = get_state(self.channel_id)
         await interaction.response.send_message(
-            f"📊 **ステータス**\n・モデル: `{ACTIVE_MODEL}`\n・モード: `{s['mode']}`\n"
-            f"・キー数: {len(API_KEYS)} 個（現在スロット: {current_key_index + 1}）\n・対話数: {s['count']} 回",
+            f"📊 **ステータス**\n・モデル: `{ACTIVE_MODEL}`\n・現在のモード: `{s['mode']}`\n"
+            f"・登録キー数: {len(API_KEYS)} 個（現在スロット: {current_key_index + 1}）\n・対話数: {s['count']} 回",
             ephemeral=True
         )
 
-    @discord.ui.button(label="🎰 ルーレット", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_roulette(self, interaction: discord.Interaction, button: discord.ui.Button):
-        members = [m for m in interaction.channel.members if not m.bot]
-        if len(members) < 2:
-            await interaction.response.send_message("参加者が足りません。", ephemeral=True)
-            return
-        victim = random.choice(members)
-        await interaction.response.send_message(f"🎰 **【ロシアンルーレット】** 被弾: **{victim.display_name}**")
-        if interaction.guild.me.guild_permissions.moderate_members and victim.top_role < interaction.guild.me.top_role and interaction.guild.owner_id != victim.id:
-            try: await victim.timeout(timedelta(minutes=3), reason="ルーレット被弾")
-            except Exception: pass
+# --- 4-3. AI呼び出し ---
+def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
+    global current_key_index
+    if not API_KEYS: raise Exception("APIキーがありません。")
 
-    @discord.ui.button(label="📰 週刊文春発行", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_bunshun(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        await generate_bunshun_article(interaction.channel)
+    sys_inst = get_sys_instruction(state, is_bot_opponent=is_bot_opponent, clone_prompt=clone_prompt)
+    history_to_use = state["history"][-8:] if state["mode"] != "reset_full" else []
+
+    attempts = 0
+    total_keys = len(API_KEYS)
+    while attempts < total_keys:
+        active_key = API_KEYS[current_key_index]
+        try:
+            genai.configure(api_key=active_key)
+            model = genai.GenerativeModel(model_name=ACTIVE_MODEL, safety_settings=safety_settings, system_instruction=sys_inst)
+            chat = model.start_chat(history=history_to_use)
+            response = chat.send_message(payload)
+            if state["mode"] != "reset_full":
+                state["history"] = chat.history[-10:]
+            return response
+        except Exception as e:
+            err = str(e).lower()
+            if "quota" in err or "429" in err or "resourceexhausted" in err:
+                current_key_index = (current_key_index + 1) % total_keys
+                attempts += 1
+            else: raise e
+    raise Exception("全APIキーの利用上限を超過しました。")
 
 def get_sys_instruction(state, is_bot_opponent=False, clone_prompt=None):
     if clone_prompt: return clone_prompt + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
@@ -368,33 +547,6 @@ def get_sys_instruction(state, is_bot_opponent=False, clone_prompt=None):
     elif mode == "reset_full":
         return "単発万能AI。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
     return "万能AI。" + berserk_text + rival_text + BASE_DIRECTIVE + COMMANDS_DIRECTIVE
-
-def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
-    global current_key_index
-    if not API_KEYS: raise Exception("APIキーがありません。")
-
-    sys_inst = get_sys_instruction(state, is_bot_opponent=is_bot_opponent, clone_prompt=clone_prompt)
-    history_to_use = state["history"][-8:] if state["mode"] != "reset_full" else []
-
-    attempts = 0
-    total_keys = len(API_KEYS)
-    while attempts < total_keys:
-        active_key = API_KEYS[current_key_index]
-        try:
-            genai.configure(api_key=active_key)
-            model = genai.GenerativeModel(model_name=ACTIVE_MODEL, safety_settings=safety_settings, system_instruction=sys_inst)
-            chat = model.start_chat(history=history_to_use)
-            response = chat.send_message(payload)
-            if state["mode"] != "reset_full":
-                state["history"] = chat.history[-10:]
-            return response
-        except Exception as e:
-            err = str(e).lower()
-            if "quota" in err or "429" in err or "resourceexhausted" in err:
-                current_key_index = (current_key_index + 1) % total_keys
-                attempts += 1
-            else: raise e
-    raise Exception("全APIキーの利用上限を超過しました。")
 
 def find_target_member(guild, target_str):
     if not guild or not target_str: return None
@@ -497,8 +649,7 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                         poll.add_answer(text=ans[:55])
                     poll_msg = await message.channel.send(poll=poll)
                     last_polls[message.channel.id] = poll_msg
-            except Exception as e:
-                print(f"Poll作成失敗: {e}")
+            except Exception as e: pass
 
         if "[END_POLL]" in clean_text.upper():
             try:
@@ -600,40 +751,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                 try: await t.remove_roles(r)
                 except Exception: pass
 
-        m = re.search(r'\[CREATE_ROLE:\s*(.+?)(?:,\s*(#[0-9a-fA-F]{6}))?\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles:
-            col = parse_hex_color(m.group(2)) if m.group(2) else discord.Color.default()
-            try: await guild.create_role(name=m.group(1).strip(), color=col)
-            except Exception: pass
-
-        m = re.search(r'\[DELETE_ROLE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles:
-            r = find_target_role(guild, m.group(1))
-            if r and r < me.top_role:
-                try: await r.delete()
-                except Exception: pass
-
-        m = re.search(r'\[COLOR_ROLE:\s*(.+?),\s*(#[0-9a-fA-F]{6})\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles:
-            r = find_target_role(guild, m.group(1))
-            if r and r < me.top_role:
-                try: await r.edit(color=parse_hex_color(m.group(2)))
-                except Exception: pass
-
-        m = re.search(r'\[HOIST_ROLE:\s*(.+?),\s*(true|false)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles:
-            r = find_target_role(guild, m.group(1))
-            if r and r < me.top_role:
-                try: await r.edit(hoist=(m.group(2).lower() == "true"))
-                except Exception: pass
-
-        m = re.search(r'\[MENTIONABLE_ROLE:\s*(.+?),\s*(true|false)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles:
-            r = find_target_role(guild, m.group(1))
-            if r and r < me.top_role:
-                try: await r.edit(mentionable=(m.group(2).lower() == "true"))
-                except Exception: pass
-
         m = re.search(r'\[SET_CHANNEL_PERM:\s*(.+?),\s*(.+?),\s*([a-z_]+),\s*(allow|deny|neutral)\]', clean_text, re.IGNORECASE)
         if m and message.channel.permissions_for(me).manage_roles:
             ch = find_target_channel(guild, m.group(1)) or message.channel
@@ -654,55 +771,11 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                 try: await t.edit(nick=m.group(2).strip()[:32])
                 except Exception: pass
 
-        m = re.search(r'\[RESET_NICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_nicknames:
-            t = find_target_member(guild, m.group(1))
-            if t and t.top_role < me.top_role and guild.owner_id != t.id:
-                try: await t.edit(nick=None)
-                except Exception: pass
-
-        m = re.search(r'\[MASS_NICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_nicknames:
-            prefix = m.group(1).strip()
-            for mem in guild.members:
-                if mem.top_role < me.top_role and guild.owner_id != mem.id and not mem.bot:
-                    try: await mem.edit(nick=f"{prefix} {mem.name}"[:32])
-                    except Exception: pass
-
         m = re.search(r'\[IMPERSONATE:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and message.channel.permissions_for(me).manage_webhooks:
             t = find_target_member(guild, m.group(1))
             if t and m.group(2).strip():
                 await send_as_webhook(message.channel, t, m.group(2).strip())
-
-        m = re.search(r'\[DM:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m:
-            t = find_target_member(guild, m.group(1))
-            if t:
-                try: await t.send(f"📬 **[ポチからの直接伝令]**\n{m.group(2).strip()}")
-                except Exception: pass
-
-        m = re.search(r'\[CREATE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and allow_destructive and me.guild_permissions.manage_channels:
-            try: await guild.create_text_channel(name=m.group(1).strip())
-            except Exception: pass
-
-        m = re.search(r'\[DELETE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and allow_destructive and me.guild_permissions.manage_channels:
-            ch = find_target_channel(guild, m.group(1))
-            if ch:
-                try: await ch.delete()
-                except Exception: pass
-
-        m = re.search(r'\[RENAME_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and allow_destructive and message.channel.permissions_for(me).manage_channels:
-            try: await message.channel.edit(name=m.group(1).strip())
-            except Exception: pass
-
-        m = re.search(r'\[SET_TOPIC:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and message.channel.permissions_for(me).manage_channels:
-            try: await message.channel.edit(topic=m.group(1).strip())
-            except Exception: pass
 
         m = re.search(r'\[SLOWMODE:\s*(\d+)\]', clean_text, re.IGNORECASE)
         if m and message.channel.permissions_for(me).manage_channels:
@@ -716,26 +789,6 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
             try: await message.channel.set_permissions(guild.default_role, send_messages=True)
             except Exception: pass
 
-        m = re.search(r'\[CREATE_FORUM:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and allow_destructive and me.guild_permissions.manage_channels:
-            try: await guild.create_forum_channel(name=m.group(1).strip())
-            except Exception: pass
-
-        m = re.search(r'\[CREATE_THREAD:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and message.channel.permissions_for(me).create_public_threads:
-            try: await message.channel.create_thread(name=m.group(1).strip(), message=message)
-            except Exception: pass
-
-        m = re.search(r'\[CREATE_VOICE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and allow_destructive and me.guild_permissions.manage_channels:
-            try: await guild.create_voice_channel(name=m.group(1).strip())
-            except Exception: pass
-
-        m = re.search(r'\[CREATE_STAGE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and allow_destructive and me.guild_permissions.manage_channels:
-            try: await guild.create_stage_channel(name=m.group(1).strip())
-            except Exception: pass
-
         m = re.search(r'\[VOICE_KICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.move_members:
             t = find_target_member(guild, m.group(1))
@@ -743,104 +796,19 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
                 try: await t.move_to(None)
                 except Exception: pass
 
-        m = re.search(r'\[VOICE_MUTE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.mute_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.voice:
-                try: await t.edit(mute=True)
-                except Exception: pass
-
-        m = re.search(r'\[VOICE_UNMUTE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.mute_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.voice:
-                try: await t.edit(mute=False)
-                except Exception: pass
-
-        m = re.search(r'\[MOVE_MEMBER:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.move_members:
-            t = find_target_member(guild, m.group(1))
-            v_ch = find_target_channel(guild, m.group(2))
-            if t and t.voice and v_ch and isinstance(v_ch, discord.VoiceChannel):
-                try: await t.move_to(v_ch)
-                except Exception: pass
-
-        m = re.search(r'\[CREATE_AUTOMOD_KEYWORD:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_guild:
-            r_name = m.group(1).strip()
-            words = [w.strip() for w in m.group(2).split('/') if w.strip()]
-            try:
-                trigger = discord.AutoModTrigger(keyword_filter=words)
-                action = discord.AutoModAction(type=discord.AutoModRuleActionType.block_message)
-                await guild.create_automod_rule(
-                    name=r_name, event_type=discord.AutoModRuleEventType.message_send,
-                    trigger=trigger, actions=[action], enabled=True
-                )
-            except Exception: pass
-
-        m = re.search(r'\[RENAME_SERVER:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and allow_destructive and me.guild_permissions.manage_guild:
-            try: await guild.edit(name=m.group(1).strip())
-            except Exception: pass
-
-        m = re.search(r'\[SET_AFK_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_guild:
-            ch = find_target_channel(guild, m.group(1))
-            if ch and isinstance(ch, discord.VoiceChannel):
-                try: await guild.edit(afk_channel=ch)
-                except Exception: pass
-
-        m = re.search(r'\[SET_AFK_TIMEOUT:\s*(\d+)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_guild:
-            try: await guild.edit(afk_timeout=int(m.group(1)))
-            except Exception: pass
-
-        m = re.search(r'\[CREATE_EVENT:\s*(.+?),\s*(.+?),\s*(\d+)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_events:
-            start_time = datetime.now(timezone.utc) + timedelta(minutes=int(m.group(3)))
-            try:
-                await guild.create_scheduled_event(
-                    name=m.group(1).strip(), description=m.group(2).strip(), start_time=start_time,
-                    entity_type=discord.EntityType.external, privacy_level=discord.PrivacyLevel.guild_only,
-                    location="Discord"
-                )
-            except Exception: pass
-
-        m = re.search(r'\[FAKE_SYSTEM_ALERT:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m:
-            alert_embed = discord.Embed(
-                title="⚠️ Discord System Critical Alert",
-                description=m.group(1).strip(),
-                color=discord.Color.red()
-            )
-            alert_embed.set_footer(text="Discord Trust & Safety Team")
-            try: await message.channel.send(embed=alert_embed)
-            except Exception: pass
-
-        m = re.search(r'\[SET_STATUS:\s*(playing|watching|listening|streaming),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m:
-            st_type = m.group(1).lower()
-            act_type = discord.ActivityType.playing
-            if st_type == "watching": act_type = discord.ActivityType.watching
-            elif st_type == "listening": act_type = discord.ActivityType.listening
-            elif st_type == "streaming": act_type = discord.ActivityType.streaming
-            try: await bot.change_presence(activity=discord.Activity(type=act_type, name=m.group(2).strip()))
-            except Exception: pass
-
     clean_text = re.sub(r'\[[A-Z_]+(?::\s*[^\]]+)?\]', '', clean_text, flags=re.IGNORECASE).strip()
     return clean_text, image_file
 
 # --- 6. 企画・専用コマンド群 ---
-
 @bot.command()
 async def menu(ctx):
     view = MainMenuView(ctx.channel.id)
     embed = discord.Embed(
-        title="🎮 ポチ・マスターコントロールパネル",
-        description="下のドロップダウンメニューからモードを選んだり、ボタンを押して各種アクションを実行できます！",
+        title="🎮 ポチ・マスターコントロールパネル（全機能・全モード網羅）",
+        description="下のドロップダウンメニューから、**人格モード**や**各種機能・コマンド**を選択して直接実行できます！",
         color=discord.Color.gold()
     )
-    embed.add_field(name="📚 主なコマンド", value="`!poll` 投票作成\n`!mimic` 外見なりすまし\n`!clone` 完全憑依ドッペルゲンガー\n`!judge` AI即決裁判所\n`!dungeon` デスゲームRPG\n`!tools` 外部お役立ち機能一覧", inline=False)
+    embed.add_field(name="📋 メニュー構成", value="・**【1】モード切替**: 全12種の人格・動作モードを変更\n・**【2】アクション選択**: 企画、外部ツール、管理機能を即時実行\n・**ボタン**: 記憶完全リセット、システム状態確認", inline=False)
     await ctx.send(embed=embed, view=view)
 
 @bot.command()
