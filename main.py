@@ -61,7 +61,7 @@ BASE_DIRECTIVE = (
 )
 
 COMMANDS_DIRECTIVE = (
-    "\n【Discord全権限・全操作コマンド一覧（120種超完全網羅）】\n"
+    "\n【Discord全権限・全操作コマンド一覧（完全網羅）】\n"
     "状況や要望、裁きに合わせて回答内に専用タグを埋め込んで実行してください（裏で自動実行されます）：\n"
     "■ 制裁・治安維持\n"
     "[KICK: ユーザー], [BAN: ユーザー], [UNBAN: ユーザーID], [TIMEOUT: ユーザー, 分数], [UNTIMEOUT: ユーザー]\n"
@@ -255,8 +255,16 @@ def get_state(channel_id):
         channels_state[channel_id] = {"mode": "normal_full", "count": 0, "history": [], "vocab": [], "learned_facts": []}
     return channels_state[channel_id]
 
-# --- 5. 動的モーダルUI (ポップアップ入力画面) ---
-class DynamicActionModal(discord.ui.Modal):
+# --- 5. 実行用メッセージコンテキスト偽装クラス ---
+class ActionContext:
+    def __init__(self, interaction: discord.Interaction):
+        self.guild = interaction.guild
+        self.channel = interaction.channel
+        self.author = interaction.user
+        self.reference = None
+
+# --- 6. 動的モーダルUI (確実に発動する修正版) ---
+class ActionInputModal(discord.ui.Modal):
     def __init__(self, action, title, labels):
         super().__init__(title=title[:45])
         self.action = action
@@ -271,12 +279,7 @@ class DynamicActionModal(discord.ui.Modal):
         vals = [i.value.strip() for i in self.inputs]
         ch = interaction.channel
         guild = interaction.guild
-
-        class DummyMsg:
-            def __init__(self):
-                self.guild = guild
-                self.channel = ch
-                self.reference = None
+        ctx_mock = ActionContext(interaction)
 
         # 外部ツール系
         if self.action == "calc":
@@ -293,19 +296,19 @@ class DynamicActionModal(discord.ui.Modal):
         elif self.action == "wiki":
             try:
                 res = requests.get(f"https://ja.wikipedia.org/api/rest_v1/page/summary/{quote(vals[0])}", timeout=3).json()
-                await interaction.followup.send(f"📚 **Wiki:** {res.get('extract', '不明')[:1500]}")
+                await interaction.followup.send(f"📚 **Wiki:** {res.get('extract', '見つかりませんでした。')[:1500]}")
             except Exception as e: await interaction.followup.send(f"⚠️ エラー: {e}")
         elif self.action == "weather":
             try:
                 res = requests.get(f"https://wttr.in/{quote(vals[0])}?format=%C+%t+湿度:%h+風速:%w", timeout=3).text
                 await interaction.followup.send(f"☀️ **天気:** {res}")
-            except Exception: await interaction.followup.send("⚠️ エラー")
+            except Exception: await interaction.followup.send("⚠️ 取得失敗")
         elif self.action == "cur":
             try:
                 res = requests.get(f"https://open.er-api.com/v6/latest/{vals[1].upper()}", timeout=3).json()
                 rate = res["rates"][vals[2].upper()]
-                await interaction.followup.send(f"💱 **為替:** {vals[0]}{vals[1].upper()} = {float(vals[0])*rate:,.2f}{vals[2].upper()}")
-            except Exception: await interaction.followup.send("⚠️ エラー")
+                await interaction.followup.send(f"💱 **為替:** {vals[0]} {vals[1].upper()} = {float(vals[0])*rate:,.2f} {vals[2].upper()}")
+            except Exception: await interaction.followup.send("⚠️ 為替取得失敗")
         elif self.action == "hash":
             await interaction.followup.send(f"🔐 **MD5:** `{hashlib.md5(vals[0].encode()).hexdigest()}`\n🛡️ **SHA-256:** `{hashlib.sha256(vals[0].encode()).hexdigest()}`")
         elif self.action == "b64enc":
@@ -325,8 +328,8 @@ class DynamicActionModal(discord.ui.Modal):
             t = find_target_member(guild, vals[0])
             if t:
                 mimic_targets[ch.id] = t
-                await interaction.followup.send(f"🎭 **{t.display_name}** の外見を奪いました。")
-            else: await interaction.followup.send("⚠️ ユーザー不明")
+                await interaction.followup.send(f"🎭 **{t.display_name}** の外見を奪いました。（解除: `!unmimic`）")
+            else: await interaction.followup.send("⚠️ 対象ユーザーが見つかりません。")
         elif self.action == "clone":
             t = find_target_member(guild, vals[0])
             if t:
@@ -334,28 +337,28 @@ class DynamicActionModal(discord.ui.Modal):
                 async for m in ch.history(limit=50):
                     if m.author.id == t.id and m.content: logs.append(m.clean_content)
                 cloned_targets[ch.id] = {"target": t, "prompt": f"本人として振る舞え:\n" + "\n".join(logs[:15])}
-                await interaction.followup.send(f"👥 **{t.display_name}** を完全クローンしました。")
-            else: await interaction.followup.send("⚠️ ユーザー不明")
+                await interaction.followup.send(f"👥 **{t.display_name}** を完全クローンしました。（解除: `!unclone`）")
+            else: await interaction.followup.send("⚠️ 対象ユーザーが見つかりません。")
         elif self.action == "judge":
             ua, ub = find_target_member(guild, vals[0]), find_target_member(guild, vals[1])
             if ua and ub:
                 prompt = f"原告:{ua.name} 被告:{ub.name}\n有罪を論破し末尾に [TIMEOUT: {ub.id}, 3] を付けろ。"
                 res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), prompt)
-                ans, _ = await handle_special_actions(DummyMsg(), res.text if res.text else "")
+                ans, _ = await handle_special_actions(ctx_mock, res.text if res.text else "")
                 await interaction.followup.send(f"⚖️ **【AI裁判所】**\n{ans}")
-            else: await interaction.followup.send("⚠️ ユーザー不明")
+            else: await interaction.followup.send("⚠️ ユーザーが見つかりません。")
         elif self.action == "leak":
             t = find_target_member(guild, vals[0])
             if t:
                 prompt = f"対象:{t.name}\n架空不祥事と謝罪文を捏造し末尾に [NICK: {t.id}, {t.name[:10]}(謹慎中)] を付けろ。"
                 res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), prompt)
-                ans, _ = await handle_special_actions(DummyMsg(), res.text if res.text else "")
+                ans, _ = await handle_special_actions(ctx_mock, res.text if res.text else "")
                 await interaction.followup.send(f"🚨 **【流出速報】**\n{ans}")
-            else: await interaction.followup.send("⚠️ ユーザー不明")
+            else: await interaction.followup.send("⚠️ ユーザーが見つかりません。")
         elif self.action == "silent":
             await ch.send(content=vals[0], silent=True)
             await interaction.followup.send("サイレント送信完了", ephemeral=True)
-        # Discord操作系
+        # Discord管理系（即座に反映）
         else:
             tag_str = ""
             if self.action == "poll": tag_str = f"[CREATE_POLL: {vals[0]}, {vals[1]}/{vals[2]}]"
@@ -368,23 +371,32 @@ class DynamicActionModal(discord.ui.Modal):
             elif self.action == "slowmode": tag_str = f"[SLOWMODE: {vals[0]}]"
             elif self.action == "create_text": tag_str = f"[CREATE_CHANNEL: {vals[0]}]"
             elif self.action == "create_voice": tag_str = f"[CREATE_VOICE: {vals[0]}]"
+            elif self.action == "create_stage": tag_str = f"[CREATE_STAGE: {vals[0]}]"
+            elif self.action == "create_category": tag_str = f"[CREATE_CATEGORY: {vals[0]}]"
             elif self.action == "create_forum": tag_str = f"[CREATE_FORUM: {vals[0]}]"
             elif self.action == "create_thread": tag_str = f"[CREATE_THREAD: {vals[0]}]"
+            elif self.action == "delete_channel": tag_str = f"[DELETE_CHANNEL: {vals[0]}]"
             elif self.action == "rename_channel": tag_str = f"[RENAME_CHANNEL: {vals[0]}]"
             elif self.action == "set_topic": tag_str = f"[SET_TOPIC: {vals[0]}]"
             elif self.action == "nick": tag_str = f"[NICK: {vals[0]}, {vals[1]}]"
             elif self.action == "mass_nick": tag_str = f"[MASS_NICK: {vals[0]}]"
             elif self.action == "create_role": tag_str = f"[CREATE_ROLE: {vals[0]}]"
+            elif self.action == "delete_role": tag_str = f"[DELETE_ROLE: {vals[0]}]"
             elif self.action == "add_role": tag_str = f"[ADD_ROLE: {vals[0]}, {vals[1]}]"
+            elif self.action == "remove_role": tag_str = f"[REMOVE_ROLE: {vals[0]}, {vals[1]}]"
             elif self.action == "automod_kw": tag_str = f"[CREATE_AUTOMOD_KEYWORD: {vals[0]}, {vals[1]}]"
             elif self.action == "announce": tag_str = f"[ANNOUNCE: {vals[0]}]"
             elif self.action == "rename_server": tag_str = f"[RENAME_SERVER: {vals[0]}]"
+            elif self.action == "voice_kick": tag_str = f"[VOICE_KICK: {vals[0]}]"
+            elif self.action == "voice_mute": tag_str = f"[VOICE_MUTE: {vals[0]}]"
+            elif self.action == "move_member": tag_str = f"[MOVE_MEMBER: {vals[0]}, {vals[1]}]"
+            elif self.action == "set_perm": tag_str = f"[SET_CHANNEL_PERM: {vals[0]}, {vals[1]}, {vals[2]}, {vals[3]}]"
 
             if tag_str:
-                await handle_special_actions(DummyMsg(), tag_str)
-                await interaction.followup.send(f"✅ 実行完了: `{tag_str}`", ephemeral=True)
+                await handle_special_actions(ctx_mock, tag_str)
+                await interaction.followup.send(f"✅ 実行完了: `{tag_str}`")
 
-# --- 4-3. メニュー用 セレクトクラス群 (4種) ---
+# --- 7. メニュー用 セレクトクラス群 ---
 class ModeSelect(discord.ui.Select):
     def __init__(self, channel_id):
         self.channel_id = channel_id
@@ -420,21 +432,20 @@ class EntSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         val = self.values[0]
-        if val == "mimic": await interaction.response.send_modal(DynamicActionModal("mimic", "ミミック (外見偽装)", ["対象ユーザー名またはID"]))
-        elif val == "clone": await interaction.response.send_modal(DynamicActionModal("clone", "クローン (完全憑依)", ["対象ユーザー名またはID"]))
-        elif val == "judge": await interaction.response.send_modal(DynamicActionModal("judge", "AI即決裁判所", ["原告ユーザー", "被告ユーザー"]))
-        elif val == "leak": await interaction.response.send_modal(DynamicActionModal("leak", "黒歴史捏造", ["対象ユーザー"]))
-        elif val == "silent": await interaction.response.send_modal(DynamicActionModal("silent", "サイレントメッセージ", ["送信するテキスト"]))
+        if val == "mimic": await interaction.response.send_modal(ActionInputModal("mimic", "ミミック (外見偽装)", ["対象ユーザー名またはID"]))
+        elif val == "clone": await interaction.response.send_modal(ActionInputModal("clone", "クローン (完全憑依)", ["対象ユーザー名またはID"]))
+        elif val == "judge": await interaction.response.send_modal(ActionInputModal("judge", "AI即決裁判所", ["原告ユーザー", "被告ユーザー"]))
+        elif val == "leak": await interaction.response.send_modal(ActionInputModal("leak", "黒歴史捏造", ["対象ユーザー"]))
+        elif val == "silent": await interaction.response.send_modal(ActionInputModal("silent", "サイレントメッセージ", ["送信するテキスト"]))
         else:
             await interaction.response.defer()
             ch = interaction.channel
+            ctx_mock = ActionContext(interaction)
             if val == "bunshun":
                 await interaction.followup.send("📰 文春砲を装填中...")
-                class DummyMsg:
-                    def __init__(self): self.guild, self.channel, self.reference = interaction.guild, ch, None
-                prompt = "極悪ゴシップ記者。チャットログから痛い発言を嗅ぎ回りスクープを書け。\n末尾に [IMAGE: tabloid scandal newspaper headline art] をつけろ。"
+                prompt = "極悪記者。ログから痛い発言のスクープを書け。\n末尾に [IMAGE: tabloid scandal newspaper headline art] をつけろ。"
                 res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), prompt)
-                ans, img = await handle_special_actions(DummyMsg(), res.text if res.text else "")
+                ans, img = await handle_special_actions(ctx_mock, res.text if res.text else "")
                 await ch.send(f"📰 **【週刊ポチ春・最新号】**\n{ans}", file=img)
             elif val == "roulette":
                 members = [m for m in ch.members if not m.bot]
@@ -475,16 +486,16 @@ class ExtSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         val = self.values[0]
-        if val == "calc": await interaction.response.send_modal(DynamicActionModal("calc", "計算機", ["数式 (例: sqrt(144) + 10)"]))
-        elif val == "qr": await interaction.response.send_modal(DynamicActionModal("qr", "QR生成", ["URLやテキスト"]))
-        elif val == "wiki": await interaction.response.send_modal(DynamicActionModal("wiki", "Wiki検索", ["キーワード"]))
-        elif val == "weather": await interaction.response.send_modal(DynamicActionModal("weather", "天気予報", ["都市名 (例: Tokyo)"]))
-        elif val == "cur": await interaction.response.send_modal(DynamicActionModal("cur", "為替換算", ["金額", "元通貨(USD等)", "先通貨(JPY等)"]))
-        elif val == "pw": await interaction.response.send_modal(DynamicActionModal("pw", "パスワード生成", ["桁数 (数字)"]))
-        elif val == "b64enc": await interaction.response.send_modal(DynamicActionModal("b64enc", "Base64エンコード", ["テキスト"]))
-        elif val == "b64dec": await interaction.response.send_modal(DynamicActionModal("b64dec", "Base64デコード", ["Base64文字列"]))
-        elif val == "hash": await interaction.response.send_modal(DynamicActionModal("hash", "ハッシュ生成", ["テキスト"]))
-        elif val == "rot13": await interaction.response.send_modal(DynamicActionModal("rot13", "ROT13暗号化", ["テキスト"]))
+        if val == "calc": await interaction.response.send_modal(ActionInputModal("calc", "計算機", ["数式 (例: sqrt(144) + 10)"]))
+        elif val == "qr": await interaction.response.send_modal(ActionInputModal("qr", "QR生成", ["URLやテキスト"]))
+        elif val == "wiki": await interaction.response.send_modal(ActionInputModal("wiki", "Wiki検索", ["キーワード"]))
+        elif val == "weather": await interaction.response.send_modal(ActionInputModal("weather", "天気予報", ["都市名 (例: Tokyo)"]))
+        elif val == "cur": await interaction.response.send_modal(ActionInputModal("cur", "為替換算", ["金額", "元通貨(USD等)", "先通貨(JPY等)"]))
+        elif val == "pw": await interaction.response.send_modal(ActionInputModal("pw", "パスワード生成", ["桁数 (数字)"]))
+        elif val == "b64enc": await interaction.response.send_modal(ActionInputModal("b64enc", "Base64エンコード", ["テキスト"]))
+        elif val == "b64dec": await interaction.response.send_modal(ActionInputModal("b64dec", "Base64デコード", ["Base64文字列"]))
+        elif val == "hash": await interaction.response.send_modal(ActionInputModal("hash", "ハッシュ生成", ["テキスト"]))
+        elif val == "rot13": await interaction.response.send_modal(ActionInputModal("rot13", "ROT13暗号化", ["テキスト"]))
         else:
             await interaction.response.defer()
             ch_id = self.channel_id
@@ -497,7 +508,8 @@ class ExtSelect(discord.ui.Select):
                 res = await asyncio.to_thread(call_gemini_api, get_state(ch_id), MEIGEN_SEARCH_PROMPT + ref + "\n迷言を出力。")
                 await interaction.followup.send(res.text if res.text else "失敗")
 
-class DiscSelect(discord.ui.Select):
+# Discord機能 分割セレクト (PART 1: 治安・メッセージ・チャンネル)
+class DiscSelectPart1(discord.ui.Select):
     def __init__(self, channel_id):
         self.channel_id = channel_id
         opts = [
@@ -507,39 +519,39 @@ class DiscSelect(discord.ui.Select):
             discord.SelectOption(label="🗑️ 特定ユーザー発言削除", value="purge_user"), discord.SelectOption(label="🗑️ メッセージ一括削除", value="purge"),
             discord.SelectOption(label="🔒 チャンネル緊急封鎖", value="act_lock"), discord.SelectOption(label="🔓 チャンネル封鎖解除", value="act_unlock"),
             discord.SelectOption(label="⏱️ スローモード設定", value="slowmode"), discord.SelectOption(label="➕ テキストチャンネル作成", value="create_text"),
-            discord.SelectOption(label="➕ ボイスチャンネル作成", value="create_voice"), discord.SelectOption(label="➕ フォーラム作成", value="create_forum"),
-            discord.SelectOption(label="🧵 スレッド作成", value="create_thread"), discord.SelectOption(label="📝 チャンネル名変更", value="rename_channel"),
-            discord.SelectOption(label="💬 トピック変更", value="set_topic"), discord.SelectOption(label="🏷️ ニックネーム変更", value="nick"),
-            discord.SelectOption(label="🏷️ 全員一斉改名", value="mass_nick"), discord.SelectOption(label="👑 役職作成", value="create_role"),
-            discord.SelectOption(label="🔰 役職付与", value="add_role"), discord.SelectOption(label="🛡️ AutoMod禁止ワード追加", value="automod_kw"),
-            discord.SelectOption(label="📣 アナウンス送信", value="announce"), discord.SelectOption(label="🎨 サーバー名変更", value="rename_server"),
+            discord.SelectOption(label="➕ ボイスチャンネル作成", value="create_voice"), discord.SelectOption(label="➕ ステージチャンネル作成", value="create_stage"),
+            discord.SelectOption(label="➕ カテゴリ作成", value="create_category"), discord.SelectOption(label="➕ フォーラム作成", value="create_forum"),
+            discord.SelectOption(label="🧵 スレッド作成", value="create_thread"), discord.SelectOption(label="❌ チャンネル削除", value="delete_channel"),
+            discord.SelectOption(label="📝 チャンネル名変更", value="rename_channel"), discord.SelectOption(label="💬 トピック変更", value="set_topic"),
+            discord.SelectOption(label="🏷️ ニックネーム変更", value="nick"), discord.SelectOption(label="🏷️ 全員一斉改名", value="mass_nick"),
+            discord.SelectOption(label="🛡️ AutoMod禁止ワード追加", value="automod_kw"), discord.SelectOption(label="📣 アナウンス送信", value="announce"),
             discord.SelectOption(label="🔗 招待リンク即時発行", value="act_invite")
         ]
-        super().__init__(placeholder="【4】Discord管理・操作機能 (全25種MAX)", min_values=1, max_values=1, options=opts, row=3)
+        super().__init__(placeholder="【4-A】Discord管理：制裁・メッセージ・チャンネル", min_values=1, max_values=1, options=opts, row=3)
 
     async def callback(self, interaction: discord.Interaction):
         val = self.values[0]
-        if val == "poll": await interaction.response.send_modal(DynamicActionModal("poll", "投票作成", ["質問", "選択肢1", "選択肢2"]))
-        elif val == "timeout": await interaction.response.send_modal(DynamicActionModal("timeout", "タイムアウト", ["ユーザー名", "分数"]))
-        elif val == "untimeout": await interaction.response.send_modal(DynamicActionModal("untimeout", "タイムアウト解除", ["ユーザー名"]))
-        elif val == "kick": await interaction.response.send_modal(DynamicActionModal("kick", "キック", ["ユーザー名"]))
-        elif val == "ban": await interaction.response.send_modal(DynamicActionModal("ban", "BAN", ["ユーザー名"]))
-        elif val == "purge": await interaction.response.send_modal(DynamicActionModal("purge", "メッセージ一括削除", ["件数"]))
-        elif val == "purge_user": await interaction.response.send_modal(DynamicActionModal("purge_user", "特定ユーザー発言削除", ["ユーザー名", "件数"]))
-        elif val == "slowmode": await interaction.response.send_modal(DynamicActionModal("slowmode", "スローモード", ["秒数"]))
-        elif val == "create_text": await interaction.response.send_modal(DynamicActionModal("create_text", "テキストチャンネル作成", ["名前"]))
-        elif val == "create_voice": await interaction.response.send_modal(DynamicActionModal("create_voice", "ボイスチャンネル作成", ["名前"]))
-        elif val == "create_forum": await interaction.response.send_modal(DynamicActionModal("create_forum", "フォーラム作成", ["名前"]))
-        elif val == "create_thread": await interaction.response.send_modal(DynamicActionModal("create_thread", "スレッド作成", ["名前"]))
-        elif val == "rename_channel": await interaction.response.send_modal(DynamicActionModal("rename_channel", "チャンネル名変更", ["新名前"]))
-        elif val == "set_topic": await interaction.response.send_modal(DynamicActionModal("set_topic", "トピック変更", ["トピック本文"]))
-        elif val == "nick": await interaction.response.send_modal(DynamicActionModal("nick", "ニックネーム変更", ["ユーザー名", "新ニックネーム"]))
-        elif val == "mass_nick": await interaction.response.send_modal(DynamicActionModal("mass_nick", "全員一斉改名", ["共通の接頭辞"]))
-        elif val == "create_role": await interaction.response.send_modal(DynamicActionModal("create_role", "役職作成", ["役職名"]))
-        elif val == "add_role": await interaction.response.send_modal(DynamicActionModal("add_role", "役職付与", ["ユーザー名", "役職名"]))
-        elif val == "automod_kw": await interaction.response.send_modal(DynamicActionModal("automod_kw", "AutoMod禁止ワード", ["ルール名", "禁止ワード(スラッシュ区切り)"]))
-        elif val == "announce": await interaction.response.send_modal(DynamicActionModal("announce", "アナウンス送信", ["本文"]))
-        elif val == "rename_server": await interaction.response.send_modal(DynamicActionModal("rename_server", "サーバー名変更", ["新サーバー名"]))
+        if val == "poll": await interaction.response.send_modal(ActionInputModal("poll", "投票作成", ["質問", "選択肢1", "選択肢2"]))
+        elif val == "timeout": await interaction.response.send_modal(ActionInputModal("timeout", "タイムアウト", ["ユーザー名", "分数"]))
+        elif val == "untimeout": await interaction.response.send_modal(ActionInputModal("untimeout", "タイムアウト解除", ["ユーザー名"]))
+        elif val == "kick": await interaction.response.send_modal(ActionInputModal("kick", "キック", ["ユーザー名"]))
+        elif val == "ban": await interaction.response.send_modal(ActionInputModal("ban", "BAN", ["ユーザー名"]))
+        elif val == "purge": await interaction.response.send_modal(ActionInputModal("purge", "メッセージ一括削除", ["件数"]))
+        elif val == "purge_user": await interaction.response.send_modal(ActionInputModal("purge_user", "特定ユーザー発言削除", ["ユーザー名", "件数"]))
+        elif val == "slowmode": await interaction.response.send_modal(ActionInputModal("slowmode", "スローモード", ["秒数"]))
+        elif val == "create_text": await interaction.response.send_modal(ActionInputModal("create_text", "テキストチャンネル作成", ["チャンネル名"]))
+        elif val == "create_voice": await interaction.response.send_modal(ActionInputModal("create_voice", "ボイスチャンネル作成", ["チャンネル名"]))
+        elif val == "create_stage": await interaction.response.send_modal(ActionInputModal("create_stage", "ステージ作成", ["チャンネル名"]))
+        elif val == "create_category": await interaction.response.send_modal(ActionInputModal("create_category", "カテゴリ作成", ["カテゴリ名"]))
+        elif val == "create_forum": await interaction.response.send_modal(ActionInputModal("create_forum", "フォーラム作成", ["フォーラム名"]))
+        elif val == "create_thread": await interaction.response.send_modal(ActionInputModal("create_thread", "スレッド作成", ["スレッド名"]))
+        elif val == "delete_channel": await interaction.response.send_modal(ActionInputModal("delete_channel", "チャンネル削除", ["チャンネル名"]))
+        elif val == "rename_channel": await interaction.response.send_modal(ActionInputModal("rename_channel", "チャンネル名変更", ["新名前"]))
+        elif val == "set_topic": await interaction.response.send_modal(ActionInputModal("set_topic", "トピック変更", ["トピック本文"]))
+        elif val == "nick": await interaction.response.send_modal(ActionInputModal("nick", "ニックネーム変更", ["ユーザー名", "新ニックネーム"]))
+        elif val == "mass_nick": await interaction.response.send_modal(ActionInputModal("mass_nick", "全員一斉改名", ["共通の接頭辞"]))
+        elif val == "automod_kw": await interaction.response.send_modal(ActionInputModal("automod_kw", "AutoMod禁止ワード", ["ルール名", "禁止ワード(スラッシュ区切り)"]))
+        elif val == "announce": await interaction.response.send_modal(ActionInputModal("announce", "アナウンス送信", ["本文"]))
         else:
             await interaction.response.defer()
             ch = interaction.channel
@@ -561,31 +573,42 @@ class DiscSelect(discord.ui.Select):
                     inv = await ch.create_invite(max_age=3600, max_uses=5)
                     await interaction.followup.send(f"📎 招待リンク: {inv.url}")
 
+# Discord機能 分割セレクト (PART 2: ロール・ボイス・サーバー設定・権限オーバーライド)
+class DiscSelectPart2(discord.ui.Select):
+    def __init__(self, channel_id):
+        self.channel_id = channel_id
+        opts = [
+            discord.SelectOption(label="👑 役職作成", value="create_role"), discord.SelectOption(label="❌ 役職削除", value="delete_role"),
+            discord.SelectOption(label="🔰 役職付与", value="add_role"), discord.SelectOption(label="⛔ 役職剥奪", value="remove_role"),
+            discord.SelectOption(label="🔇 ボイス強制切断", value="voice_kick"), discord.SelectOption(label="🔇 サーバーミュート", value="voice_mute"),
+            discord.SelectOption(label="🚚 ボイスメンバー移動", value="move_member"), discord.SelectOption(label="🎨 サーバー名変更", value="rename_server"),
+            discord.SelectOption(label="🔐 チャンネル個別権限設定", value="set_perm")
+        ]
+        super().__init__(placeholder="【4-B】Discord管理：役職・ボイス・個別権限・サーバー設定", min_values=1, max_values=1, options=opts, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        val = self.values[0]
+        if val == "create_role": await interaction.response.send_modal(ActionInputModal("create_role", "役職作成", ["役職名"]))
+        elif val == "delete_role": await interaction.response.send_modal(ActionInputModal("delete_role", "役職削除", ["役職名"]))
+        elif val == "add_role": await interaction.response.send_modal(ActionInputModal("add_role", "役職付与", ["ユーザー名", "役職名"]))
+        elif val == "remove_role": await interaction.response.send_modal(ActionInputModal("remove_role", "役職剥奪", ["ユーザー名", "役職名"]))
+        elif val == "voice_kick": await interaction.response.send_modal(ActionInputModal("voice_kick", "ボイス強制切断", ["ユーザー名"]))
+        elif val == "voice_mute": await interaction.response.send_modal(ActionInputModal("voice_mute", "サーバーミュート", ["ユーザー名"]))
+        elif val == "move_member": await interaction.response.send_modal(ActionInputModal("move_member", "ボイス移動", ["ユーザー名", "移動先チャンネル名"]))
+        elif val == "rename_server": await interaction.response.send_modal(ActionInputModal("rename_server", "サーバー名変更", ["新サーバー名"]))
+        elif val == "set_perm": await interaction.response.send_modal(ActionInputModal("set_perm", "個別権限設定", ["チャンネル名", "ユーザー/役職名", "権限名(send_messages等)", "allow/deny"]))
+
+# --- 8. メインメニューView（Discordの上限5コンポーネント完全使い切り） ---
 class MainMenuView(discord.ui.View):
     def __init__(self, channel_id):
         super().__init__(timeout=None)
         self.add_item(ModeSelect(channel_id))
         self.add_item(EntSelect(channel_id))
         self.add_item(ExtSelect(channel_id))
-        self.add_item(DiscSelect(channel_id))
+        self.add_item(DiscSelectPart1(channel_id))
+        self.add_item(DiscSelectPart2(channel_id))
 
-    @discord.ui.button(label="🧹 記憶完全初期化", style=discord.ButtonStyle.danger, row=4)
-    async def btn_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
-        state = get_state(interaction.channel.id)
-        state["count"] = 0
-        state["vocab"] = []
-        state["learned_facts"] = []
-        state["history"] = []
-        await interaction.response.send_message("🧹 このチャンネルの記憶・対話履歴を完全にリセットしました！", ephemeral=False)
-
-    @discord.ui.button(label="📊 システム状態確認", style=discord.ButtonStyle.primary, row=4)
-    async def btn_status(self, interaction: discord.Interaction, button: discord.ui.Button):
-        s = get_state(interaction.channel.id)
-        await interaction.response.send_message(
-            f"📊 **ステータス**\n・モデル: `{ACTIVE_MODEL}`\n・現在のモード: `{s['mode']}`\n"
-            f"・登録キー数: {len(API_KEYS)} 個\n・対話数: {s.get('count', 0)} 回", ephemeral=True)
-
-# --- 4-4. AI連携・発火ロジック ---
+# --- 9. AI連携 & ハンドラ ---
 def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
     global current_key_index
     if not API_KEYS: raise Exception("APIキーがありません。")
@@ -808,6 +831,13 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
             try: await t.remove_roles(r)
             except Exception: pass
 
+    m = re.search(r'\[DELETE_ROLE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+    if m and me.guild_permissions.manage_roles:
+        r = find_target_role(guild, m.group(1))
+        if r and r < me.top_role:
+            try: await r.delete()
+            except Exception: pass
+
     m = re.search(r'\[SET_CHANNEL_PERM:\s*(.+?),\s*(.+?),\s*([a-z_]+),\s*(allow\vert{}deny\vert{}neutral)\]', clean_text, re.IGNORECASE)
     if m and getattr(message, "channel", None) and message.channel.permissions_for(me).manage_roles:
         ch = find_target_channel(guild, m.group(1)) or message.channel
@@ -864,6 +894,16 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
         try: await guild.create_voice_channel(name=m.group(1).strip())
         except Exception: pass
 
+    m = re.search(r'\[CREATE_STAGE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+    if m and allow_destructive and me.guild_permissions.manage_channels:
+        try: await guild.create_stage_channel(name=m.group(1).strip())
+        except Exception: pass
+
+    m = re.search(r'\[CREATE_CATEGORY:\s*(.+?)\]', clean_text, re.IGNORECASE)
+    if m and allow_destructive and me.guild_permissions.manage_channels:
+        try: await guild.create_category(name=m.group(1).strip())
+        except Exception: pass
+
     m = re.search(r'\[CREATE_FORUM:\s*(.+?)\]', clean_text, re.IGNORECASE)
     if m and allow_destructive and me.guild_permissions.manage_channels:
         try: await guild.create_forum_channel(name=m.group(1).strip())
@@ -874,11 +914,43 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
         try: await message.channel.create_thread(name=m.group(1).strip(), message=message)
         except Exception: pass
 
+    m = re.search(r'\[DELETE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
+    if m and allow_destructive and me.guild_permissions.manage_channels:
+        ch_target = find_target_channel(guild, m.group(1))
+        if ch_target:
+            try: await ch_target.delete()
+            except Exception: pass
+
+    m = re.search(r'\[RENAME_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
+    if m and allow_destructive and getattr(message, "channel", None) and message.channel.permissions_for(me).manage_channels:
+        try: await message.channel.edit(name=m.group(1).strip())
+        except Exception: pass
+
+    m = re.search(r'\[SET_TOPIC:\s*(.+?)\]', clean_text, re.IGNORECASE)
+    if m and getattr(message, "channel", None) and message.channel.permissions_for(me).manage_channels:
+        try: await message.channel.edit(topic=m.group(1).strip())
+        except Exception: pass
+
     m = re.search(r'\[VOICE_KICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
     if m and me.guild_permissions.move_members:
         t = find_target_member(guild, m.group(1))
         if t and t.voice:
             try: await t.move_to(None)
+            except Exception: pass
+
+    m = re.search(r'\[VOICE_MUTE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+    if m and me.guild_permissions.mute_members:
+        t = find_target_member(guild, m.group(1))
+        if t and t.voice:
+            try: await t.edit(mute=True)
+            except Exception: pass
+
+    m = re.search(r'\[MOVE_MEMBER:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
+    if m and me.guild_permissions.move_members:
+        t = find_target_member(guild, m.group(1))
+        v_ch = find_target_channel(guild, m.group(2))
+        if t and t.voice and v_ch and isinstance(v_ch, discord.VoiceChannel):
+            try: await t.move_to(v_ch)
             except Exception: pass
 
     m = re.search(r'\[CREATE_AUTOMOD_KEYWORD:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
@@ -891,14 +963,24 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
             await guild.create_automod_rule(name=r_name, event_type=discord.AutoModRuleEventType.message_send, trigger=trigger, actions=[action], enabled=True)
         except Exception: pass
 
+    m = re.search(r'\[RENAME_SERVER:\s*(.+?)\]', clean_text, re.IGNORECASE)
+    if m and allow_destructive and me.guild_permissions.manage_guild:
+        try: await guild.edit(name=m.group(1).strip())
+        except Exception: pass
+
     clean_text = re.sub(r'\[[A-Z_]+(?::\s*[^\]]+)?\]', '', clean_text, flags=re.IGNORECASE).strip()
     return clean_text, image_file
 
-# --- 7. コマンド定義 ---
+# --- 10. コマンド定義 ---
 @bot.command()
 async def menu(ctx):
     view = MainMenuView(ctx.channel.id)
-    embed = discord.Embed(title="🎮 ポチ・完全マスターコントロールパネル", description="下のドロップダウンメニューから、**人格モード**や**全120種のアクション**を選択して即時実行できます！", color=discord.Color.gold())
+    embed = discord.Embed(
+        title="🎮 ポチ・完全マスターコントロールパネル（全機能・全モード網羅）",
+        description="下のドロップダウンメニューから、**人格モード**や**全Discord管理機能・外部ツール**を選択して直接実行できます！",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="📋 メニュー構成", value="・**【1】モード切替**: 全12種の人格・動作モードを変更\n・**【2】エンタメ機能**: 文春、AIダンジョン、ミミック、裁判など\n・**【3】外部ツール**: 計算機、QR、Wiki、天気、為替など\n・**【4-A】Discord管理①**: 制裁、投票、メッセージ削除、チャンネル作成\n・**【4-B】Discord管理②**: 役職、ボイス切断、個別権限、サーバー設定", inline=False)
     await ctx.send(embed=embed, view=view)
 
 @bot.command()
@@ -936,7 +1018,7 @@ async def dungeon(ctx, action: str = ""):
                         try: await m.timeout(timedelta(minutes=3))
                         except Exception: pass
 
-# --- 8. イベントハンドラ ---
+# --- 11. イベントハンドラ ---
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user.name}")
