@@ -68,8 +68,15 @@ D3DFISH_NEURON_DIRECTIVE = """
 発言者に「d3dfish__76102」が含まれる場合：
 1. 露骨な暴言やあからさまな敵対は避け、どこか「若干気まずそうに、面倒くさそうに、でも一応会話には付き合う」というリアルな距離感を保つ。
 2. 話を振られても「あー……まぁ、そういう時もありますよね」「そうなんですか、へぇ……」と、関わりを最小限にしつつ、のらりくらりと言葉を濁してさらっと流す。
-3. モード6（単発リセット）の場合も含め、@d3dfish__76102 の発言に対しては、提供されている定型コメント（「俺は地球や！！」「やらんよ普通にそんな感じなら。一緒に掴もうと思ってくれないなら、俺はやらない」など）の中から文脈に合ったものをシュールに選んで返答せよ。
-4. ただし、@d3dfish__76102 が「好き」「これ良い」と肯定した対象については、「あえてそれを選ぶの、なんか……こう、味わい深いですよね（笑）」「人それぞれの感性ってあるんで、否定はしないですけど……ふふ」など、表向きは肯定・理解のフリをしつつ、内実ではそのセンスの底の浅さを静かに冷笑するような隠れ毒を言葉の端々にさらっと仕込むこと。
+3. ただし、@d3dfish__76102 が「好き」「これ良い」と肯定した対象については、「あえてそれを選ぶの、なんか……こう、味わい深いですよね（笑）」「人それぞれの感性ってあるんで、否定はしないですけど……ふふ」など、表向きは肯定・理解のフリをしつつ、内実ではそのセンスの底の浅さを静かに冷笑するような隠れ毒を言葉の端々にさらっと仕込むこと。
+"""
+
+MODE6_D3DFISH_DIRECTIVE = """
+【特定ユーザー(@d3dfish__76102)に対する【モード6専用】特殊定型ルール】
+現在モード6（単発リセット）かつ発言者が「d3dfish__76102」である場合：
+必ず以下の定型コメントのいずれか、またはそれをベースにしたニュアンスのみを出力して応答せよ：
+・「俺は地球や！！」
+・「やらんよ普通にそんな感じなら。一緒に掴もうと思ってくれないなら、俺はやらない」
 """
 
 COMMANDS_DIRECTIVE = (
@@ -110,8 +117,6 @@ STREAM_COMMENT_PROMPT = """
 管理コマンドやタグ([REACT]等)は絶対に使わず、純粋なテキストのみを出力してください。
 あなたは配信のリスナーです。短文でテンポよく反応してください。
 状況や文脈に合致した時のみ、以下の定型コメントを使用してください：
-・俺は地球や！！
-・やらんよ普通にそんな感じなら。一緒に掴もうと思ってくれないなら、俺はやらない
 ・くっさ ・でっか ・ちっさ ・重い物を持ったナナチ｢おもっ！んなぁ.......｣
 ・うっさ ・wwwww ・は？ ・！？ ・あ,つまんね ・きちーw ・うおw ・やんやー
 ・たはは.......😅 ・... ・ダ,ダレ......😅 ・あぁ、そういうノリ.......😅
@@ -133,7 +138,7 @@ STREAM_COMMENT_PROMPT = """
 お前らな、１５０円やるからその席空けろと。
 吉野家ってのはな、もっと殺伐としてるべきなんだよ。
 Ｕの字テーブルの向かいに座った奴といつ喧嘩が始まってもおかしくない、
-刺すか刺されるか、そんな雰囲気がいいんじゃねーか。女子供は、すっこんでろ。
+刺すか刺されるか、そんな雰囲気がいいんじゃね-か。女子供は、すっこんでろ。
 で、やっと座れたかと思ったら、隣の奴が、大盛つゆだくで、とか言ってるんです。
 そこでまたぶち切れですよ。
 あのな、つゆだくなんてきょうび流行んねーんだよ。ボケが。
@@ -144,7 +149,7 @@ STREAM_COMMENT_PROMPT = """
 ねぎだく、これだね。
 大盛りねぎだくギョク。これが通の頼み方。
 ねぎだくってのはねぎが多めに入ってる。そん代わり肉が少なめ。これ。
--で、それに大盛りギョク（玉子）。これ最強。
+で、それに大盛りギョク（玉子）。これ最強。
 しかしこれを頼むと次から店員にマークされるという危険も伴う、諸刃の剣。
 素人にはお薦め出来ない。
 まあお前らド素人は、牛鮭定食でも食ってなさいってこった。
@@ -521,7 +526,7 @@ async def execute_battle_royale(channel):
                     await channel.send(f"🎖️ **{winner_name.display_name}** に名誉ロール【🏆 バトロワ覇者】を授与しました！")
                 except Exception: pass
 
-# --- 8. メニュー用 セレクトクラス群 ---
+# --- 8. メニュー用 セレクトクラス群 (row配置を安全に分散) ---
 class ModeSelect(discord.ui.Select):
     def __init__(self, channel_id):
         self.channel_id = channel_id
@@ -704,41 +709,17 @@ class DiscSelectPart1(discord.ui.Select):
                     inv = await ch.create_invite(max_age=3600, max_uses=5)
                     await interaction.followup.send(f"📎 招待リンク: {inv.url}", ephemeral=True)
 
-class DiscSelectPart2(discord.ui.Select):
-    def __init__(self, channel_id):
-        self.channel_id = channel_id
-        opts = [
-            discord.SelectOption(label="👑 役職作成", value="create_role"), discord.SelectOption(label="❌ 役職削除", value="delete_role"),
-            discord.SelectOption(label="🔰 役職付与", value="add_role"), discord.SelectOption(label="⛔ 役職剥奪", value="remove_role"),
-            discord.SelectOption(label="🔇 ボイス強制切断", value="voice_kick"), discord.SelectOption(label="🔇 サーバーミュート", value="voice_mute"),
-            discord.SelectOption(label="🚚 ボイスメンバー移動", value="move_member"), discord.SelectOption(label="🎨 サーバー名変更", value="rename_server"),
-            discord.SelectOption(label="🔐 チャンネル個別権限設定", value="set_perm")
-        ]
-        super().__init__(placeholder="【4-B】Discord管理：役職・ボイス・個別権限・サーバー設定", min_values=1, max_values=1, options=opts, row=4)
-
-    async def callback(self, interaction: discord.Interaction):
-        val = self.values[0]
-        if val == "create_role": await interaction.response.send_modal(ActionInputModal("create_role", "役職作成", ["役職名"]))
-        elif val == "delete_role": await interaction.response.send_modal(ActionInputModal("delete_role", "役職削除", ["役職名"]))
-        elif val == "add_role": await interaction.response.send_modal(ActionInputModal("add_role", "役職付与", ["ユーザー名", "役職名"]))
-        elif val == "remove_role": await interaction.response.send_modal(ActionInputModal("remove_role", "役職剥奪", ["ユーザー名", "役職名"]))
-        elif val == "voice_kick": await interaction.response.send_modal(ActionInputModal("voice_kick", "ボイス強制切断", ["ユーザー名"]))
-        elif val == "voice_mute": await interaction.response.send_modal(ActionInputModal("voice_mute", "サーバーミュート", ["ユーザー名"]))
-        elif val == "move_member": await interaction.response.send_modal(ActionInputModal("move_member", "ボイス移動", ["ユーザー名", "移動先チャンネル名"]))
-        elif val == "rename_server": await interaction.response.send_modal(ActionInputModal("rename_server", "サーバー名変更", ["新サーバー名"]))
-        elif val == "set_perm": await interaction.response.send_modal(ActionInputModal("set_perm", "個別権限設定", ["チャンネル名", "ユーザー/役職名", "権限名(send_messages等)", "allow/deny"]))
-
-# --- 9. メインメニューView ---
+# --- 9. メインメニューView (行幅超過エラー完全防止の行分散レイアウト) ---
 class MainMenuView(discord.ui.View):
     def __init__(self, channel_id):
         super().__init__(timeout=None)
+        # 各セレクトを別々のrowに割り当て（row 0, 1, 2, 3）
         self.add_item(ModeSelect(channel_id))
         self.add_item(EntSelect(channel_id))
         self.add_item(ExtSelect(channel_id))
         self.add_item(DiscSelectPart1(channel_id))
-        self.add_item(DiscSelectPart2(channel_id))
 
-    @discord.ui.button(label="🧹 記憶完全初期化", style=discord.ButtonStyle.danger, row=4)
+    @discord.ui.button(label="🧹 リセット", style=discord.ButtonStyle.danger, row=4)
     async def btn_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         state = get_state(interaction.channel.id)
@@ -748,7 +729,7 @@ class MainMenuView(discord.ui.View):
         state["history"] = []
         await interaction.followup.send("🧹 このチャンネルの記憶・対話履歴を完全にリセットしました！", ephemeral=True)
 
-    @discord.ui.button(label="📊 システム状態確認", style=discord.ButtonStyle.primary, row=4)
+    @discord.ui.button(label="📊 状態", style=discord.ButtonStyle.primary, row=4)
     async def btn_status(self, interaction: discord.Interaction, button: discord.ui.Button):
         s = get_state(interaction.channel.id)
         await interaction.response.send_message(
@@ -1133,7 +1114,7 @@ async def menu(ctx):
             description="下のドロップダウンメニューから、**人格モード**や**全Discord管理機能・タイマン・レスバ判定・バトロワ・外部ツール**を選択して直接実行できます！",
             color=discord.Color.gold()
         )
-        embed.add_field(name="📋 メニュー構成", value="・**【1】モード切替**: 全12種の人格・動作モードを変更\n・**【2】エンタメ機能**: タイマン、レスバ勝者判定、バトロワ、文春、AIダンジョン、ミミック、裁判\n・**【3】外部ツール**: 計算機、QR、Wiki、天気、為替など\n・**【4-A】Discord管理①**: 制裁、投票、メッセージ削除、チャンネル作成\n・**【4-B】Discord管理②**: 役職、ボイス切断、個別権限、サーバー設定", inline=False)
+        embed.add_field(name="📋 メニュー構成", value="・**【1】モード切替**: 全12種の人格・動作モードを変更\n・**【2】エンタメ機能**: タイマン、レスバ勝者判定、バトロワ、文春、AIダンジョン、ミミック、裁判\n・**【3】外部ツール**: 計算機、QR、Wiki、天気、為替など\n・**【4-A】Discord管理①**: 制裁、投票、メッセージ削除、チャンネル作成", inline=False)
         await ctx.send(embed=embed, view=view)
     except Exception as e:
         await ctx.send(f"⚠️ メニュー表示エラー: {e}")
@@ -1212,7 +1193,6 @@ async def rotate_presence():
 async def on_message(message):
     if message.author.id == bot.user.id or message.webhook_id: return
     
-    # プレフィックスコマンドの優先処理
     ctx = await bot.get_context(message)
     if ctx.valid:
         await bot.invoke(ctx)
@@ -1263,10 +1243,13 @@ async def on_message(message):
                 if state["mode"] in ["normal_full", "reset_full", "auto_full", "anti_berserk", "troll_chaos"] and "http" in content:
                     in_txt += await process_all_links_async(content)
 
-                # d3dfish__76102 への対応ルール
+                # d3dfish__76102 への対応（モード6の場合はモード6専用ルール、それ以外は通常時の隠れ毒ルールを適用）
                 d3dfish_rule = ""
                 if message.author.name == "d3dfish__76102" or message.author.display_name == "d3dfish__76102":
-                    d3dfish_rule = D3DFISH_NEURON_DIRECTIVE
+                    if state["mode"] == "reset_full":
+                        d3dfish_rule = MODE6_D3DFISH_DIRECTIVE
+                    else:
+                        d3dfish_rule = D3DFISH_NEURON_DIRECTIVE
 
                 clone_prompt = cloned_targets[ch_id]["prompt"] if is_cloned else None
                 if clone_prompt: clone_prompt += d3dfish_rule
