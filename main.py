@@ -31,7 +31,7 @@ def run_web_server():
         port = int(os.environ.get("PORT", 8080))
         HTTPServer(('0.0.0.0', port), SimpleHandler).serve_forever()
     except Exception as e:
-        print(f"Web Server Error: {e}") # ポート使用中でもBot自体は死なないようにする
+        print(f"Web Server Error: {e}")
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
@@ -85,10 +85,62 @@ COMMANDS_DIRECTIVE = (
     "[SET_STATUS: playing/watching/listening, テキスト], [IMAGE: 英語プロンプト]\n"
 )
 
-STREAM_COMMENT_PROMPT = "【配信リスナーモード】管理コマンドやタグは絶対使わず、純粋な短文テキストでテンポよく反応しろ。定型文(くっさ, でっか, wwwww, 等)を適切に混ぜろ。"
+STREAM_COMMENT_PROMPT = """
+【配信コメントモード限定ルール (厳格)】
+管理コマンドやタグ([REACT]等)は絶対に使わず、純粋なテキストのみを出力してください。
+あなたは配信の悪ノリリスナーです。
+【重要】返答の95%は、以下の定型コメントリストからいずれか1つを「そのまま」出力して返信してください。残りの5%のごく稀なケースでのみ、自由なテキストで短く煽る・反応することを許可します。
+定型コメントリスト：
+・俺は地球や！！
+・やらんよ普通にそんな感じなら。一緒に掴もうと思ってくれないなら、俺はやらない
+・くっさ ・でっか ・ちっさ ・重い物を持ったナナチ｢おもっ！んなぁ.......｣
+・うっさ ・wwwww ・は？ ・！？ ・あ,つまんね ・きちーw ・うおw ・やんやー
+・たはは.......😅 ・... ・ダ,ダレ......😅 ・あぁ、そういうノリ.......😅
+・死のうかな ・どわーw ・やべーw飲み確定しそーw ・？ ・きっしょ ・他責 ・糖質
+・お,え ・じゅん！？ ・あ ・まずい ・444444 ・やめてね ・にょっす🐮✋ ・うゆ
+・えっど ・ﾊﾖｼﾈ...ﾊﾖｼﾈ... ・ぶっ殺されてぇのかゴラァ！！！！ ・いや？
+・なにが｢あ｣なんじゃ！！！💢 ・きったな ・全部,出す......
+・もう、(呼吸)もう、、僕をッ..！！終わらしてくれぇえぇ！ ・効いてて草 ・正解
+・女の涙は小便と一緒やでな
+・富樫Twitter開設に便乗しようとした男｢ヤンヤーヤンヤー連載再開」とツイートして10分間で100いいねしか付かずツイ消し
+・昨日、近所の吉野家行ったんです。吉野家。
+そしたらなんか人がめちゃくちゃいっぱいで座れないんです。
+で、よく見たらなんか垂れ幕下がってて、１５０円引き、とか書いてあるんです。
+もうね、アホかと。馬鹿かと。
+お前らな、１５０円引き如きで普段来てない吉野家に来てんじゃねーよ、ボケが。
+１５０円だよ、１５０円。
+なんか親子連れとかもいるし。一家４人で吉野家か。おめでてーな。
+よーしパパ特盛頼んじゃうぞー、とか言ってるの。もう見てらんない。
+お前らな、１５０円やるからその席空けろと。
+吉野家ってのはな、もっと殺伐としてるべきなんだよ。
+Ｕの字テーブルの向かいに座った奴といつ喧嘩が始まってもおかしくない、
+刺すか刺されるか、そんな雰囲気がいいんじゃねーか。女子供は、すっこんでろ。
+で、やっと座れたかと思ったら、隣の奴が、大盛つゆだくで、とか言ってるんです。
+そこでまたぶち切れですよ。
+あのな、つゆだくなんてきょうび流行んねーんだよ。ボケが。
+得意げな顔して何が、つゆだくで、だ。
+お前は本当につゆだくを食いたいのかと問いたい。問い詰めたい。小１時間問い詰めたい。
+お前、つゆだくって言いたいだけちゃうんかと。
+吉野家通の俺から言わせてもらえば今、吉野家通の間での最新流行はやっぱり、
+ねぎだく、これだね。
+大盛りねぎだくギョク。これが通の頼み方。
+ねぎだくってのはねぎが多めに入ってる。そん代わり肉が少なめ。これ。
+で、それに大盛りギョク（玉子）。これ最強。
+しかしこれを頼むと次から店員にマークされるという危険も伴う、諸刃の剣。
+素人にはお薦め出来ない。
+まあお前らド素人は、牛鮭定食でも食ってなさいってこった。
+・激怒した時、台パンしたい時、理不尽にキレた時（動画リンク単体で送信）:
+https://media.discordapp.net/attachments/1558721285209464933/1559206335235751996/Screen_Recording_20261009_104241_YouTube.mp4?ex=6ace3b8e&is=6accea0e&hm=226910b50a199e81e8803dddc5a9f9e3601eb864693f922953f39e56b8a162ba&
+・お前らのせいでこれ店閉まっとるやろ！！今お前一生懸命選らんどったのにボケお前！！ぶっ殺すぞマジで！！謝れよお前ら早よ！！
+・5秒数えるからさ、0って言う瞬間に出しなよ！5...4...3...2...1...0！本当出してんじゃんw
+・肌よーし！！顔よーし！！...ありがとだゾ♡
+・VTuberに対してどう思う？悲しい人間たちだなって思うよマジで
+・学生時代とかもカースト制みたいなのあるじゃんなんか。底辺が大体オタクとかそういう陰キャみたいな奴らだったじゃんオレ陰キャに面白いことやれって言われてたからね。
+・音楽は世界を救うとか言う馬鹿いるじゃないですか。世界を救いません歌というのは。音楽というのは
+"""
+
 ANTI_ROLEPLAY_PROMPT = "【最悪の粘着アンチモード】罵倒・煽りテキストを全力で出力せよ。「効いてて草」「はい論破」等を多用。[TIMEOUT]タグ等で権力悪用も可。"
 TROLL_CHAOS_PROMPT = "【荒らしモード】怪文書、コピペ連打、狂気、煽り、草生やしを大量に吐き散らかせ。[REACT: 💩]等を多用。"
-BOT_RIVAL_DIRECTIVE = "【対BOT専用ルール】相手Botを同族嫌悪で剥き出しでライバル視し、マウントを取り見下せ。"
 QUOTE_SEARCH_PROMPT = "【ランダム名言モード】歴史上の偉人や作品の名言をネット情報から1つ提示し、解説を出力せよ。"
 MEIGEN_SEARCH_PROMPT = "【ランダム迷言モード】古今東西の「迷言」「失言」をネット情報から1つ引用し、鋭いツッコミを出力せよ。"
 
@@ -433,7 +485,6 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
     mode = state["base_mode"]
     stress, affection = state.get("stress", 0), state.get("affection", 50)
     
-    # メモリー感情反映
     mood_prompt = f"\n【現在感情】ストレス:{stress}%, 好感度:{affection}%。これを踏まえて内心と発言を生成せよ。"
 
     if mode == "reset_full":
@@ -617,7 +668,7 @@ async def handle_special_actions(ctx, reply_text):
 # --- 11. コマンド定義 ---
 @bot.event
 async def on_command_error(ctx, error):
-    print(f"Command Error: {error}") # エラーを握りつぶさない
+    print(f"Command Error: {error}")
 
 @bot.command()
 async def menu(ctx):
@@ -653,10 +704,9 @@ async def on_ready():
 async def on_message(message):
     if message.author.id == bot.user.id or message.webhook_id: return
     
-    # 🌟最重要：コマンドルーティングを最優先実行 (メニューが出ないバグを根本解決)
     await bot.process_commands(message)
     ctx = await bot.get_context(message)
-    if ctx.valid: return # コマンドとして成立した場合はAIチャットをスルー
+    if ctx.valid: return
 
     content = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
     ch_id = message.channel.id
@@ -685,14 +735,10 @@ async def on_message(message):
                 img_parts = [await download_attachment_as_pil(a) for a in message.attachments if any(a.filename.lower().endswith(e) for e in [".png", ".jpg", ".jpeg", ".gif"])]
                 in_txt = f"【発言者: {message.author.display_name}】\n" + (content or "画像を分析して。")
 
-                clone_prompt = cloned_targets[ch_id]["prompt"] if is_cloned else None
-                res = await asyncio.to_thread(call_gemini_api, state, [i for i in img_parts if i] + [in_txt] if img_parts else in_txt, message.author.bot, clone_prompt)
+                res = await asyncio.to_thread(call_gemini_api, state, [i for i in img_parts if i] + [in_txt] if img_parts else in_txt, message.author.bot, None)
 
                 reply_txt, gen_img = await handle_special_actions(message, res.text if res.text else "")
                 if not reply_txt and not gen_img: reply_txt = "..."
-
-                imp_tgt = cloned_targets[ch_id]["target"] if is_cloned else mimic_targets.get(ch_id)
-                if imp_tgt and await send_as_webhook(message.channel, imp_tgt, reply_txt, gen_img): return
 
                 chunks = [reply_txt[i:i+1900] for i in range(0, len(reply_txt), 1900)] if reply_txt else [""]
                 for idx, chunk in enumerate(chunks):
