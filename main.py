@@ -144,7 +144,7 @@ STREAM_COMMENT_PROMPT = """
 ねぎだく、これだね。
 大盛りねぎだくギョク。これが通の頼み方。
 ねぎだくってのはねぎが多めに入ってる。そん代わり肉が少なめ。これ。
-で、それに大盛りギョク（玉子）。これ最強。
+-で、それに大盛りギョク（玉子）。これ最強。
 しかしこれを頼むと次から店員にマークされるという危険も伴う、諸刃の剣。
 素人にはお薦め出来ない。
 まあお前らド素人は、牛鮭定食でも食ってなさいってこった。
@@ -1126,14 +1126,17 @@ async def handle_special_actions(message, reply_text, is_anti_or_troll=False):
 # --- 11. コマンド定義 ---
 @bot.command()
 async def menu(ctx):
-    view = MainMenuView(ctx.channel.id)
-    embed = discord.Embed(
-        title="🎮 ポチ・完全マスターコントロールパネル（全機能・全モード網羅）",
-        description="下のドロップダウンメニューから、**人格モード**や**全Discord管理機能・タイマン・レスバ判定・バトロワ・外部ツール**を選択して直接実行できます！",
-        color=discord.Color.gold()
-    )
-    embed.add_field(name="📋 メニュー構成", value="・**【1】モード切替**: 全12種の人格・動作モードを変更\n・**【2】エンタメ機能**: タイマン、レスバ勝者判定、バトロワ、文春、AIダンジョン、ミミック、裁判\n・**【3】外部ツール**: 計算機、QR、Wiki、天気、為替など\n・**【4-A】Discord管理①**: 制裁、投票、メッセージ削除、チャンネル作成\n・**【4-B】Discord管理②**: 役職、ボイス切断、個別権限、サーバー設定", inline=False)
-    await ctx.send(embed=embed, view=view)
+    try:
+        view = MainMenuView(ctx.channel.id)
+        embed = discord.Embed(
+            title="🎮 ポチ・完全マスターコントロールパネル（全機能・全モード網羅）",
+            description="下のドロップダウンメニューから、**人格モード**や**全Discord管理機能・タイマン・レスバ判定・バトロワ・外部ツール**を選択して直接実行できます！",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="📋 メニュー構成", value="・**【1】モード切替**: 全12種の人格・動作モードを変更\n・**【2】エンタメ機能**: タイマン、レスバ勝者判定、バトロワ、文春、AIダンジョン、ミミック、裁判\n・**【3】外部ツール**: 計算機、QR、Wiki、天気、為替など\n・**【4-A】Discord管理①**: 制裁、投票、メッセージ削除、チャンネル作成\n・**【4-B】Discord管理②**: 役職、ボイス切断、個別権限、サーバー設定", inline=False)
+        await ctx.send(embed=embed, view=view)
+    except Exception as e:
+        await ctx.send(f"⚠️ メニュー表示エラー: {e}")
 
 @bot.command()
 async def duel(ctx, target_str: str = ""):
@@ -1209,6 +1212,7 @@ async def rotate_presence():
 async def on_message(message):
     if message.author.id == bot.user.id or message.webhook_id: return
     
+    # プレフィックスコマンドの優先処理
     ctx = await bot.get_context(message)
     if ctx.valid:
         await bot.invoke(ctx)
@@ -1259,7 +1263,7 @@ async def on_message(message):
                 if state["mode"] in ["normal_full", "reset_full", "auto_full", "anti_berserk", "troll_chaos"] and "http" in content:
                     in_txt += await process_all_links_async(content)
 
-                # d3dfish__76102 への対応（モード6のときも定型コメント選択肢の中から選んで対応するよう常時適用）
+                # d3dfish__76102 への対応ルール
                 d3dfish_rule = ""
                 if message.author.name == "d3dfish__76102" or message.author.display_name == "d3dfish__76102":
                     d3dfish_rule = D3DFISH_NEURON_DIRECTIVE
