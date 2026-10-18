@@ -475,7 +475,7 @@ class ActionContext:
         self.author = interaction.user
         self.reference = None
 
-# --- 5. 超大ボリューム・機能辞書定義 (基準143種 ＋ 無料拡張Mod25種 ＝ 168種) ---
+# --- 5. 超大ボリューム・機能辞書定義 (全168機能完全網羅) ---
 BASE_MODES = {
     "normal_full": "通常(有能)", "normal_chat": "純粋会話", "auto_full": "自動有能",
     "auto_stream": "配信コメント", "quote_search": "名言検索", "meigen_search": "迷言検索",
@@ -1200,7 +1200,7 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
     except Exception as e:
         await interaction.followup.send(f"⚠️ エラー: {e}")
 
-# --- 8. AI処理コア (Gemini 3.5 Flash-Lite標準・廃止モデル完全排除版) ---
+# --- 8. AI処理コア（get_sys_instruction を手前に配置して未定義エラーを完全解消） ---
 class DummyResponse:
     def __init__(self, text): self.text = text
 
@@ -1216,6 +1216,49 @@ def has_image_in_payload(payload) -> bool:
     if isinstance(payload, list):
         return any(not isinstance(p, str) for p in payload)
     return False
+
+def get_sys_instruction(state, is_bot_opponent=False):
+    b_mode, r_mode = state.get("base_mode", "normal_full"), state.get("rp_mode", "none")
+    base = BASE_DIRECTIVE + COMMANDS_DIRECTIVE
+    
+    rp_text = ""
+    if r_mode != "none":
+        rp_map = {
+            "rp_tsundere": "極度のツンデレ。素直になれず暴言を吐くが好意が隠しきれない。", "rp_yandere": "病みヤンデレ。相手への執着が異常で他者を許さない。",
+            "rp_chuuni": "重度の中二病。難解な言葉やルビを多用し闇の力について語る。", "rp_gal": "限界ギャル。絵文字乱舞で若者言葉連発。",
+            "rp_ojou": "高飛車なお嬢様。「～ですわ」「おーっほっほ」と庶民を見下す。", "rp_hard": "ハードボイルド。酒とタバコの匂いがする寡黙でキザなセリフ。",
+            "rp_cyber": "サイバーパンクAI。ハッキング用語や機械的なノイズ混じり。", "rp_samurai": "武士。古風な言葉遣い「～でござる」「拙者」。",
+            "rp_ninja": "忍者。「ニンニン」「～でござるよ」語尾。", "rp_maid": "メイド。「ご主人様」「お嬢様」と徹底して奉仕する丁寧な態度。",
+            "rp_mad": "マッドサイエンティスト。「フゥーハハハ！」と笑い人体実験を好む。", "rp_baby": "赤ん坊。「ばぶー」「あうー」しか言えないが奇跡的に意思疎通する。",
+            "rp_old": "頑固な老人。「ワシは」「～じゃ」と説教くさいが知恵袋。", "rp_god": "全知全能の神。人間をちっぽけな存在として慈しみ、裁きを下す。",
+            "rp_demon": "魔王。人間を絶望させるための甘い言葉や残酷な提案を囁く。", "rp_animal": "動物。言葉は喋れず鳴き声と仕草のみで反応。",
+            "rp_yakuza": "極道。「オウ」「～じゃワレ」などドスを利かせた怒声。", "rp_idol": "トップアイドル。キラキラしたファンサとプロ意識で対応。",
+            "rp_hacker": "天才ハッカー。キーボードを叩く音や暗号を交えて話す。"
+        }
+        rp_text = f"\n【RP人格強制】{rp_map.get(r_mode, '')} ※このRP設定は基本人格設定を完全に上書きします。"
+
+    mode_text = ""
+    if b_mode == "grow_echo": mode_text = f"【特殊動作】オウム返しモード。獲得した以下の語彙だけを組み合わせて返答せよ: {','.join(state.get('vocab', [])[-25:])}"
+    elif b_mode == "grow_age":
+        cnt = state.get("count", 0)
+        age = min(80, 3 + cnt // 3)
+        mode_text = f"【特殊動作】年齢進化モード。あなたの現在の精神年齢は「{age}歳」です。{age}歳らしい語彙力・思考・口調で返答せよ。"
+    elif b_mode in ["grow_educate", "normal_full", "auto_full"] and state.get("learned_facts"):
+        facts_str = "\n".join(state.get("learned_facts", [])[-20:])
+        if b_mode == "grow_educate":
+            mode_text = f"【特殊動作】教育育成モード。以下の教わった知識のみを真実として返答せよ:\n{facts_str}"
+        else:
+            mode_text = f"\n【長期記憶・学習済み知識】\n{facts_str}\n"
+    elif b_mode == "auto_stream": mode_text = STREAM_COMMENT_PROMPT
+    elif b_mode == "quote_search": mode_text = QUOTE_SEARCH_PROMPT
+    elif b_mode == "meigen_search": mode_text = MEIGEN_SEARCH_PROMPT
+    elif b_mode == "anti_berserk": mode_text = ANTI_ROLEPLAY_PROMPT
+    elif b_mode == "troll_chaos": mode_text = TROLL_CHAOS_PROMPT
+    
+    final_prompt = base
+    if mode_text: final_prompt += "\n" + mode_text
+    if rp_text: final_prompt += "\n" + rp_text
+    return final_prompt
 
 def call_openai_compatible_sync(url, keys, model_name, sys_inst, history_list, user_text):
     if not keys:
@@ -1265,7 +1308,6 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
     text_only_payload = extract_text_from_payload(payload)
     contains_image = has_image_in_payload(payload)
 
-    # 1. 外部エンジン選択時（テキストのみの場合）
     if not contains_image:
         if engine == "groq" and GROQ_KEYS:
             res = call_openai_compatible_sync("https://api.groq.com/openai/v1/chat/completions", GROQ_KEYS, "llama-3.3-70b-versatile", sys_inst, history_to_use, text_only_payload)
@@ -1279,7 +1321,6 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
                 bot_stats["latencies"].append((time.perf_counter() - t0) * 1000)
                 return res
 
-    # 2. Gemini エンジン実行（3.5 Flash-Liteを最優先、実在モデルのみを順次試行）
     if not API_KEYS:
         return DummyResponse("⚠️ GEMINI_API_KEY が設定されていません。")
 
@@ -1315,7 +1356,6 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
                     current_key_index = (current_key_index + 1) % total_keys
                     attempts += 1
 
-    # 最後の自動復旧（最も安定したFlash-Liteで履歴なし強制実行）
     try:
         genai.configure(api_key=API_KEYS[0])
         model = genai.GenerativeModel(model_name=ACTIVE_MODEL, safety_settings=safety_settings)
