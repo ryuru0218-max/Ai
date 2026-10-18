@@ -15,6 +15,7 @@ import uuid
 import sqlite3
 import threading
 import asyncio
+import contextlib
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, unquote
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -70,7 +71,7 @@ OPENROUTER_KEYS = [k.strip() for k in os.environ.get("OPENROUTER_API_KEY", "").s
 
 current_key_index = 0
 ACTIVE_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
 
 safety_settings = [
     {"category": c, "threshold": HarmBlockThreshold.BLOCK_NONE}
@@ -197,7 +198,7 @@ MORSE_DICT = {
 }
 MORSE_REV = {v: k for k, v in MORSE_DICT.items()}
 
-# --- 2.5 安全計算機 (AST)・長文分割・永続DB ---
+# --- 2.5 安全計算機 (AST)・サンドボックス実行・長文分割 ---
 def safe_calc(expr: str):
     allowed_funcs = {"sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan, "log": math.log, "log10": math.log10, "abs": abs, "round": round}
     allowed_consts = {"pi": math.pi, "e": math.e}
@@ -226,6 +227,27 @@ def safe_calc(expr: str):
     res = _eval(ast.parse(expr.strip()[:200], mode="eval").body)
     return int(res) if isinstance(res, float) and res.is_integer() else round(res, 8)
 
+def run_safe_python_sandbox(code_str: str) -> str:
+    """拡張Mod：制限付きPythonコード実行サンドボックス"""
+    banned = ["import ", "__", "open(", "exec(", "eval(", "os.", "sys.", "subprocess", "socket", "getattr", "setattr", "globals", "locals"]
+    for b in banned:
+        if b in code_str:
+            return f"⚠️ セキュリティ制限により `{b}` は使用できません。"
+    safe_builtins = {
+        "print": print, "range": range, "len": len, "sum": sum, "min": min, "max": max,
+        "abs": abs, "round": round, "sorted": sorted, "list": list, "dict": dict, "set": set,
+        "str": str, "int": int, "float": float, "bool": bool, "enumerate": enumerate, "zip": zip,
+        "math": math, "random": random
+    }
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            exec(code_str, {"__builtins__": safe_builtins}, {})
+        out = buf.getvalue()
+        return out[:1500] if out else "✅ 実行完了（出力なし。`print()` を使うと結果が表示されます）"
+    except Exception as e:
+        return f"⚠️ 実行エラー: `{e}`"
+
 def smart_chunks(text: str, limit: int = 1900) -> list[str]:
     if not text: return ["..."]
     if len(text) <= limit: return [text]
@@ -246,18 +268,7 @@ def smart_chunks(text: str, limit: int = 1900) -> list[str]:
     if cur: out.append("\n".join(cur) + ("\n```" if in_code else ""))
     return out
 
-# --- 3. 外部解析 ---
-def _fetch_random_web_sync(cat):
-    try:
-        url = f"https://ja.wikipedia.org/wiki/Special:RandomInCategory/{quote(cat)}"
-        res = requests.get(url, timeout=2.5, headers={"User-Agent": "Mozilla/5.0"})
-        soup = BeautifulSoup(res.text, "html.parser")
-        for p in soup.find_all('p'):
-            t = p.get_text().strip()
-            if len(t) > 30: return f"\n【参考】{t[:300]}\n"
-    except: pass
-    return ""
-
+# --- 3. 外部解析 ＆ 視覚画像生成Mod ---
 async def process_all_links_async(text):
     urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
     if not urls: return ""
@@ -290,12 +301,30 @@ async def process_all_links_async(text):
                     pass
     return summary if len(summary) > 30 else ""
 
-def download_image_sync(prompt):
+def download_image_sync(prompt, model="flux"):
     try:
-        url = f"https://image.pollinations.ai/prompt/{quote(prompt)}?width=1024&height=1024&seed={random.randint(1000, 999999)}&nologo=true"
-        res = requests.get(url, timeout=20)
+        url = f"https://image.pollinations.ai/prompt/{quote(prompt)}?model={model}&width=1024&height=1024&seed={random.randint(1000, 999999)}&nologo=true"
+        res = requests.get(url, timeout=22)
         if res.status_code == 200: return res.content
     except: pass
+    return None
+
+def synthesize_voice_sync(text: str, speaker: int = 3) -> bytes | None:
+    """拡張Mod：VOICEVOX無料API（ずんだもん=3, 四国めたん=2, つむぎ=8）＋ gTTSフォールバック"""
+    clean = re.sub(r'https?://\S+', 'URL省略', text)[:180]
+    try:
+        r = requests.get(f"https://deprecatedapis.tts.quest/v2/voicevox/audio/?text={quote(clean)}&speaker={speaker}", timeout=8)
+        if r.status_code == 200 and len(r.content) > 1000:
+            return r.content
+    except Exception:
+        pass
+    if gTTS:
+        try:
+            buf = io.BytesIO()
+            gTTS(text=clean, lang="ja").write_to_fp(buf)
+            return buf.getvalue()
+        except Exception:
+            pass
     return None
 
 async def download_attachment_as_pil(att):
@@ -303,9 +332,7 @@ async def download_attachment_as_pil(att):
     except: return None
 
 def render_dungeon_map_bytes(dungeon_state: dict) -> bytes:
-    """Pillowを使った視覚盤面ダンジョンマップ生成Mod"""
-    grid_size = 5
-    cell = 80
+    grid_size, cell = 5, 80
     w, h = grid_size * cell + 40, grid_size * cell + 100
     img = Image.new("RGB", (w, h), (24, 26, 32))
     draw = ImageDraw.Draw(img)
@@ -321,20 +348,36 @@ def render_dungeon_map_bytes(dungeon_state: dict) -> bytes:
         for x in range(grid_size):
             x0, y0 = 20 + x * cell, 80 + y * cell
             x1, y1 = x0 + cell - 6, y0 + cell - 6
-            if (x, y) == (px, py):
-                color = (46, 204, 113)
-                label = "YOU"
+            if (x, y) == (px, py): color, label = (46, 204, 113), "YOU"
             elif (x, y) == (gx, gy):
-                color = (241, 196, 15) if (x, y) in visited or abs(px - x) + abs(py - y) <= 1 else (60, 65, 80)
-                label = "STAIR" if color == (241, 196, 15) else "?"
-            elif (x, y) in visited:
-                color = (70, 80, 100)
-                label = "CLR"
-            else:
-                color = (45, 50, 62)
-                label = "?"
+                vis = (x, y) in visited or abs(px - x) + abs(py - y) <= 1
+                color, label = ((241, 196, 15), "STAIR") if vis else ((60, 65, 80), "?")
+            elif (x, y) in visited: color, label = (70, 80, 100), "CLR"
+            else: color, label = (45, 50, 62), "?"
             draw.rectangle([x0, y0, x1, y1], fill=color, outline=(120, 130, 150), width=2)
             draw.text((x0 + 18, y0 + 30), label, fill=(255, 255, 255))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+def render_blackjack_bytes(player_hand: list, dealer_hand: list, hide_dealer: bool = True) -> bytes:
+    """Pillow視覚ブラックジャック描画Mod"""
+    img = Image.new("RGB", (520, 300), (18, 75, 42))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([8, 8, 512, 292], outline=(212, 175, 55), width=3)
+    draw.text((20, 20), "DEALER HAND", fill=(255, 255, 255))
+    for idx, card in enumerate(dealer_hand):
+        x0, y0 = 20 + idx * 75, 45
+        draw.rectangle([x0, y0, x0 + 62, y0 + 90], fill=(245, 245, 245) if not (hide_dealer and idx == 1) else (40, 60, 120), outline=(20, 20, 20), width=2)
+        txt = "??" if (hide_dealer and idx == 1) else card
+        draw.text((x0 + 16, y0 + 38), txt, fill=(220, 30, 30) if ("H" in txt or "D" in txt) else (20, 20, 20))
+
+    draw.text((20, 155), "YOUR HAND", fill=(255, 215, 0))
+    for idx, card in enumerate(player_hand):
+        x0, y0 = 20 + idx * 75, 180
+        draw.rectangle([x0, y0, x0 + 62, y0 + 90], fill=(255, 255, 255), outline=(20, 20, 20), width=2)
+        draw.text((x0 + 16, y0 + 38), card, fill=(220, 30, 30) if ("H" in card or "D" in card) else (20, 20, 20))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -363,13 +406,13 @@ def get_state(channel_id):
             "history": [],
             "vocab": [],
             "learned_facts": [],
+            "todos": [],
             "stress": 0,
             "affection": 50
         }
     return channels_state[channel_id]
 
 async def save_cloud_backup(guild_or_bot):
-    """Render再起動対策：Discordの #pochi-backup チャンネルへ状態を圧縮保存"""
     try:
         target_ch = None
         guilds = [guild_or_bot] if isinstance(guild_or_bot, discord.Guild) else bot.guilds
@@ -394,6 +437,7 @@ async def save_cloud_backup(guild_or_bot):
                 "count": st.get("count", 0),
                 "vocab": st.get("vocab", [])[-50:],
                 "learned_facts": st.get("learned_facts", [])[-50:],
+                "todos": st.get("todos", [])[-30:],
                 "stress": st.get("stress", 0),
                 "affection": st.get("affection", 50)
             }
@@ -408,7 +452,6 @@ async def save_cloud_backup(guild_or_bot):
         return False, str(e)
 
 async def load_cloud_backup():
-    """起動時に #pochi-backup から状態を自動復元"""
     try:
         for g in bot.guilds:
             ch = discord.utils.get(g.text_channels, name="pochi-backup")
@@ -423,7 +466,6 @@ async def load_cloud_backup():
                         s.update(st)
                     for cid_str, dg in data.get("dungeons", {}).items():
                         active_dungeons[int(cid_str)] = dg
-                    print(f"Cloud Backup Restored: {len(data.get('states', {}))} channels.")
                     return True
     except Exception as e:
         print(f"Cloud Restore Skip/Error: {e}")
@@ -436,7 +478,7 @@ class ActionContext:
         self.author = interaction.user
         self.reference = None
 
-# --- 5. 超大ボリューム・機能辞書定義 (基準コード完全維持 ＋ Mod拡張パック) ---
+# --- 5. 超大ボリューム・機能辞書定義 (基準143種 ＋ 無料拡張Mod25種 ＝ 168種) ---
 BASE_MODES = {
     "normal_full": "通常(有能)", "normal_chat": "純粋会話", "auto_full": "自動有能",
     "auto_stream": "配信コメント", "quote_search": "名言検索", "meigen_search": "迷言検索",
@@ -449,6 +491,13 @@ RP_MODES = {
     "rp_samurai": "武士", "rp_ninja": "忍者", "rp_maid": "メイド", "rp_mad": "狂気科学者",
     "rp_baby": "赤ん坊", "rp_old": "頑固老人", "rp_god": "神様", "rp_demon": "魔王",
     "rp_animal": "動物", "rp_yakuza": "極道", "rp_idol": "アイドル", "rp_hacker": "天才ハッカー"
+}
+AI_ENGINE_MODES = {
+    "gemini": "Gemini 2.5 Flash (標準・画像対応)",
+    "gemini_pro": "Gemini 2.5 Pro (高精度推論)",
+    "groq": "Groq Llama 3.3 70B (超爆速・要GROQキー)",
+    "openrouter": "OpenRouter Llama 3.3 (無料枠・要ORキー)",
+    "openrouter_r1": "OpenRouter DeepSeek R1 (推論・要ORキー)"
 }
 
 UI_CONFIG = {
@@ -508,11 +557,30 @@ UI_CONFIG = {
         "act_nuke": ["💣 Ch完全消去(NUKE)", ["Ch名"]], "act_nsfw": ["🔞 NSFW切替", []], "create_event": ["📅 イベント作成", ["名", "説明", "何分後"]],
         "create_emoji": ["🖼️ 絵文字作成", ["名", "URL"]]
     },
-    "MOD_PACK": {
-        "mod_tts": ["🔊 無料音声読み上げ(TTS Mod)", ["喋らせたいテキスト"]],
+    "MOD_PACK1": {
+        "mod_voicevox": ["🗣️ ずんだもん音声合成Mod(VOICEVOX)", ["喋らせたいセリフ"]],
+        "mod_tts": ["🔊 Google標準音声読み上げMod", ["喋らせたいテキスト"]],
+        "mod_img_flux": ["🎨 超高精細Flux画像生成Mod", ["英語または日本語プロンプト"]],
+        "mod_img_anime": ["✨ アニメ特化イラスト生成Mod", ["描きたいキャラ・情景"]],
+        "mod_img_pixel": ["👾 レトロドット絵(PixelArt)生成Mod", ["描きたいモチーフ"]],
         "mod_url_deep": ["🌐 Web/YouTube/PDF完全解体Mod", ["解析したいURL"]],
+        "mod_py_sandbox": ["🐍 Pythonサンドボックス実行Mod", ["実行するPythonコード (print等)"]],
+        "mod_earthquake": ["🌋 気象庁・最新地震速報Mod", []],
+        "mod_crypto": ["📈 暗号資産(BTC/ETH)リアルタイムMod", []],
+        "mod_hackernews": ["📰 世界ITトレンド速報(HackerNews)Mod", []],
+        "mod_pokemon": ["⚡ ポケモン図鑑データ検索Mod", ["ポケモン英語名または図鑑番号(1〜1025)"]],
+        "mod_anime_search": ["🎬 アニメデータベース検索Mod(Jikan)", ["アニメタイトル"]],
+        "mod_debate": ["⚔️ 一人二役AIディベート対決Mod", ["討論テーマ (例: きのこvsたけのこ)"]]
+    },
+    "MOD_PACK2": {
         "mod_visual_dungeon": ["🗺️ 視覚マップダンジョンMod(Pillow)", []],
-        "mod_switch_ai": ["🧠 AI頭脳エンジン切替Mod", ["gemini / groq / openrouter"]],
+        "mod_blackjack": ["🃏 視覚ブラックジャック対戦Mod(Pillow)", []],
+        "mod_tictactoe": ["⭕ 3×3マルバツ(TicTacToe)対戦Mod", []],
+        "mod_akinator": ["🧞 AIアキネーター開始Mod", ["思い浮かべたキャラの特徴・質問"]],
+        "mod_trpg_dice": ["🎲 多面ダイスロールMod(例:3d6+5)", ["ダイス式 (例: 2d6+3, 1d20)"]],
+        "mod_timer": ["⏰ カウントダウンタイマーMod", ["分数 (例: 3)", "通知メッセージ"]],
+        "mod_todo_add": ["📝 共有メモ・ToDo追加Mod", ["メモ内容"]],
+        "mod_todo_view": ["📋 共有メモ・ToDo一覧表示Mod", []],
         "mod_fact_add": ["📥 長期記憶・知識の直接注入Mod", ["覚えさせたい事実"]],
         "mod_fact_view": ["🧠 記憶・学習データベース閲覧Mod", []],
         "mod_cloud_save": ["☁️ Discordクラウド強制セーブMod", []],
@@ -527,9 +595,13 @@ class MainCategoryView(discord.ui.View):
         super().__init__(timeout=None)
         self.channel_id = channel_id
 
-    @discord.ui.button(label="🎭 モード設定", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="🎭 モード＆頭脳設定", style=discord.ButtonStyle.primary, row=0)
     async def b1(self, interaction, button):
-        await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicSelect(self.channel_id, "ベースモード選択", BASE_MODES, "base_mode"), DynamicSelect(self.channel_id, "RP人格モード選択", RP_MODES, "rp_mode")]))
+        await interaction.response.edit_message(view=SubMenuView(self.channel_id, [
+            DynamicSelect(self.channel_id, "ベースモード選択", BASE_MODES, "base_mode"),
+            DynamicSelect(self.channel_id, "RP人格モード選択", RP_MODES, "rp_mode"),
+            DynamicSelect(self.channel_id, "🧠 AI頭脳エンジン切替 (自動復旧付)", AI_ENGINE_MODES, "ai_engine")
+        ]))
     @discord.ui.button(label="🎲 エンタメ1", style=discord.ButtonStyle.success, row=0)
     async def b2(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "エンタメ1", UI_CONFIG["ENT1"])]))
     @discord.ui.button(label="🎲 エンタメ2", style=discord.ButtonStyle.success, row=0)
@@ -542,13 +614,15 @@ class MainCategoryView(discord.ui.View):
     async def b6(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "ユーザー管理", UI_CONFIG["MOD"])]))
     @discord.ui.button(label="⚙️ サーバー管理", style=discord.ButtonStyle.danger, row=2)
     async def b7(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "サーバー設定", UI_CONFIG["SERVER"])]))
-    @discord.ui.button(label="🧩 拡張Mod・永続DB", style=discord.ButtonStyle.primary, row=2)
-    async def b8(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "無料拡張Modパック", UI_CONFIG["MOD_PACK"])]))
-    @discord.ui.button(label="🧹 記憶・感情リセット", style=discord.ButtonStyle.danger, row=4)
+    @discord.ui.button(label="🧩 拡張Mod1(AI・情報)", style=discord.ButtonStyle.primary, row=3)
+    async def b8(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "拡張Modパック1 (AI・情報・音声)", UI_CONFIG["MOD_PACK1"])]))
+    @discord.ui.button(label="🎮 拡張Mod2(ゲーム・DB)", style=discord.ButtonStyle.primary, row=3)
+    async def b9(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "拡張Modパック2 (盤面ゲーム・記憶・DB)", UI_CONFIG["MOD_PACK2"])]))
+    @discord.ui.button(label="🧹 記憶・設定リセット", style=discord.ButtonStyle.danger, row=4)
     async def btn_reset(self, interaction, button):
         await interaction.response.defer(ephemeral=True)
-        get_state(self.channel_id).update({"count":0, "vocab":[], "history":[], "stress":0, "affection":50})
-        await interaction.followup.send("🧹 記憶・感情パラメーターを完全にリセットしました！", ephemeral=True)
+        get_state(self.channel_id).update({"base_mode": "normal_full", "rp_mode": "none", "ai_engine": "gemini", "count":0, "vocab":[], "history":[], "stress":0, "affection":50})
+        await interaction.followup.send("🧹 記憶・感情・頭脳エンジン設定を初期状態（Gemini標準）に完全リセットしました！", ephemeral=True)
     @discord.ui.button(label="📊 AIステータス", style=discord.ButtonStyle.secondary, row=4)
     async def btn_status(self, interaction, button):
         s = get_state(self.channel_id)
@@ -573,9 +647,16 @@ class DynamicSelect(discord.ui.Select):
         super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=opts)
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        get_state(self.channel_id)[self.state_key] = self.values[0]
+        chosen = self.values[0]
+        warn_msg = ""
+        if self.state_key == "ai_engine":
+            if chosen == "groq" and not GROQ_KEYS:
+                warn_msg = "\n⚠️ ※Renderに `GROQ_API_KEY` が未設定のため、自動的にGeminiへフォールバックして動作します。"
+            elif chosen.startswith("openrouter") and not OPENROUTER_KEYS:
+                warn_msg = "\n⚠️ ※Renderに `OPENROUTER_API_KEY` が未設定のため、自動的にGeminiへフォールバックして動作します。"
+        get_state(self.channel_id)[self.state_key] = chosen
         get_state(self.channel_id)["history"] = []
-        await interaction.followup.send(f"✅ {self.state_key} を `{self.values[0]}` にセットしました！", ephemeral=True)
+        await interaction.followup.send(f"✅ `{self.state_key}` を **`{chosen}`** にセットしました！{warn_msg}", ephemeral=True)
 
 class DynamicActionSelect(discord.ui.Select):
     def __init__(self, channel_id, placeholder, config):
@@ -590,8 +671,8 @@ class DynamicActionSelect(discord.ui.Select):
             await interaction.response.defer(ephemeral=False)
             await execute_direct_action(interaction.channel, interaction.guild, ActionContext(interaction), val)
 
+# --- 6.2 拡張ゲームMod用 インタラクティブView群 ---
 class VisualDungeonView(discord.ui.View):
-    """Pillow視覚盤面ダンジョン操作用ボタンMod"""
     def __init__(self, channel_id):
         super().__init__(timeout=300)
         self.channel_id = channel_id
@@ -642,7 +723,102 @@ class VisualDungeonView(discord.ui.View):
     @discord.ui.button(label="➡️ 東へ", style=discord.ButtonStyle.primary)
     async def right(self, i, b): await self.move(i, 1, 0)
 
-# --- 6.5 基準コードで未定義だった決闘・バトロワ・レスバ判定関数の完全実装 ---
+class BlackjackView(discord.ui.View):
+    """拡張Mod：Pillow画像付きブラックジャック"""
+    def __init__(self):
+        super().__init__(timeout=180)
+        suits = ["S", "H", "D", "C"]
+        ranks = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+        self.deck = [f"{s}{r}" for s in suits for r in ranks]
+        random.shuffle(self.deck)
+        self.player = [self.deck.pop(), self.deck.pop()]
+        self.dealer = [self.deck.pop(), self.deck.pop()]
+
+    def score(self, hand):
+        total, aces = 0, 0
+        for c in hand:
+            r = c[1:]
+            if r in ["J", "Q", "K"]: total += 10
+            elif r == "A": total += 11; aces += 1
+            else: total += int(r)
+        while total > 21 and aces:
+            total -= 10; aces -= 1
+        return total
+
+    @discord.ui.button(label="🃏 ヒット (もう1枚)", style=discord.ButtonStyle.success)
+    async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        self.player.append(self.deck.pop())
+        p_score = self.score(self.player)
+        if p_score > 21:
+            for child in self.children: child.disabled = True
+            img = await asyncio.to_thread(render_blackjack_bytes, self.player, self.dealer, False)
+            await interaction.edit_original_response(content=f"💥 **BUST! あなたの負けです（合計: {p_score}）**", attachments=[discord.File(io.BytesIO(img), "bj.png")], view=self)
+        else:
+            img = await asyncio.to_thread(render_blackjack_bytes, self.player, self.dealer, True)
+            await interaction.edit_original_response(content=f"🃏 **ブラックジャック進行中（現在合計: {p_score}）**", attachments=[discord.File(io.BytesIO(img), "bj.png")], view=self)
+
+    @discord.ui.button(label="🛑 スタンド (勝負)", style=discord.ButtonStyle.primary)
+    async def stand(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        for child in self.children: child.disabled = True
+        while self.score(self.dealer) < 17:
+            self.dealer.append(self.deck.pop())
+        p_s, d_s = self.score(self.player), self.score(self.dealer)
+        if d_s > 21 or p_s > d_s: res = "🎉 **あなたの勝利です！！**"
+        elif p_s == d_s: res = "🤝 **引き分け (PUSH)**"
+        else: res = "💀 **ディーラーの勝利です…**"
+        img = await asyncio.to_thread(render_blackjack_bytes, self.player, self.dealer, False)
+        await interaction.edit_original_response(content=f"🃏 **結果発表 — あなた: `{p_s}` vs ディーラー: `{d_s}`**\n{res}", attachments=[discord.File(io.BytesIO(img), "bj.png")], view=self)
+
+class TicTacToeView(discord.ui.View):
+    """拡張Mod：3×3マルバツゲーム（対人・対AIハイブリッド）"""
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.board = [0] * 9
+        for idx in range(9):
+            btn = discord.ui.Button(label="・", style=discord.ButtonStyle.secondary, row=idx // 3, custom_id=str(idx))
+            btn.callback = self.make_callback(idx)
+            self.add_item(btn)
+
+    def check_win(self):
+        lines = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
+        for a, b, c in lines:
+            if self.board[a] != 0 and self.board[a] == self.board[b] == self.board[c]:
+                return self.board[a]
+        return 0 if 0 in self.board else -1
+
+    def make_callback(self, idx):
+        async def _cb(interaction: discord.Interaction):
+            if self.board[idx] != 0:
+                return await interaction.response.send_message("そこには置けません。", ephemeral=True)
+            self.board[idx] = 1
+            self.children[idx].label = "⭕"
+            self.children[idx].style = discord.ButtonStyle.success
+            self.children[idx].disabled = True
+
+            w = self.check_win()
+            if w == 0:
+                # AIの手番
+                empty = [i for i, v in enumerate(self.board) if v == 0]
+                if empty:
+                    ai_pick = random.choice(empty)
+                    self.board[ai_pick] = 2
+                    self.children[ai_pick].label = "❌"
+                    self.children[ai_pick].style = discord.ButtonStyle.danger
+                    self.children[ai_pick].disabled = True
+                w = self.check_win()
+
+            msg = "⭕ **マルバツゲーム（あなた: ⭕ / ポチAI: ❌）**"
+            if w != 0:
+                for child in self.children: child.disabled = True
+                if w == 1: msg = "🎉 **あなたの勝利です！**"
+                elif w == 2: msg = "😈 **ポチAIの勝利です！**"
+                else: msg = "🤝 **引き分けです！**"
+            await interaction.response.edit_message(content=msg, view=self)
+        return _cb
+
+# --- 6.5 決闘・バトロワ・レスバ判定関数 ---
 async def execute_battle_royale(ch):
     members = [m.display_name for m in ch.members if not m.bot]
     if len(members) < 2:
@@ -700,11 +876,39 @@ async def execute_direct_action(ch, guild, ctx_mock, action):
                     except: pass
         elif action == "dungeon":
             active_dungeons[ch.id] = {"hp": 100, "floor": 1, "x": 2, "y": 2, "gx": 4, "gy": 0, "gold": 0, "visited": [[2, 2]]}
-            await ch.send("🏰 **【AIダンジョン】** `!dungeon <行動>` でテキスト進行、または拡張Modの『視覚マップダンジョン』でボタン探索が可能です！")
+            await ch.send("🏰 **【AIダンジョン】** `!dungeon <行動>` でテキスト進行、または拡張Mod2の『視覚マップダンジョン』でボタン探索が可能です！")
         elif action == "mod_visual_dungeon":
             dg = active_dungeons.setdefault(ch.id, {"hp": 100, "floor": 1, "x": 2, "y": 2, "gx": 4, "gy": 0, "gold": 0, "visited": [[2, 2]]})
             img_bytes = await asyncio.to_thread(render_dungeon_map_bytes, dg)
             await ch.send("🏰 **【視覚マップAIダンジョン】** ボタンを押して探索せよ！", file=discord.File(io.BytesIO(img_bytes), "dungeon_map.png"), view=VisualDungeonView(ch.id))
+        elif action == "mod_blackjack":
+            bj_view = BlackjackView()
+            img_bytes = await asyncio.to_thread(render_blackjack_bytes, bj_view.player, bj_view.dealer, True)
+            await ch.send(f"🃏 **【視覚ブラックジャック開幕】** 現在合計: `{bj_view.score(bj_view.player)}`", file=discord.File(io.BytesIO(img_bytes), "bj.png"), view=bj_view)
+        elif action == "mod_tictactoe":
+            await ch.send("⭕ **【3×3 マルバツゲーム】** ボタンを押してマスを選んでください！", view=TicTacToeView())
+        elif action == "mod_earthquake":
+            r = requests.get("https://api.p2pquake.net/v2/history?codes=551&limit=3", timeout=5).json()
+            lines = []
+            for item in r:
+                eq = item.get("earthquake", {})
+                hypo = eq.get("hypocenter", {})
+                lines.append(f"・**{hypo.get('name', '不明')}** (M{hypo.get('magnitude', '?')} / 最大震度: {eq.get('maxScale', 0)//10}) - `{eq.get('time', '')}`")
+            await ch.send("🌋 **【気象庁・最新地震速報Mod】**\n" + ("\n".join(lines) if lines else "直近のデータなし"))
+        elif action == "mod_crypto":
+            r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=jpy,usd", timeout=5).json()
+            btc_j, eth_j, sol_j = r.get("bitcoin",{}).get("jpy",0), r.get("ethereum",{}).get("jpy",0), r.get("solana",{}).get("jpy",0)
+            await ch.send(f"📈 **【暗号資産リアルタイム価格Mod】**\n・**Bitcoin (BTC):** `¥{btc_j:,}`\n・**Ethereum (ETH):** `¥{eth_j:,}`\n・**Solana (SOL):** `¥{sol_j:,}`")
+        elif action == "mod_hackernews":
+            ids = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=4).json()[:5]
+            items = []
+            for tid in ids:
+                d = requests.get(f"https://hacker-news.firebaseio.com/v0/item/{tid}.json", timeout=3).json()
+                if d: items.append(f"・[{d.get('title','')}]({d.get('url','https://news.ycombinator.com')}) (👍{d.get('score',0)})")
+            await ch.send("📰 **【世界ITトレンド速報 (HackerNews Top 5)】**\n" + "\n".join(items))
+        elif action == "mod_todo_view":
+            todos = get_state(ch.id).get("todos", [])
+            await ch.send("📋 **【共有メモ・ToDoリスト】**\n" + ("\n".join([f"`{i+1}.` {t}" for i, t in enumerate(todos)]) if todos else "現在登録されているメモはありません。"))
         elif action == "unmimic":
             mimic_targets.pop(ch.id, None); cloned_targets.pop(ch.id, None); await ch.send("🎭 憑依解除完了")
         elif action == "fake_id": await ch.send(f"🪪 **身分証:** コード `{uuid.uuid4().hex[:8].upper()}`")
@@ -752,6 +956,7 @@ async def execute_direct_action(ch, guild, ctx_mock, action):
             embed = discord.Embed(title="🩺 POCHI システム診断Mod", color=discord.Color.teal())
             embed.add_field(name="稼働時間", value=f"`{uptime // 3600}時間 {(uptime % 3600) // 60}分`", inline=True)
             embed.add_field(name="メモリ使用量", value=f"`{mem_mb}`", inline=True)
+            embed.add_field(name="現在エンジン", value=f"`{get_state(ch.id).get('ai_engine', 'gemini')}`", inline=True)
             embed.add_field(name="API平均応答", value=f"`{avg_lat} ms` (計{bot_stats['calls']}回 / エラー{bot_stats['errors']}回)", inline=False)
             embed.add_field(name="登録APIキー数", value=f"Gemini: `{len(API_KEYS)}` / Groq: `{len(GROQ_KEYS)}` / OpenRouter: `{len(OPENROUTER_KEYS)}`", inline=False)
             await ch.send(embed=embed)
@@ -798,29 +1003,88 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
         elif action == "silent":
             await interaction.followup.send(vals[0], silent=True)
 
-        # 無料拡張Mod系の処理
+        # --- 大幅増強：無料拡張Modパックの処理 ---
+        elif action == "mod_voicevox":
+            await interaction.followup.send("🗣️ ずんだもん音声生成中...")
+            audio_bytes = await asyncio.to_thread(synthesize_voice_sync, vals[0], 3)
+            if audio_bytes:
+                await ch.send(f"🗣️ **ずんだもんボイス:** `{vals[0][:40]}`", file=discord.File(io.BytesIO(audio_bytes), "zundamon.mp3"))
+            else:
+                await ch.send("⚠️ 音声合成に失敗しました。")
         elif action == "mod_tts":
-            if not gTTS:
-                return await interaction.followup.send("⚠️ `gTTS` がインストールされていません。")
-            def _make_tts(txt):
-                buf = io.BytesIO()
-                gTTS(text=txt[:300], lang="ja").write_to_fp(buf)
-                buf.seek(0)
-                return buf
-            audio_buf = await asyncio.to_thread(_make_tts, vals[0])
-            await interaction.followup.send(f"🔊 **音声合成完了:** `{vals[0][:40]}...`", file=discord.File(audio_buf, "pochi_voice.mp3"))
+            audio_bytes = await asyncio.to_thread(synthesize_voice_sync, vals[0], 2)
+            if audio_bytes:
+                await interaction.followup.send(f"🔊 **音声合成完了:** `{vals[0][:40]}`", file=discord.File(io.BytesIO(audio_bytes), "pochi_voice.mp3"))
+            else:
+                await interaction.followup.send("⚠️ 音声合成エラー")
+        elif action in ["mod_img_flux", "mod_img_anime", "mod_img_pixel"]:
+            await interaction.followup.send("🎨 高精細AIイラスト生成中（約5〜12秒）...")
+            style_prefix = {"mod_img_flux": "masterpiece, photorealistic, 8k, ", "mod_img_anime": "masterpiece, best quality, anime style illustration, vibrant colors, ", "mod_img_pixel": "pixel art, 16-bit retro game sprite style, clean pixels, "}[action]
+            img_b = await asyncio.to_thread(download_image_sync, style_prefix + vals[0], "flux")
+            if img_b:
+                await ch.send(f"🎨 **【画像生成Mod: {vals[0][:40]}】**", file=discord.File(io.BytesIO(img_b), "art.png"))
+            else:
+                await ch.send("⚠️ 画像生成サーバーが混雑しています。")
+        elif action == "mod_py_sandbox":
+            out = await asyncio.to_thread(run_safe_python_sandbox, vals[0])
+            await interaction.followup.send(f"🐍 **【Pythonサンドボックス実行結果】**\n```\n{out}\n```")
+        elif action == "mod_pokemon":
+            q = vals[0].lower().strip()
+            r = requests.get(f"https://pokeapi.co/api/v2/pokemon/{quote(q)}", timeout=5)
+            if r.status_code == 200:
+                d = r.json()
+                types = ", ".join([t["type"]["name"] for t in d["types"]])
+                stats = " / ".join([f"{s['stat']['name']}:{s['base_stat']}" for s in d["stats"]])
+                embed = discord.Embed(title=f"⚡ No.{d['id']} {d['name'].upper()}", description=f"**タイプ:** `{types}`\n**高さ/重さ:** `{d['height']/10}m / {d['weight']/10}kg`\n**種族値:** `{stats}`", color=discord.Color.gold())
+                if d["sprites"]["front_default"]: embed.set_thumbnail(url=d["sprites"]["front_default"])
+                await interaction.followup.send(embed=embed)
+            else:
+                await interaction.followup.send("⚠️ ポケモンが見つかりません（図鑑番号1〜1025、または英語名で指定してください）。")
+        elif action == "mod_anime_search":
+            r = requests.get(f"https://api.jikan.moe/v4/anime?q={quote(vals[0])}&limit=1", timeout=5).json()
+            data = r.get("data", [])
+            if data:
+                a = data[0]
+                embed = discord.Embed(title=f"🎬 {a.get('title_japanese') or a.get('title')}", url=a.get("url"), description=(a.get("synopsis") or "あらすじなし")[:400] + "...", color=discord.Color.blue())
+                embed.add_field(name="スコア", value=f"⭐ `{a.get('score', 'N/A')}`", inline=True)
+                embed.add_field(name="話数 / 放送", value=f"`{a.get('episodes', '?')}話 ({a.get('status', '')})`", inline=True)
+                if a.get("images", {}).get("jpg", {}).get("image_url"): embed.set_thumbnail(url=a["images"]["jpg"]["image_url"])
+                await interaction.followup.send(embed=embed)
+            else:
+                await interaction.followup.send("⚠️ アニメ情報が見つかりませんでした。")
+        elif action == "mod_trpg_dice":
+            m = re.match(r"^(\d+)d(\d+)([+-]\d+)?$", vals[0].lower().replace(" ", ""))
+            if not m:
+                return await interaction.followup.send("⚠️ `2d6` や `3d10+5` の形式で入力してください。")
+            cnt, sides, mod = min(100, int(m.group(1))), min(10000, int(m.group(2))), int(m.group(3) or 0)
+            rolls = [random.randint(1, max(1, sides)) for _ in range(max(1, cnt))]
+            total = sum(rolls) + mod
+            await interaction.followup.send(f"🎲 **ダイスロール ({vals[0]}):**\n出目: `{rolls[:30]}` {'(+省略)' if len(rolls)>30 else ''}\n**合計: `{total}`**")
+        elif action == "mod_timer":
+            mins = float(vals[0]) if vals[0].replace(".", "").isdigit() else 1.0
+            mins = max(0.1, min(180.0, mins))
+            await interaction.followup.send(f"⏰ **{mins}分後** にタイマーをセットしました: `{vals[1]}`")
+            await asyncio.sleep(mins * 60)
+            await ch.send(f"🔔 {interaction.user.mention} **【タイマー通知】** `{vals[1]}` （{mins}分経過）")
+        elif action == "mod_todo_add":
+            get_state(ch.id).setdefault("todos", []).append(vals[0])
+            await save_cloud_backup(guild)
+            await interaction.followup.send(f"📝 共有ToDoリストに追加しました: `{vals[0]}`")
+        elif action == "mod_debate":
+            await interaction.followup.send(f"⚔️ **テーマ『{vals[0]}』で一人二役AIディベートを開始します...**")
+            res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), f"討論テーマ:「{vals[0]}」\n肯定派（A）と否定派（B）の2人の論客になりきり、互いに鋭い論理で3往復の白熱したディベートを行わせ、最後に審判として勝敗判定を下せ。")
+            for chunk in smart_chunks(f"⚔️ **【AI一人二役ディベート: {vals[0]}】**\n{res.text}"):
+                await ch.send(chunk)
+        elif action == "mod_akinator":
+            await interaction.followup.send("🧞 アキネーター思考中...")
+            res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), f"AIアキネーターとして振る舞え。ユーザーの入力:「{vals[0]}」。特定できそうならズバリ当て、まだなら絞り込むためのYes/No質問を1つ投げかけろ。")
+            await ch.send(f"🧞 **【AIアキネーター】**\n{res.text}")
         elif action == "mod_url_deep":
             await interaction.followup.send("🌐 リンク先を解体・解析中...")
             extracted = await process_all_links_async(vals[0])
             res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), f"以下のURL内容または知識をもとに、3行要約・重要論点・背景解説を出力しろ:\nURL: {vals[0]}\n{extracted}")
             for chunk in smart_chunks(f"🌐 **【URL完全解体レポート】**\n{res.text}"):
                 await ch.send(chunk)
-        elif action == "mod_switch_ai":
-            eng = vals[0].lower().strip()
-            if eng not in ["gemini", "groq", "openrouter"]:
-                return await interaction.followup.send("⚠️ `gemini`、`groq`、`openrouter` のいずれかを入力してください。")
-            get_state(ch.id)["ai_engine"] = eng
-            await interaction.followup.send(f"🧠 このチャンネルのAI頭脳エンジンを **`{eng.upper()}`** に切り替えました！")
         elif action == "mod_fact_add":
             get_state(ch.id).setdefault("learned_facts", []).append(vals[0])
             await save_cloud_backup(guild)
@@ -944,23 +1208,49 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
     except Exception as e:
         await interaction.followup.send(f"⚠️ エラー: {e}")
 
-# --- 8. AI処理コア (Gemini複数キー回転 ＋ Groq / OpenRouter Mod対応) ---
+# --- 8. AI処理コア (エンジン切替バグ完全修正・自動フォールバック搭載版) ---
 class DummyResponse:
     def __init__(self, text): self.text = text
 
-def call_openai_compatible_sync(url, keys, model_name, sys_inst, payload_text):
+def extract_text_from_payload(payload) -> str:
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, list):
+        texts = [p for p in payload if isinstance(p, str)]
+        return "\n".join(texts) if texts else "画像を分析して。"
+    return str(payload)
+
+def has_image_in_payload(payload) -> bool:
+    if isinstance(payload, list):
+        return any(not isinstance(p, str) for p in payload)
+    return False
+
+def call_openai_compatible_sync(url, keys, model_name, sys_inst, history_list, user_text):
+    if not keys:
+        return None
+    messages = [{"role": "system", "content": sys_inst}]
+    for h in history_list[-8:]:
+        try:
+            role = "assistant" if getattr(h, "role", "") == "model" else "user"
+            part_txt = h.parts[0].text if hasattr(h, "parts") and h.parts else ""
+            if part_txt:
+                messages.append({"role": role, "content": part_txt})
+        except Exception:
+            continue
+    messages.append({"role": "user", "content": user_text})
+
     for key in keys:
         try:
             headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-            body = {
-                "model": model_name,
-                "messages": [{"role": "system", "content": sys_inst}, {"role": "user", "content": str(payload_text)}],
-                "temperature": 0.8
-            }
+            body = {"model": model_name, "messages": messages, "temperature": 0.8, "max_tokens": 2000}
             r = requests.post(url, headers=headers, json=body, timeout=20)
             if r.status_code == 200:
-                return DummyResponse(r.json()["choices"][0]["message"]["content"])
-        except Exception:
+                content = r.json()["choices"][0]["message"]["content"]
+                # DeepSeek R1等の <think> タグを綺麗に除去
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                return DummyResponse(content)
+        except Exception as e:
+            print(f"External AI Engine Error ({model_name}): {e}")
             continue
     return None
 
@@ -969,7 +1259,7 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
     t0 = time.perf_counter()
     bot_stats["calls"] += 1
 
-    mode = state["base_mode"]
+    mode = state.get("base_mode", "normal_full")
     stress, affection = state.get("stress", 0), state.get("affection", 50)
     mood_prompt = f"\n【現在のあなたの感情状態】ストレス: {stress}%, 好感度: {affection}%。この数値を踏まえて、自然な対話を行ってください。"
 
@@ -978,26 +1268,32 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
         history_to_use = []
     else:
         sys_inst = (clone_prompt if clone_prompt else get_sys_instruction(state, is_bot_opponent)) + mood_prompt + AUTONOMOUS_DIRECTIVE
-        history_to_use = state["history"][-8:]
+        history_to_use = state.get("history", [])[-8:]
 
-    # 拡張Mod：Groq または OpenRouter が選択されている場合（画像を含まないテキスト時）
     engine = state.get("ai_engine", "gemini")
-    if isinstance(payload, str):
+    text_only_payload = extract_text_from_payload(payload)
+    contains_image = has_image_in_payload(payload)
+
+    # 1. Groq / OpenRouter が選択されており、画像添付がない場合は優先実行（失敗時は自動でGeminiへフォールバック）
+    if not contains_image:
         if engine == "groq" and GROQ_KEYS:
-            res = call_openai_compatible_sync("https://api.groq.com/openai/v1/chat/completions", GROQ_KEYS, "llama-3.3-70b-versatile", sys_inst, payload)
+            res = call_openai_compatible_sync("https://api.groq.com/openai/v1/chat/completions", GROQ_KEYS, "llama-3.3-70b-versatile", sys_inst, history_to_use, text_only_payload)
             if res:
                 bot_stats["latencies"].append((time.perf_counter() - t0) * 1000)
                 return res
-        elif engine == "openrouter" and OPENROUTER_KEYS:
-            res = call_openai_compatible_sync("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_KEYS, "meta-llama/llama-3.3-70b-instruct:free", sys_inst, payload)
+        elif engine in ["openrouter", "openrouter_r1"] and OPENROUTER_KEYS:
+            or_model = "deepseek/deepseek-r1:free" if engine == "openrouter_r1" else "meta-llama/llama-3.3-70b-instruct:free"
+            res = call_openai_compatible_sync("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_KEYS, or_model, sys_inst, history_to_use, text_only_payload)
             if res:
                 bot_stats["latencies"].append((time.perf_counter() - t0) * 1000)
                 return res
 
+    # 2. Gemini エンジン実行（Pro指定時またはフォールバック時）
     if not API_KEYS:
-        raise Exception("GEMINI_API_KEY が設定されていません。")
+        return DummyResponse("⚠️ APIキーが設定されていません。RenderのEnvironmentを確認してください。")
 
-    models_to_try = [ACTIVE_MODEL] + [m for m in FALLBACK_MODELS if m != ACTIVE_MODEL]
+    preferred = "gemini-2.5-pro" if engine == "gemini_pro" else ACTIVE_MODEL
+    models_to_try = [preferred] + [m for m in FALLBACK_MODELS if m != preferred]
     last_err = None
 
     for model_candidate in models_to_try:
@@ -1005,7 +1301,7 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
         total_keys = len(API_KEYS)
         while attempts < total_keys:
             try:
-                genai.configure(api_key=API_KEYS[current_key_index])
+                genai.configure(api_key=API_KEYS[current_key_index % total_keys])
                 model = genai.GenerativeModel(model_name=model_candidate, safety_settings=safety_settings, system_instruction=sys_inst)
                 chat = model.start_chat(history=history_to_use)
                 response = chat.send_message(payload)
@@ -1016,17 +1312,21 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
             except Exception as e:
                 last_err = e
                 err_s = str(e).lower()
+                # 履歴破損エラーの場合は履歴をクリアして即リトライ
+                if "history" in err_s or "role" in err_s or "content" in err_s:
+                    history_to_use = []
+                    state["history"] = []
                 if any(k in err_s for k in ["quota", "429", "resourceexhausted"]):
                     current_key_index = (current_key_index + 1) % total_keys
                     attempts += 1
-                elif "404" in err_s or "not found" in err_s:
+                elif "404" in err_s or "not found" in err_s or "not supported" in err_s:
                     break
                 else:
                     current_key_index = (current_key_index + 1) % total_keys
                     attempts += 1
 
     bot_stats["errors"] += 1
-    raise Exception(f"AI通信エラー: {last_err}")
+    return DummyResponse(f"⚠️ AI応答エラーが発生したため自動復旧しました（詳細: `{last_err}`）")
 
 def get_sys_instruction(state, is_bot_opponent=False):
     b_mode, r_mode = state["base_mode"], state["rp_mode"]
@@ -1130,7 +1430,6 @@ async def handle_special_actions(ctx, reply_text):
     me = guild.me
 
     try:
-        # 1. 天気・Wiki・計算・為替・画像の自律処理
         m = re.search(r'\[WEATHER:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m: await channel.send(f"☁️ **天気 ({m.group(1)}):** {requests.get(f'https://wttr.in/{quote(m.group(1))}?format=%C+%t+湿度:%h+風速:%w', timeout=4).text}")
             
@@ -1151,7 +1450,6 @@ async def handle_special_actions(ctx, reply_text):
             img_bytes = await asyncio.to_thread(download_image_sync, img_match.group(1).strip())
             if img_bytes: image_file = discord.File(io.BytesIO(img_bytes), filename="generated.png")
 
-        # 2. エンタメ系タグ
         if "[ROYALE]" in clean_text.upper(): await execute_battle_royale(channel)
         if "[ROULETTE]" in clean_text.upper():
             members = [mem for mem in channel.members if not mem.bot]
@@ -1170,7 +1468,6 @@ async def handle_special_actions(ctx, reply_text):
             t = find_target_member(guild, m.group(1))
             if t: await execute_duel(channel, getattr(ctx, "author", me), t)
 
-        # 3. 制裁・モデレーション系タグ（全実装）
         m = re.search(r'\[TIMEOUT:\s*(.+?)(?:,\s*(\d+))?\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.moderate_members:
             t = find_target_member(guild, m.group(1)); mins = int(m.group(2)) if m.group(2) else 10
@@ -1205,7 +1502,6 @@ async def handle_special_actions(ctx, reply_text):
             t = find_target_member(guild, m.group(1))
             if t: await channel.purge(limit=min(100, int(m.group(2))), check=lambda msg: msg.author.id == t.id)
 
-        # 4. ニックネーム・DM・代理発言・隔離
         m = re.search(r'\[NICK:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_nicknames:
             t = find_target_member(guild, m.group(1))
@@ -1243,7 +1539,6 @@ async def handle_special_actions(ctx, reply_text):
                 removable = [r for r in t.roles if r != guild.default_role and r < me.top_role]
                 await t.remove_roles(*removable)
 
-        # 5. ロール・権限操作
         m = re.search(r'\[ADD_ROLE:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_roles:
             t, r = find_target_member(guild, m.group(1)), find_target_role(guild, m.group(2))
@@ -1262,7 +1557,6 @@ async def handle_special_actions(ctx, reply_text):
             r = find_target_role(guild, m.group(1))
             if r and r < me.top_role: await r.delete()
 
-        # 6. チャンネル・VC・サーバー設定
         m = re.search(r'\[CREATE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_channels: await guild.create_text_channel(name=m.group(1).strip())
 
@@ -1318,7 +1612,6 @@ async def handle_special_actions(ctx, reply_text):
             for idx in range(len(opts[:5])): await poll_msg.add_reaction(e_nums[idx])
             last_polls[channel.id] = poll_msg
 
-        # 7. ボイスチャンネル操作
         m = re.search(r'\[VOICE_KICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.move_members:
             t = find_target_member(guild, m.group(1))
@@ -1364,10 +1657,23 @@ async def on_command_error(ctx, error):
 @bot.command()
 async def menu(ctx):
     try:
-        embed = discord.Embed(title="🎮 マスターコントロールパネル (200機能＋拡張Mod)", description="ボタンを押してカテゴリを展開してください。全機能がバグなしで使用可能です。", color=discord.Color.gold())
+        embed = discord.Embed(
+            title="🎮 マスターコントロールパネル (全168機能＋拡張Modパック1・2)",
+            description="ボタンを押してカテゴリを展開してください。\n万が一応答がおかしい場合は `!fix` でいつでも初期状態へ緊急リセットできます。",
+            color=discord.Color.gold()
+        )
         await ctx.send(embed=embed, view=MainCategoryView(ctx.channel.id))
     except Exception as e:
         await ctx.send(f"⚠️ メニュー表示エラー（Embed等の権限を確認してください）: {e}")
+
+@bot.command()
+async def fix(ctx):
+    """緊急復旧コマンド：エンジン・履歴・憑依をすべて初期状態に戻す"""
+    st = get_state(ctx.channel.id)
+    st.update({"base_mode": "normal_full", "rp_mode": "none", "ai_engine": "gemini", "history": [], "stress": 0, "affection": 50})
+    mimic_targets.pop(ctx.channel.id, None)
+    cloned_targets.pop(ctx.channel.id, None)
+    await ctx.send("🛠️ **緊急復旧完了:** AI頭脳エンジンを標準（Gemini）、履歴・モード・憑依をすべて正常な初期状態にリセットしました！")
 
 @bot.command()
 async def unmimic(ctx):
@@ -1432,7 +1738,6 @@ async def on_message(message):
     ch_id = message.channel.id
     state = get_state(ch_id)
     
-    # 感情(ストレス・好感度)の変動システム ＆ 育成語彙の記録
     bad_words = ["バカ", "死ね", "使えない", "ゴミ", "カス"]
     good_words = ["ありがとう", "すごい", "天才", "助かる", "可愛い", "好き"]
     if any(w in content for w in bad_words): state["stress"] += 15; state["affection"] -= 10
@@ -1460,16 +1765,17 @@ async def on_message(message):
             try:
                 state["count"] += 1
                 img_parts = [await download_attachment_as_pil(a) for a in message.attachments if any(a.filename.lower().endswith(e) for e in [".png", ".jpg", ".jpeg", ".gif"])]
+                valid_imgs = [i for i in img_parts if i is not None]
                 link_context = await process_all_links_async(content) if content else ""
                 in_txt = f"【発言者: {message.author.display_name}】\n" + (content or "画像を分析して。") + link_context
 
                 c_prompt = cloned_targets[ch_id]["prompt"] if is_cloned else None
-                res = await asyncio.to_thread(call_gemini_api, state, [i for i in img_parts if i] + [in_txt] if img_parts else in_txt, message.author.bot, c_prompt)
+                payload_to_send = valid_imgs + [in_txt] if valid_imgs else in_txt
+                res = await asyncio.to_thread(call_gemini_api, state, payload_to_send, message.author.bot, c_prompt)
 
-                reply_txt, gen_img = await handle_special_actions(message, res.text if res.text else "")
+                reply_txt, gen_img = await handle_special_actions(message, res.text if res and res.text else "")
                 if not reply_txt and not gen_img: reply_txt = "..."
 
-                # mimic または clone 中は Webhook で対象本人になりきって送信
                 impersonate_member = mimic_targets.get(ch_id) or (cloned_targets[ch_id]["target"] if is_cloned else None)
                 if impersonate_member and isinstance(message.channel, discord.TextChannel):
                     sent = await send_as_webhook(message.channel, impersonate_member, reply_txt, file=gen_img)
@@ -1484,5 +1790,7 @@ async def on_message(message):
                     else: await message.channel.send(chunk, file=sf)
             except Exception as e:
                 print(f"処理エラー: {e}")
+                try: await message.channel.send(f"⚠️ 内部エラーが発生しました（`!fix` でリセットできます）: `{e}`")
+                except: pass
 
 bot.run(os.environ.get("DISCORD_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN"))
