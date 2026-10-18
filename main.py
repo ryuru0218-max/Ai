@@ -1200,21 +1200,247 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
     except Exception as e:
         await interaction.followup.send(f"⚠️ エラー: {e}")
 
-# --- 8. AI処理コア（get_sys_instruction を手前に配置して未定義エラーを完全解消） ---
+# --- 8. AI処理コア ＆ タグ処理関数 (handle_special_actions) ---
+async def handle_special_actions(ctx, reply_text):
+    clean_text = reply_text
+    image_file = None
+    guild = getattr(ctx, "guild", None)
+    channel = getattr(ctx, "channel", None)
+    if not guild or not channel: return clean_text, image_file
+    me = guild.me
+
+    try:
+        m = re.search(r'\[WEATHER:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m: await channel.send(f"☁️ **天気 ({m.group(1)}):** {requests.get(f'https://wttr.in/{quote(m.group(1))}?format=%C+%t+湿度:%h+風速:%w', timeout=4).text}")
+            
+        m = re.search(r'\[WIKI:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m: await channel.send(f"📚 **Wiki ({m.group(1)}):** {requests.get(f'https://ja.wikipedia.org/api/rest_v1/page/summary/{quote(m.group(1))}', timeout=4).json().get('extract', '不明')[:1000]}")
+
+        m = re.search(r'\[CALC:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m: await channel.send(f"🧮 **計算:** `{m.group(1)}` = **{safe_calc(m.group(1))}**")
+
+        m = re.search(r'\[CURRENCY:\s*([\d\.]+),\s*([A-Za-z]{3}),\s*([A-Za-z]{3})\]', clean_text, re.IGNORECASE)
+        if m:
+            amt, c1, c2 = float(m.group(1)), m.group(2).upper(), m.group(3).upper()
+            rate = requests.get(f"https://open.er-api.com/v6/latest/{c1}", timeout=4).json()["rates"][c2]
+            await channel.send(f"💱 **為替:** {amt} {c1} = **{amt*rate:,.2f} {c2}**")
+
+        img_match = re.search(r'\[IMAGE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if img_match:
+            img_bytes = await asyncio.to_thread(download_image_sync, img_match.group(1).strip())
+            if img_bytes: image_file = discord.File(io.BytesIO(img_bytes), filename="generated.png")
+
+        if "[ROYALE]" in clean_text.upper(): await execute_battle_royale(channel)
+        if "[ROULETTE]" in clean_text.upper():
+            members = [mem for mem in channel.members if not mem.bot]
+            if len(members) >= 1:
+                vic = random.choice(members)
+                await channel.send(f"🎰 **【ロシアンルーレット】** 被弾: **{vic.display_name}**")
+                if me.guild_permissions.moderate_members and vic.top_role < me.top_role:
+                    try: await vic.timeout(timedelta(minutes=3))
+                    except: pass
+        if "[TAROT]" in clean_text.upper(): await channel.send(f"🔮 **【タロット】** カード: **{random.choice(['0.愚者', 'I.魔術師', 'II.女教皇', 'III.女帝', 'IV.皇帝', 'VI.恋人', 'VII.戦車', 'IX.隠者', 'X.運命の輪', 'XIII.死神', 'XVI.塔', 'XVII.星', 'XIX.太陽', 'XXI.世界'])}** ({random.choice(['正位置', '逆位置'])})")
+        if "[OMIKUJI]" in clean_text.upper(): await channel.send(f"⛩️ **【おみくじ】** 結果: **{random.choice(['大吉', '吉', '中吉', '小吉', '末吉', '凶', '大凶'])}**")
+        if "[SLOT]" in clean_text.upper(): await channel.send(f"🎰 **【スロット】** [ {' | '.join(random.choices(['🍒', '🔔', '🍉', '⭐', '7️⃣'], k=3))} ]")
+
+        m = re.search(r'\[DUEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m:
+            t = find_target_member(guild, m.group(1))
+            if t: await execute_duel(channel, getattr(ctx, "author", me), t)
+
+        m = re.search(r'\[TIMEOUT:\s*(.+?)(?:,\s*(\d+))?\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.moderate_members:
+            t = find_target_member(guild, m.group(1)); mins = int(m.group(2)) if m.group(2) else 10
+            if t and t.top_role < me.top_role: await t.timeout(timedelta(minutes=mins))
+
+        m = re.search(r'\[UNTIMEOUT:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.moderate_members:
+            t = find_target_member(guild, m.group(1))
+            if t and t.top_role < me.top_role: await t.timeout(None)
+        
+        m = re.search(r'\[KICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.kick_members:
+            t = find_target_member(guild, m.group(1))
+            if t and t.top_role < me.top_role: await t.kick()
+
+        m = re.search(r'\[BAN:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.ban_members:
+            t = find_target_member(guild, m.group(1))
+            if t and t.top_role < me.top_role: await t.ban()
+
+        m = re.search(r'\[UNBAN:\s*(\d+)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.ban_members:
+            uid = int(m.group(1))
+            await guild.unban(discord.Object(id=uid))
+
+        m = re.search(r'\[PURGE:\s*(\d+)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_messages:
+            await channel.purge(limit=min(100, int(m.group(1))))
+
+        m = re.search(r'\[PURGE_USER:\s*(.+?),\s*(\d+)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_messages:
+            t = find_target_member(guild, m.group(1))
+            if t: await channel.purge(limit=min(100, int(m.group(2))), check=lambda msg: msg.author.id == t.id)
+
+        m = re.search(r'\[NICK:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_nicknames:
+            t = find_target_member(guild, m.group(1))
+            if t and t.top_role < me.top_role: await t.edit(nick=m.group(2).strip()[:32])
+
+        m = re.search(r'\[RESET_NICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_nicknames:
+            t = find_target_member(guild, m.group(1))
+            if t and t.top_role < me.top_role: await t.edit(nick=None)
+
+        m = re.search(r'\[MASS_NICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_nicknames:
+            prefix = m.group(1).strip()[:15]
+            for mem in guild.members[:30]:
+                if not mem.bot and mem.top_role < me.top_role:
+                    try: await mem.edit(nick=f"{prefix}{mem.name}"[:32])
+                    except: pass
+
+        m = re.search(r'\[DM:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m:
+            t = find_target_member(guild, m.group(1))
+            if t:
+                try: await t.send(f"📩 **メッセージ:** {m.group(2)}")
+                except: pass
+
+        m = re.search(r'\[IMPERSONATE:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m:
+            t = find_target_member(guild, m.group(1))
+            if t: await send_as_webhook(channel, t, m.group(2))
+
+        m = re.search(r'\[ISOLATE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_roles:
+            t = find_target_member(guild, m.group(1))
+            if t and t.top_role < me.top_role:
+                removable = [r for r in t.roles if r != guild.default_role and r < me.top_role]
+                await t.remove_roles(*removable)
+
+        m = re.search(r'\[ADD_ROLE:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_roles:
+            t, r = find_target_member(guild, m.group(1)), find_target_role(guild, m.group(2))
+            if t and r and r < me.top_role: await t.add_roles(r)
+
+        m = re.search(r'\[REMOVE_ROLE:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_roles:
+            t, r = find_target_member(guild, m.group(1)), find_target_role(guild, m.group(2))
+            if t and r and r < me.top_role: await t.remove_roles(r)
+
+        m = re.search(r'\[CREATE_ROLE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_roles: await guild.create_role(name=m.group(1).strip())
+
+        m = re.search(r'\[DELETE_ROLE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_roles:
+            r = find_target_role(guild, m.group(1))
+            if r and r < me.top_role: await r.delete()
+
+        m = re.search(r'\[CREATE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_channels: await guild.create_text_channel(name=m.group(1).strip())
+
+        m = re.search(r'\[CREATE_VOICE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_channels: await guild.create_voice_channel(name=m.group(1).strip())
+
+        m = re.search(r'\[CREATE_STAGE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_channels: await guild.create_stage_channel(name=m.group(1).strip())
+
+        m = re.search(r'\[CREATE_CATEGORY:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_channels: await guild.create_category(name=m.group(1).strip())
+
+        m = re.search(r'\[CREATE_FORUM:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_channels: await guild.create_forum(name=m.group(1).strip())
+
+        m = re.search(r'\[CREATE_THREAD:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m: await channel.create_thread(name=m.group(1).strip(), type=discord.ChannelType.public_thread)
+
+        m = re.search(r'\[DELETE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_channels:
+            c = find_target_channel(guild, m.group(1))
+            if c: await c.delete()
+
+        m = re.search(r'\[RENAME_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_channels: await channel.edit(name=m.group(1).strip())
+
+        m = re.search(r'\[SET_TOPIC:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_channels: await channel.edit(topic=m.group(1).strip())
+
+        m = re.search(r'\[SLOWMODE:\s*(\d+)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_channels: await channel.edit(slowmode_delay=min(21600, int(m.group(1))))
+
+        m = re.search(r'\[NUKE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_channels:
+            c = find_target_channel(guild, m.group(1)) or channel
+            new_c = await c.clone()
+            await c.delete()
+            await new_c.send("💣 **Channel Nuked & Recreated.**")
+
+        m = re.search(r'\[RENAME_SERVER:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.manage_guild: await guild.edit(name=m.group(1).strip())
+
+        m = re.search(r'\[ANNOUNCE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m: await channel.send(embed=discord.Embed(title="📣 サーバー公式アナウンス", description=m.group(1), color=discord.Color.gold()))
+
+        m = re.search(r'\[CREATE_POLL:\s*(.+?),\s*(.+?)(?:,\s*(\d+))?\]', clean_text, re.IGNORECASE)
+        if m:
+            q, opts_str = m.group(1).strip(), m.group(2).strip()
+            opts = [o.strip() for o in opts_str.split("/") if o.strip()]
+            e_nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+            desc = "\n".join([f"{e_nums[idx]} {opt}" for idx, opt in enumerate(opts[:5])])
+            poll_msg = await channel.send(embed=discord.Embed(title=f"📊 投票: {q}", description=desc, color=discord.Color.green()))
+            for idx in range(len(opts[:5])): await poll_msg.add_reaction(e_nums[idx])
+            last_polls[channel.id] = poll_msg
+
+        m = re.search(r'\[VOICE_KICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.move_members:
+            t = find_target_member(guild, m.group(1))
+            if t and t.voice: await t.move_to(None)
+
+        m = re.search(r'\[VOICE_MUTE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.mute_members:
+            t = find_target_member(guild, m.group(1))
+            if t and t.voice: await t.edit(mute=True)
+
+        m = re.search(r'\[VOICE_UNMUTE:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.mute_members:
+            t = find_target_member(guild, m.group(1))
+            if t and t.voice: await t.edit(mute=False)
+
+        m = re.search(r'\[SERVER_DEAFEN:\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.deafen_members:
+            t = find_target_member(guild, m.group(1))
+            if t and t.voice: await t.edit(deafen=not t.voice.deaf)
+
+        m = re.search(r'\[MOVE_MEMBER:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
+        if m and me.guild_permissions.move_members:
+            t, vc = find_target_member(guild, m.group(1)), find_target_channel(guild, m.group(2))
+            if t and isinstance(vc, discord.VoiceChannel): await t.move_to(vc)
+
+        for r_emoji in re.findall(r'\[REACT:\s*(.+?)\]', clean_text, re.IGNORECASE):
+            try:
+                tgt = ctx.reference.resolved if (hasattr(ctx, "reference") and getattr(ctx, "reference") and ctx.reference.resolved) else ctx
+                if hasattr(tgt, "add_reaction"): await tgt.add_reaction(r_emoji.strip())
+            except: pass
+
+    except Exception as e:
+        print(f"Tag Parse Error: {e}")
+
+    clean_text = re.sub(r'\[[A-Z_]+(?::\s*[^\]]+)?\]', '', clean_text, flags=re.IGNORECASE).strip()
+    return clean_text, image_file
+
 class DummyResponse:
     def __init__(self, text): self.text = text
 
 def extract_text_from_payload(payload) -> str:
-    if isinstance(payload, str):
-        return payload
+    if isinstance(payload, str): return payload
     if isinstance(payload, list):
         texts = [p for p in payload if isinstance(p, str)]
         return "\n".join(texts) if texts else "画像を分析して。"
     return str(payload)
 
 def has_image_in_payload(payload) -> bool:
-    if isinstance(payload, list):
-        return any(not isinstance(p, str) for p in payload)
+    if isinstance(payload, list): return any(not isinstance(p, str) for p in payload)
     return False
 
 def get_sys_instruction(state, is_bot_opponent=False):
@@ -1261,17 +1487,14 @@ def get_sys_instruction(state, is_bot_opponent=False):
     return final_prompt
 
 def call_openai_compatible_sync(url, keys, model_name, sys_inst, history_list, user_text):
-    if not keys:
-        return None
+    if not keys: return None
     messages = [{"role": "system", "content": sys_inst}]
     for h in history_list[-8:]:
         try:
             role = "assistant" if getattr(h, "role", "") == "model" else "user"
             part_txt = h.parts[0].text if hasattr(h, "parts") and h.parts else ""
-            if part_txt:
-                messages.append({"role": role, "content": part_txt})
-        except Exception:
-            continue
+            if part_txt: messages.append({"role": role, "content": part_txt})
+        except Exception: continue
     messages.append({"role": "user", "content": user_text})
 
     for key in keys:
@@ -1366,74 +1589,6 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
 
     bot_stats["errors"] += 1
     return DummyResponse(f"⚠️ AI接続エラーが発生しました（詳細: `{last_err}`）")
-
-# --- 9. コマンド定義 ---
-@bot.event
-async def on_command_error(ctx, error):
-    print(f"Command Error: {error}")
-
-@bot.command()
-async def menu(ctx):
-    try:
-        embed = discord.Embed(
-            title="🎮 マスターコントロールパネル (全168機能＋拡張Modパック1・2)",
-            description="ボタンを押してカテゴリを展開してください。\n万が一応答がおかしい場合は `!fix` でいつでも初期状態へ緊急リセットできます。",
-            color=discord.Color.gold()
-        )
-        await ctx.send(embed=embed, view=MainCategoryView(ctx.channel.id))
-    except Exception as e:
-        await ctx.send(f"⚠️ メニュー表示エラー（Embed等の権限を確認してください）: {e}")
-
-@bot.command()
-async def fix(ctx):
-    st = get_state(ctx.channel.id)
-    st.update({"base_mode": "normal_full", "rp_mode": "none", "ai_engine": "gemini", "history": [], "stress": 0, "affection": 50})
-    mimic_targets.pop(ctx.channel.id, None)
-    cloned_targets.pop(ctx.channel.id, None)
-    await ctx.send("🛠️ **緊急復旧完了:** AI頭脳エンジンを標準（Gemini 3.5 Flash-Lite）、履歴・モード・憑依をすべて正常な初期状態にリセットしました！")
-
-@bot.command()
-async def unmimic(ctx):
-    mimic_targets.pop(ctx.channel.id, None)
-    cloned_targets.pop(ctx.channel.id, None)
-    await ctx.send("🎭 偽装・クローンを解除しました。")
-
-@bot.command()
-async def unclone(ctx):
-    cloned_targets.pop(ctx.channel.id, None)
-    await ctx.send("👥 クローン憑依を解除しました。")
-
-@bot.command()
-async def duel(ctx, target_str: str = ""):
-    t = find_target_member(ctx.guild, target_str)
-    if t: await execute_duel(ctx.channel, ctx.author, t)
-    else: await ctx.send("⚠️ 対戦相手の名前またはメンションを指定してください。")
-
-@bot.command()
-async def judge_resba(ctx, w_str: str = "", l_str: str = ""):
-    w, l = find_target_member(ctx.guild, w_str), find_target_member(ctx.guild, l_str)
-    if w and l: await execute_resba_judge(ctx.channel, w, l)
-    else: await ctx.send("⚠️ `!judge_resba <勝者候補> <敗者候補>` の形式で指定してください。")
-
-@bot.command()
-async def royale(ctx):
-    await execute_battle_royale(ctx.channel)
-
-@bot.command()
-async def dungeon(ctx, *, action: str = ""):
-    dg = active_dungeons.setdefault(ctx.channel.id, {"hp": 100, "floor": 1, "x": 2, "y": 2, "gx": 4, "gy": 0, "gold": 0, "visited": [[2, 2]]})
-    if not action:
-        img_bytes = await asyncio.to_thread(render_dungeon_map_bytes, dg)
-        return await ctx.send("🏰 **【AIダンジョン】** `!dungeon <行動>` でテキスト進行、または下のボタンでマップ探索！", file=discord.File(io.BytesIO(img_bytes), "dungeon_map.png"), view=VisualDungeonView(ctx.channel.id))
-    prompt = f"現在地下{dg['floor']}階、HP:{dg['hp']}、所持金:{dg['gold']}G。プレイヤーの行動:「{action}」。結果をゲームマスターとして描写し、次の選択肢を提示しろ。"
-    res = await asyncio.to_thread(call_gemini_api, get_state(ctx.channel.id), prompt)
-    dg["floor"] += 1 if "階段" in res.text or "次の階" in res.text else 0
-    await ctx.send(f"🏰 **【AIダンジョン B{dg['floor']}F (HP:{dg['hp']})】**\n{res.text}")
-
-@tasks.loop(minutes=30.0)
-async def auto_cloud_backup_loop():
-    for g in bot.guilds:
-        await save_cloud_backup(g)
 
 # --- 10. イベントハンドラ ---
 @bot.event
