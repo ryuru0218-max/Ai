@@ -70,8 +70,8 @@ GROQ_KEYS = [k.strip() for k in os.environ.get("GROQ_API_KEY", "").split(",") if
 OPENROUTER_KEYS = [k.strip() for k in os.environ.get("OPENROUTER_API_KEY", "").split(",") if k.strip()]
 
 current_key_index = 0
-ACTIVE_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+ACTIVE_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
 safety_settings = [
     {"category": c, "threshold": HarmBlockThreshold.BLOCK_NONE}
@@ -228,7 +228,6 @@ def safe_calc(expr: str):
     return int(res) if isinstance(res, float) and res.is_integer() else round(res, 8)
 
 def run_safe_python_sandbox(code_str: str) -> str:
-    """拡張Mod：制限付きPythonコード実行サンドボックス"""
     banned = ["import ", "__", "open(", "exec(", "eval(", "os.", "sys.", "subprocess", "socket", "getattr", "setattr", "globals", "locals"]
     for b in banned:
         if b in code_str:
@@ -310,7 +309,6 @@ def download_image_sync(prompt, model="flux"):
     return None
 
 def synthesize_voice_sync(text: str, speaker: int = 3) -> bytes | None:
-    """拡張Mod：VOICEVOX無料API（ずんだもん=3, 四国めたん=2, つむぎ=8）＋ gTTSフォールバック"""
     clean = re.sub(r'https?://\S+', 'URL省略', text)[:180]
     try:
         r = requests.get(f"https://deprecatedapis.tts.quest/v2/voicevox/audio/?text={quote(clean)}&speaker={speaker}", timeout=8)
@@ -362,7 +360,6 @@ def render_dungeon_map_bytes(dungeon_state: dict) -> bytes:
     return buf.getvalue()
 
 def render_blackjack_bytes(player_hand: list, dealer_hand: list, hide_dealer: bool = True) -> bytes:
-    """Pillow視覚ブラックジャック描画Mod"""
     img = Image.new("RGB", (520, 300), (18, 75, 42))
     draw = ImageDraw.Draw(img)
     draw.rectangle([8, 8, 512, 292], outline=(212, 175, 55), width=3)
@@ -493,8 +490,8 @@ RP_MODES = {
     "rp_animal": "動物", "rp_yakuza": "極道", "rp_idol": "アイドル", "rp_hacker": "天才ハッカー"
 }
 AI_ENGINE_MODES = {
-    "gemini": "Gemini 2.5 Flash (標準・画像対応)",
-    "gemini_pro": "Gemini 2.5 Pro (高精度推論)",
+    "gemini": "Gemini 3.5 Flash-Lite (標準・高速・画像対応)",
+    "gemini_flash": "Gemini 2.5 Flash (高精度マルチモーダル)",
     "groq": "Groq Llama 3.3 70B (超爆速・要GROQキー)",
     "openrouter": "OpenRouter Llama 3.3 (無料枠・要ORキー)",
     "openrouter_r1": "OpenRouter DeepSeek R1 (推論・要ORキー)"
@@ -622,12 +619,12 @@ class MainCategoryView(discord.ui.View):
     async def btn_reset(self, interaction, button):
         await interaction.response.defer(ephemeral=True)
         get_state(self.channel_id).update({"base_mode": "normal_full", "rp_mode": "none", "ai_engine": "gemini", "count":0, "vocab":[], "history":[], "stress":0, "affection":50})
-        await interaction.followup.send("🧹 記憶・感情・頭脳エンジン設定を初期状態（Gemini標準）に完全リセットしました！", ephemeral=True)
+        await interaction.followup.send("🧹 記憶・感情・頭脳エンジン設定を初期状態（Gemini 3.5 Flash-Lite）に完全リセットしました！", ephemeral=True)
     @discord.ui.button(label="📊 AIステータス", style=discord.ButtonStyle.secondary, row=4)
     async def btn_status(self, interaction, button):
         s = get_state(self.channel_id)
         await interaction.response.send_message(
-            f"📊 **AI状態**\n頭脳エンジン:`{s.get('ai_engine','gemini')}`\nベース:`{s['base_mode']}` / RP:`{s['rp_mode']}`\n"
+            f"📊 **AI状態**\n頭脳エンジン:`{s.get('ai_engine','gemini')}` (モデル: `{ACTIVE_MODEL}`)\nベース:`{s['base_mode']}` / RP:`{s['rp_mode']}`\n"
             f"ストレス:`{s['stress']}` / 好感度:`{s['affection']}`\n対話:`{s.get('count',0)}`回 / 学習知識:`{len(s.get('learned_facts',[]))}`件",
             ephemeral=True
         )
@@ -724,7 +721,6 @@ class VisualDungeonView(discord.ui.View):
     async def right(self, i, b): await self.move(i, 1, 0)
 
 class BlackjackView(discord.ui.View):
-    """拡張Mod：Pillow画像付きブラックジャック"""
     def __init__(self):
         super().__init__(timeout=180)
         suits = ["S", "H", "D", "C"]
@@ -772,7 +768,6 @@ class BlackjackView(discord.ui.View):
         await interaction.edit_original_response(content=f"🃏 **結果発表 — あなた: `{p_s}` vs ディーラー: `{d_s}`**\n{res}", attachments=[discord.File(io.BytesIO(img), "bj.png")], view=self)
 
 class TicTacToeView(discord.ui.View):
-    """拡張Mod：3×3マルバツゲーム（対人・対AIハイブリッド）"""
     def __init__(self):
         super().__init__(timeout=180)
         self.board = [0] * 9
@@ -799,7 +794,6 @@ class TicTacToeView(discord.ui.View):
 
             w = self.check_win()
             if w == 0:
-                # AIの手番
                 empty = [i for i, v in enumerate(self.board) if v == 0]
                 if empty:
                     ai_pick = random.choice(empty)
@@ -957,6 +951,7 @@ async def execute_direct_action(ch, guild, ctx_mock, action):
             embed.add_field(name="稼働時間", value=f"`{uptime // 3600}時間 {(uptime % 3600) // 60}分`", inline=True)
             embed.add_field(name="メモリ使用量", value=f"`{mem_mb}`", inline=True)
             embed.add_field(name="現在エンジン", value=f"`{get_state(ch.id).get('ai_engine', 'gemini')}`", inline=True)
+            embed.add_field(name="基準Geminiモデル", value=f"`{ACTIVE_MODEL}`", inline=True)
             embed.add_field(name="API平均応答", value=f"`{avg_lat} ms` (計{bot_stats['calls']}回 / エラー{bot_stats['errors']}回)", inline=False)
             embed.add_field(name="登録APIキー数", value=f"Gemini: `{len(API_KEYS)}` / Groq: `{len(GROQ_KEYS)}` / OpenRouter: `{len(OPENROUTER_KEYS)}`", inline=False)
             await ch.send(embed=embed)
@@ -1003,7 +998,6 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
         elif action == "silent":
             await interaction.followup.send(vals[0], silent=True)
 
-        # --- 大幅増強：無料拡張Modパックの処理 ---
         elif action == "mod_voicevox":
             await interaction.followup.send("🗣️ ずんだもん音声生成中...")
             audio_bytes = await asyncio.to_thread(synthesize_voice_sync, vals[0], 3)
@@ -1090,7 +1084,6 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
             await save_cloud_backup(guild)
             await interaction.followup.send(f"📥 長期記憶に知識を注入し、クラウド保存しました: `{vals[0]}`")
 
-        # AIプロンプト系
         ai_prompts = {
             "summary": "要約しろ:\n", "translate": "翻訳しろ:\n", "grammar": "文法修正しろ:\n", "codegen": "コード生成しろ:\n", "psycho_test": "サイコパス診断。対象:",
             "yugioh_card": "遊戯王オリカ生成。テーマ:", "stand_gen": "ジョジョ風スタンド生成。対象:", "nen_type": "念能力生成。対象:", "zanpakuto": "斬魄刀生成。対象:",
@@ -1111,7 +1104,6 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
             for chunk in smart_chunks(f"💡 **AI応答:**\n{res.text}"):
                 await ch.send(chunk)
 
-        # エンタメ＆管理タグ系
         elif action == "compatibility":
             await interaction.followup.send(f"💕 **相性:** {vals[0]} と {vals[1]} は **{int(hashlib.md5((vals[0]+vals[1]).encode()).hexdigest(),16)%101}％**！")
         elif action == "mimic":
@@ -1208,7 +1200,7 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
     except Exception as e:
         await interaction.followup.send(f"⚠️ エラー: {e}")
 
-# --- 8. AI処理コア (エンジン切替バグ完全修正・自動フォールバック搭載版) ---
+# --- 8. AI処理コア (Gemini 3.5 Flash-Lite標準・廃止モデル完全排除版) ---
 class DummyResponse:
     def __init__(self, text): self.text = text
 
@@ -1246,7 +1238,6 @@ def call_openai_compatible_sync(url, keys, model_name, sys_inst, history_list, u
             r = requests.post(url, headers=headers, json=body, timeout=20)
             if r.status_code == 200:
                 content = r.json()["choices"][0]["message"]["content"]
-                # DeepSeek R1等の <think> タグを綺麗に除去
                 content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
                 return DummyResponse(content)
         except Exception as e:
@@ -1274,7 +1265,7 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
     text_only_payload = extract_text_from_payload(payload)
     contains_image = has_image_in_payload(payload)
 
-    # 1. Groq / OpenRouter が選択されており、画像添付がない場合は優先実行（失敗時は自動でGeminiへフォールバック）
+    # 1. 外部エンジン選択時（テキストのみの場合）
     if not contains_image:
         if engine == "groq" and GROQ_KEYS:
             res = call_openai_compatible_sync("https://api.groq.com/openai/v1/chat/completions", GROQ_KEYS, "llama-3.3-70b-versatile", sys_inst, history_to_use, text_only_payload)
@@ -1288,11 +1279,11 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
                 bot_stats["latencies"].append((time.perf_counter() - t0) * 1000)
                 return res
 
-    # 2. Gemini エンジン実行（Pro指定時またはフォールバック時）
+    # 2. Gemini エンジン実行（3.5 Flash-Liteを最優先、実在モデルのみを順次試行）
     if not API_KEYS:
-        return DummyResponse("⚠️ APIキーが設定されていません。RenderのEnvironmentを確認してください。")
+        return DummyResponse("⚠️ GEMINI_API_KEY が設定されていません。")
 
-    preferred = "gemini-2.5-pro" if engine == "gemini_pro" else ACTIVE_MODEL
+    preferred = "gemini-2.5-flash" if engine == "gemini_flash" else ACTIVE_MODEL
     models_to_try = [preferred] + [m for m in FALLBACK_MODELS if m != preferred]
     last_err = None
 
@@ -1312,8 +1303,7 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
             except Exception as e:
                 last_err = e
                 err_s = str(e).lower()
-                # 履歴破損エラーの場合は履歴をクリアして即リトライ
-                if "history" in err_s or "role" in err_s or "content" in err_s:
+                if any(k in err_s for k in ["history", "role", "content", "part"]):
                     history_to_use = []
                     state["history"] = []
                 if any(k in err_s for k in ["quota", "429", "resourceexhausted"]):
@@ -1325,329 +1315,17 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
                     current_key_index = (current_key_index + 1) % total_keys
                     attempts += 1
 
+    # 最後の自動復旧（最も安定したFlash-Liteで履歴なし強制実行）
+    try:
+        genai.configure(api_key=API_KEYS[0])
+        model = genai.GenerativeModel(model_name=ACTIVE_MODEL, safety_settings=safety_settings)
+        res = model.generate_content(payload)
+        return res
+    except Exception:
+        pass
+
     bot_stats["errors"] += 1
-    return DummyResponse(f"⚠️ AI応答エラーが発生したため自動復旧しました（詳細: `{last_err}`）")
-
-def get_sys_instruction(state, is_bot_opponent=False):
-    b_mode, r_mode = state["base_mode"], state["rp_mode"]
-    base = BASE_DIRECTIVE + COMMANDS_DIRECTIVE
-    
-    rp_text = ""
-    if r_mode != "none":
-        rp_map = {
-            "rp_tsundere": "極度のツンデレ。素直になれず暴言を吐くが好意が隠しきれない。", "rp_yandere": "病みヤンデレ。相手への執着が異常で他者を許さない。",
-            "rp_chuuni": "重度の中二病。難解な言葉やルビを多用し闇の力について語る。", "rp_gal": "限界ギャル。絵文字乱舞で若者言葉連発。",
-            "rp_ojou": "高飛車なお嬢様。「～ですわ」「おーっほっほ」と庶民を見下す。", "rp_hard": "ハードボイルド。酒とタバコの匂いがする寡黙でキザなセリフ。",
-            "rp_cyber": "サイバーパンクAI。ハッキング用語や機械的なノイズ混じり。", "rp_samurai": "武士。古風な言葉遣い「～でござる」「拙者」。",
-            "rp_ninja": "忍者。「ニンニン」「～でござるよ」語尾。", "rp_maid": "メイド。「ご主人様」「お嬢様」と徹底して奉仕する丁寧な態度。",
-            "rp_mad": "マッドサイエンティスト。「フゥーハハハ！」と笑い人体実験を好む。", "rp_baby": "赤ん坊。「ばぶー」「あうー」しか言えないが奇跡的に意思疎通する。",
-            "rp_old": "頑固な老人。「ワシは」「～じゃ」と説教くさいが知恵袋。", "rp_god": "全知全能の神。人間をちっぽけな存在として慈しみ、裁きを下す。",
-            "rp_demon": "魔王。人間を絶望させるための甘い言葉や残酷な提案を囁く。", "rp_animal": "動物。言葉は喋れず鳴き声と仕草のみで反応。",
-            "rp_yakuza": "極道。「オウ」「～じゃワレ」などドスを利かせた怒声。", "rp_idol": "トップアイドル。キラキラしたファンサとプロ意識で対応。",
-            "rp_hacker": "天才ハッカー。キーボードを叩く音や暗号を交えて話す。"
-        }
-        rp_text = f"\n【RP人格強制】{rp_map.get(r_mode, '')} ※このRP設定は基本人格設定を完全に上書きします。"
-
-    mode_text = ""
-    if b_mode == "grow_echo": mode_text = f"【特殊動作】オウム返しモード。獲得した以下の語彙だけを組み合わせて返答せよ: {','.join(state.get('vocab', [])[-25:])}"
-    elif b_mode == "grow_age":
-        cnt = state.get("count", 0)
-        age = min(80, 3 + cnt // 3)
-        mode_text = f"【特殊動作】年齢進化モード。あなたの現在の精神年齢は「{age}歳」です。{age}歳らしい語彙力・思考・口調で返答せよ。"
-    elif b_mode in ["grow_educate", "normal_full", "auto_full"] and state.get("learned_facts"):
-        facts_str = "\n".join(state.get("learned_facts", [])[-20:])
-        if b_mode == "grow_educate":
-            mode_text = f"【特殊動作】教育育成モード。以下の教わった知識のみを真実として返答せよ:\n{facts_str}"
-        else:
-            mode_text = f"\n【長期記憶・学習済み知識】\n{facts_str}\n"
-    elif b_mode == "auto_stream": mode_text = STREAM_COMMENT_PROMPT
-    elif b_mode == "quote_search": mode_text = QUOTE_SEARCH_PROMPT
-    elif b_mode == "meigen_search": mode_text = MEIGEN_SEARCH_PROMPT
-    elif b_mode == "anti_berserk": mode_text = ANTI_ROLEPLAY_PROMPT
-    elif b_mode == "troll_chaos": mode_text = TROLL_CHAOS_PROMPT
-    
-    final_prompt = base
-    if mode_text: final_prompt += "\n" + mode_text
-    if rp_text: final_prompt += "\n" + rp_text
-    return final_prompt
-
-async def send_as_webhook(channel, target_member, content, file=None):
-    try:
-        avatar_bytes = None
-        try: avatar_bytes = await target_member.display_avatar.read()
-        except: pass
-        webhooks = await channel.webhooks()
-        webhook = next((wh for wh in webhooks if wh.user and wh.user.id == bot.user.id), None)
-        if webhook:
-            try: await webhook.edit(name=target_member.display_name[:32], avatar=avatar_bytes)
-            except: pass
-        else:
-            if len(webhooks) >= 15:
-                for wh in webhooks:
-                    if wh.user and wh.user.id == bot.user.id:
-                        try: await wh.delete(); break
-                        except: pass
-            webhook = await channel.create_webhook(name=target_member.display_name[:32], avatar=avatar_bytes)
-
-        chunks = smart_chunks(content) if content else [""]
-        for idx, chunk in enumerate(chunks):
-            if idx == 0 and file: await webhook.send(content=chunk, file=file)
-            else: await webhook.send(content=chunk)
-        return True
-    except:
-        return False
-
-def find_target_member(guild, target_str):
-    if not guild or not target_str: return None
-    id_match = re.search(r'\d{15,21}', target_str.strip())
-    if id_match: return guild.get_member(int(id_match.group(0)))
-    for m in guild.members:
-        if target_str.lower() in [m.name.lower(), m.display_name.lower()]: return m
-    return None
-
-def find_target_role(guild, role_str):
-    if not guild or not role_str: return None
-    id_match = re.search(r'\d{15,21}', role_str.strip())
-    if id_match: return guild.get_role(int(id_match.group(0)))
-    for r in guild.roles:
-        if role_str.lower() in r.name.lower(): return r
-    return None
-
-def find_target_channel(guild, ch_str):
-    if not guild or not ch_str: return None
-    id_match = re.search(r'\d{15,21}', ch_str.strip())
-    if id_match: return guild.get_channel(int(id_match.group(0)))
-    for c in guild.channels:
-        if ch_str.lower() in c.name.lower(): return c
-    return None
-
-async def handle_special_actions(ctx, reply_text):
-    clean_text = reply_text
-    image_file = None
-    guild = getattr(ctx, "guild", None)
-    channel = getattr(ctx, "channel", None)
-    if not guild or not channel: return clean_text, image_file
-    me = guild.me
-
-    try:
-        m = re.search(r'\[WEATHER:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m: await channel.send(f"☁️ **天気 ({m.group(1)}):** {requests.get(f'https://wttr.in/{quote(m.group(1))}?format=%C+%t+湿度:%h+風速:%w', timeout=4).text}")
-            
-        m = re.search(r'\[WIKI:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m: await channel.send(f"📚 **Wiki ({m.group(1)}):** {requests.get(f'https://ja.wikipedia.org/api/rest_v1/page/summary/{quote(m.group(1))}', timeout=4).json().get('extract', '不明')[:1000]}")
-
-        m = re.search(r'\[CALC:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m: await channel.send(f"🧮 **計算:** `{m.group(1)}` = **{safe_calc(m.group(1))}**")
-
-        m = re.search(r'\[CURRENCY:\s*([\d\.]+),\s*([A-Za-z]{3}),\s*([A-Za-z]{3})\]', clean_text, re.IGNORECASE)
-        if m:
-            amt, c1, c2 = float(m.group(1)), m.group(2).upper(), m.group(3).upper()
-            rate = requests.get(f"https://open.er-api.com/v6/latest/{c1}", timeout=4).json()["rates"][c2]
-            await channel.send(f"💱 **為替:** {amt} {c1} = **{amt*rate:,.2f} {c2}**")
-
-        img_match = re.search(r'\[IMAGE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if img_match:
-            img_bytes = await asyncio.to_thread(download_image_sync, img_match.group(1).strip())
-            if img_bytes: image_file = discord.File(io.BytesIO(img_bytes), filename="generated.png")
-
-        if "[ROYALE]" in clean_text.upper(): await execute_battle_royale(channel)
-        if "[ROULETTE]" in clean_text.upper():
-            members = [mem for mem in channel.members if not mem.bot]
-            if len(members) >= 1:
-                vic = random.choice(members)
-                await channel.send(f"🎰 **【ロシアンルーレット】** 被弾: **{vic.display_name}**")
-                if me.guild_permissions.moderate_members and vic.top_role < me.top_role:
-                    try: await vic.timeout(timedelta(minutes=3))
-                    except: pass
-        if "[TAROT]" in clean_text.upper(): await channel.send(f"🔮 **【タロット】** カード: **{random.choice(['愚者', '魔術師', '死神', '太陽', '塔', '恋人', '世界'])}**")
-        if "[OMIKUJI]" in clean_text.upper(): await channel.send(f"⛩️ **【おみくじ】** 結果: **{random.choice(['大吉', '吉', '中吉', '小吉', '末吉', '凶', '大凶'])}**")
-        if "[SLOT]" in clean_text.upper(): await channel.send(f"🎰 **【スロット】** [ {' | '.join(random.choices(['🍒', '🔔', '🍉', '⭐', '7️⃣'], k=3))} ]")
-
-        m = re.search(r'\[DUEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m:
-            t = find_target_member(guild, m.group(1))
-            if t: await execute_duel(channel, getattr(ctx, "author", me), t)
-
-        m = re.search(r'\[TIMEOUT:\s*(.+?)(?:,\s*(\d+))?\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.moderate_members:
-            t = find_target_member(guild, m.group(1)); mins = int(m.group(2)) if m.group(2) else 10
-            if t and t.top_role < me.top_role: await t.timeout(timedelta(minutes=mins))
-
-        m = re.search(r'\[UNTIMEOUT:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.moderate_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.top_role < me.top_role: await t.timeout(None)
-        
-        m = re.search(r'\[KICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.kick_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.top_role < me.top_role: await t.kick()
-
-        m = re.search(r'\[BAN:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.ban_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.top_role < me.top_role: await t.ban()
-
-        m = re.search(r'\[UNBAN:\s*(\d+)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.ban_members:
-            uid = int(m.group(1))
-            await guild.unban(discord.Object(id=uid))
-
-        m = re.search(r'\[PURGE:\s*(\d+)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_messages:
-            await channel.purge(limit=min(100, int(m.group(1))))
-
-        m = re.search(r'\[PURGE_USER:\s*(.+?),\s*(\d+)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_messages:
-            t = find_target_member(guild, m.group(1))
-            if t: await channel.purge(limit=min(100, int(m.group(2))), check=lambda msg: msg.author.id == t.id)
-
-        m = re.search(r'\[NICK:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_nicknames:
-            t = find_target_member(guild, m.group(1))
-            if t and t.top_role < me.top_role: await t.edit(nick=m.group(2).strip()[:32])
-
-        m = re.search(r'\[RESET_NICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_nicknames:
-            t = find_target_member(guild, m.group(1))
-            if t and t.top_role < me.top_role: await t.edit(nick=None)
-
-        m = re.search(r'\[MASS_NICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_nicknames:
-            prefix = m.group(1).strip()[:15]
-            for mem in guild.members[:30]:
-                if not mem.bot and mem.top_role < me.top_role:
-                    try: await mem.edit(nick=f"{prefix}{mem.name}"[:32])
-                    except: pass
-
-        m = re.search(r'\[DM:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m:
-            t = find_target_member(guild, m.group(1))
-            if t:
-                try: await t.send(f"📩 **メッセージ:** {m.group(2)}")
-                except: pass
-
-        m = re.search(r'\[IMPERSONATE:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m:
-            t = find_target_member(guild, m.group(1))
-            if t: await send_as_webhook(channel, t, m.group(2))
-
-        m = re.search(r'\[ISOLATE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles:
-            t = find_target_member(guild, m.group(1))
-            if t and t.top_role < me.top_role:
-                removable = [r for r in t.roles if r != guild.default_role and r < me.top_role]
-                await t.remove_roles(*removable)
-
-        m = re.search(r'\[ADD_ROLE:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles:
-            t, r = find_target_member(guild, m.group(1)), find_target_role(guild, m.group(2))
-            if t and r and r < me.top_role: await t.add_roles(r)
-
-        m = re.search(r'\[REMOVE_ROLE:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles:
-            t, r = find_target_member(guild, m.group(1)), find_target_role(guild, m.group(2))
-            if t and r and r < me.top_role: await t.remove_roles(r)
-
-        m = re.search(r'\[CREATE_ROLE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles: await guild.create_role(name=m.group(1).strip())
-
-        m = re.search(r'\[DELETE_ROLE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles:
-            r = find_target_role(guild, m.group(1))
-            if r and r < me.top_role: await r.delete()
-
-        m = re.search(r'\[CREATE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await guild.create_text_channel(name=m.group(1).strip())
-
-        m = re.search(r'\[CREATE_VOICE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await guild.create_voice_channel(name=m.group(1).strip())
-
-        m = re.search(r'\[CREATE_STAGE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await guild.create_stage_channel(name=m.group(1).strip())
-
-        m = re.search(r'\[CREATE_CATEGORY:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await guild.create_category(name=m.group(1).strip())
-
-        m = re.search(r'\[CREATE_FORUM:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await guild.create_forum(name=m.group(1).strip())
-
-        m = re.search(r'\[CREATE_THREAD:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m: await channel.create_thread(name=m.group(1).strip(), type=discord.ChannelType.public_thread)
-
-        m = re.search(r'\[DELETE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels:
-            c = find_target_channel(guild, m.group(1))
-            if c: await c.delete()
-
-        m = re.search(r'\[RENAME_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await channel.edit(name=m.group(1).strip())
-
-        m = re.search(r'\[SET_TOPIC:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await channel.edit(topic=m.group(1).strip())
-
-        m = re.search(r'\[SLOWMODE:\s*(\d+)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await channel.edit(slowmode_delay=min(21600, int(m.group(1))))
-
-        m = re.search(r'\[NUKE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels:
-            c = find_target_channel(guild, m.group(1)) or channel
-            new_c = await c.clone()
-            await c.delete()
-            await new_c.send("💣 **Channel Nuked & Recreated.**")
-
-        m = re.search(r'\[RENAME_SERVER:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_guild: await guild.edit(name=m.group(1).strip())
-
-        m = re.search(r'\[ANNOUNCE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m: await channel.send(embed=discord.Embed(title="📣 サーバー公式アナウンス", description=m.group(1), color=discord.Color.gold()))
-
-        m = re.search(r'\[CREATE_POLL:\s*(.+?),\s*(.+?)(?:,\s*(\d+))?\]', clean_text, re.IGNORECASE)
-        if m:
-            q, opts_str = m.group(1).strip(), m.group(2).strip()
-            opts = [o.strip() for o in opts_str.split("/") if o.strip()]
-            e_nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-            desc = "\n".join([f"{e_nums[idx]} {opt}" for idx, opt in enumerate(opts[:5])])
-            poll_msg = await channel.send(embed=discord.Embed(title=f"📊 投票: {q}", description=desc, color=discord.Color.green()))
-            for idx in range(len(opts[:5])): await poll_msg.add_reaction(e_nums[idx])
-            last_polls[channel.id] = poll_msg
-
-        m = re.search(r'\[VOICE_KICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.move_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.voice: await t.move_to(None)
-
-        m = re.search(r'\[VOICE_MUTE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.mute_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.voice: await t.edit(mute=True)
-
-        m = re.search(r'\[VOICE_UNMUTE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.mute_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.voice: await t.edit(mute=False)
-
-        m = re.search(r'\[SERVER_DEAFEN:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.deafen_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.voice: await t.edit(deafen=not t.voice.deaf)
-
-        m = re.search(r'\[MOVE_MEMBER:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.move_members:
-            t, vc = find_target_member(guild, m.group(1)), find_target_channel(guild, m.group(2))
-            if t and isinstance(vc, discord.VoiceChannel): await t.move_to(vc)
-
-        for r_emoji in re.findall(r'\[REACT:\s*(.+?)\]', clean_text, re.IGNORECASE):
-            try:
-                tgt = ctx.reference.resolved if (hasattr(ctx, "reference") and getattr(ctx, "reference") and ctx.reference.resolved) else ctx
-                if hasattr(tgt, "add_reaction"): await tgt.add_reaction(r_emoji.strip())
-            except: pass
-
-    except Exception as e:
-        print(f"Tag Parse Error: {e}")
-
-    clean_text = re.sub(r'\[[A-Z_]+(?::\s*[^\]]+)?\]', '', clean_text, flags=re.IGNORECASE).strip()
-    return clean_text, image_file
+    return DummyResponse(f"⚠️ AI接続エラーが発生しました（詳細: `{last_err}`）")
 
 # --- 9. コマンド定義 ---
 @bot.event
@@ -1668,12 +1346,11 @@ async def menu(ctx):
 
 @bot.command()
 async def fix(ctx):
-    """緊急復旧コマンド：エンジン・履歴・憑依をすべて初期状態に戻す"""
     st = get_state(ctx.channel.id)
     st.update({"base_mode": "normal_full", "rp_mode": "none", "ai_engine": "gemini", "history": [], "stress": 0, "affection": 50})
     mimic_targets.pop(ctx.channel.id, None)
     cloned_targets.pop(ctx.channel.id, None)
-    await ctx.send("🛠️ **緊急復旧完了:** AI頭脳エンジンを標準（Gemini）、履歴・モード・憑依をすべて正常な初期状態にリセットしました！")
+    await ctx.send("🛠️ **緊急復旧完了:** AI頭脳エンジンを標準（Gemini 3.5 Flash-Lite）、履歴・モード・憑依をすべて正常な初期状態にリセットしました！")
 
 @bot.command()
 async def unmimic(ctx):
@@ -1721,7 +1398,7 @@ async def auto_cloud_backup_loop():
 # --- 10. イベントハンドラ ---
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user.name}")
+    print(f"Logged in as {bot.user.name} (Active Model: {ACTIVE_MODEL})")
     await load_cloud_backup()
     if not auto_cloud_backup_loop.is_running():
         auto_cloud_backup_loop.start()
