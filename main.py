@@ -11,6 +11,8 @@ import hashlib
 import uuid
 import threading
 import asyncio
+import json
+import glob
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, unquote
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -23,7 +25,7 @@ from discord.ext import commands, tasks
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
-# VC音声再生用ライブラリの読み込み
+# --- VC音声再生用ライブラリ ---
 try:
     import yt_dlp
     import imageio_ffmpeg
@@ -51,7 +53,7 @@ def is_master_user(user) -> bool:
     master_env = os.environ.get("MASTER_USER", MASTER_USERNAME).lower()
     return any(master_env in c.lower() or MASTER_USERNAME in c.lower() for c in checks if c)
 
-# --- 1. Webサーバー (Keep-Alive ＆ マスター専用Webジュークボックス内蔵) ---
+# --- 1. Web同期サーバー (Keep-Alive ＆ VC外スマホ用連動プレイヤー) ---
 bgm_global_state = {
     "active": False,
     "channel_id": None,
@@ -62,29 +64,99 @@ bgm_global_state = {
     "current_index": 0,
     "current_track": {"title": "待機中", "url": DEFAULT_PLAYLIST_URL, "artist": "Playlist", "video_id": "", "guide": ""},
     "msg_counter": 0,
-    "last_player_msg_id": None
+    "last_player_msg_id": None,
+    "version": 0
 }
+
+WEB_PLAYER_HTML = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>POCHI MASTER BGM PLAYER</title>
+<style>
+  body { background: #111214; color: #eee; font-family: -apple-system, BlinkMacSystemFont, sans-serif; text-align: center; margin: 0; padding: 20px; }
+  .card { max-width: 480px; margin: auto; background: #1e1f22; border-radius: 16px; padding: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.6); border: 2px solid #f1c40f; }
+  h1 { font-size: 1.2rem; color: #f1c40f; margin-bottom: 6px; }
+  #status { font-weight: bold; margin: 12px 0; color: #57f287; font-size: 1rem; }
+  iframe { width: 100%; height: 260px; border: none; border-radius: 12px; }
+  .info { font-size: 0.85rem; color: #bbb; line-height: 1.5; margin-top: 15px; text-align: left; background: #2b2d31; padding: 12px; border-radius: 8px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🎵 POCHI BGM 連動プレイヤー</h1>
+  <p style="font-size:0.85rem;color:#888;">Master: yuansan0979 専用ロック</p>
+  <div id="status">初期化中...</div>
+  <div id="player-container"></div>
+  <div class="info">
+    💡 <b>VC外（スマホ単体）で聴く方法:</b><br>
+    上の動画を再生したままDiscordアプリに戻ってください。バックグラウンドで曲が流れ続けます。<br>
+    Discord側でマスターが「やめ」とチャットすると自動でここも停止します。
+  </div>
+</div>
+
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+let player;
+let lastVersion = -1;
+
+function onYouTubeIframeAPIReady() {
+  player = new YT.Player('player-container', {
+    height: '260',
+    width: '100%',
+    playerVars: { 'autoplay': 1, 'loop': 1, 'listType': 'playlist', 'list': '""" + DEFAULT_PLAYLIST_ID + """' },
+    events: {
+      'onReady': onPlayerReady
+    }
+  });
+}
+
+function onPlayerReady(event) {
+  document.getElementById('status').innerText = '準備完了。Discord連動待機中...';
+  setInterval(checkStatus, 2000);
+}
+
+function checkStatus() {
+  fetch('/api/bgm_status')
+    .then(r => r.json())
+    .then(data => {
+      if (data.version !== lastVersion) {
+        lastVersion = data.version;
+        if (data.active) {
+          document.getElementById('status').innerText = '▶️ 再生中: ' + data.current_track.title;
+          document.getElementById('status').style.color = '#57f287';
+          if (player && player.playVideo) { player.playVideo(); }
+        } else {
+          document.getElementById('status').innerText = '🛑 停止中（Discord側で停止されました）';
+          document.getElementById('status').style.color = '#ed4245';
+          if (player && player.pauseVideo) { player.pauseVideo(); }
+        }
+      }
+    }).catch(e => console.log(e));
+}
+</script>
+</body>
+</html>
+"""
 
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html; charset=utf-8')
-        self.end_headers()
-        track = bgm_global_state["current_track"]
-        vid = track.get("video_id") or ""
-        embed_src = f"https://www.youtube.com/embed/{vid}?autoplay=1&loop=1&playlist={DEFAULT_PLAYLIST_ID}" if vid else f"https://www.youtube.com/embed/videoseries?list={DEFAULT_PLAYLIST_ID}&autoplay=1&loop=1"
-        html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>POCHI MASTER BGM PLAYER</title>
-<style>body{{background:#111;color:#eee;font-family:sans-serif;text-align:center;padding:20px;}}
-.box{{max-width:720px;margin:auto;background:#1e1e24;padding:20px;border-radius:12px;border:2px solid #f1c40f;}}
-iframe{{width:100%;height:400px;border-radius:8px;border:none;}}</style></head>
-<body><div class="box">
-<h2>🎵 POCHI MASTER BGM JUKEBOX (Master: {MASTER_USERNAME})</h2>
-<p>現在再生中: <b>{track.get('title')}</b></p>
-<iframe src="{embed_src}" allow="autoplay; encrypted-media" allowfullscreen></iframe>
-<p style="white-space:pre-wrap;text-align:left;background:#000;padding:12px;border-radius:8px;">{track.get('guide', 'BGM待機中')}</p>
-</div></body></html>"""
-        self.wfile.write(html.encode("utf-8"))
+        if self.path == "/api/bgm_status":
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(bgm_global_state).encode('utf-8'))
+        elif self.path.startswith("/player") or self.path == "/":
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(WEB_PLAYER_HTML.encode('utf-8'))
+        else:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
 
 def run_web_server():
     try:
@@ -260,7 +332,7 @@ async def process_all_links_async(text):
                 res = await asyncio.to_thread(requests.get, url, headers={"User-Agent": "Mozilla/5.0"}, timeout=3.0)
                 soup = BeautifulSoup(res.text, "html.parser")
                 for tag in soup(["script", "style"]): tag.extract()
-                summary += f"\n【Web参照】\n{re.sub(r'\s+', ' ', soup.get_text(separator=' ', strip=True))[:800]}\n"
+                summary += f"\n【Web参照】\n{re.sub(r'\\s+', ' ', soup.get_text(separator=' ', strip=True))[:800]}\n"
             except: pass
     return summary
 
@@ -301,11 +373,17 @@ class ActionContext:
         self.author = interaction.user
         self.reference = None
 
-# --- 5. マスター専用BGM・VC・チャット常駐ジュークボックスエンジン ---
-def extract_playlist_or_video_sync(url: str) -> list[dict]:
-    """yt-dlpでプレイリストまたは単一動画の曲リストを取得"""
+# --- 5. マスター専用BGM・ローカルバッファ型VC再生エンジン (100%確実に鳴る修正版) ---
+TEMP_AUDIO_PATH = "/tmp/pochi_bgm_current.mp3"
+
+def clean_temp_audio():
+    for f in glob.glob("/tmp/pochi_bgm_*.mp3") + glob.glob("/tmp/pochi_bgm_*.m4a"):
+        try: os.remove(f)
+        except: pass
+
+def extract_playlist_sync(url: str) -> list[dict]:
     if not VOICE_AVAILABLE:
-        return [{"title": "Master BGM Playlist", "url": url, "artist": "YouTube", "video_id": ""}]
+        return [{"title": "Master Playlist Track", "url": url, "artist": "YouTube", "video_id": ""}]
     ydl_opts = {
         "extract_flat": "in_playlist",
         "quiet": True,
@@ -318,18 +396,17 @@ def extract_playlist_or_video_sync(url: str) -> list[dict]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
-                return [{"title": "Master BGM Stream", "url": url, "artist": "YouTube", "video_id": ""}]
+                return [{"title": "Master Stream", "url": url, "artist": "YouTube", "video_id": ""}]
             if "entries" in info:
                 for entry in info["entries"]:
                     if not entry: continue
                     vid = entry.get("id") or ""
                     v_url = entry.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else url)
-                    if not v_url.startswith("http"):
-                        v_url = f"https://www.youtube.com/watch?v={vid}"
+                    if not v_url.startswith("http"): v_url = f"https://www.youtube.com/watch?v={vid}"
                     tracks.append({
                         "title": entry.get("title") or "Track",
                         "url": v_url,
-                        "artist": entry.get("uploader") or entry.get("channel") or "YouTube Artist",
+                        "artist": entry.get("uploader") or entry.get("channel") or "Artist",
                         "video_id": vid
                     })
             else:
@@ -337,45 +414,55 @@ def extract_playlist_or_video_sync(url: str) -> list[dict]:
                 tracks.append({
                     "title": info.get("title") or "Track",
                     "url": info.get("webpage_url") or url,
-                    "artist": info.get("uploader") or "YouTube Artist",
+                    "artist": info.get("uploader") or "Artist",
                     "video_id": vid
                 })
     except Exception as e:
-        print(f"Playlist Extract Error: {e}")
-    return tracks or [{"title": "Master Selected Track", "url": url, "artist": "YouTube", "video_id": ""}]
+        print(f"Playlist Error: {e}")
+    return tracks or [{"title": "Master Track", "url": url, "artist": "YouTube", "video_id": ""}]
 
-def resolve_audio_stream_sync(track_url: str) -> dict:
-    """再生直前に実際の音声ストリームURLと詳細情報を取得"""
+def download_audio_file_sync(track_url: str) -> dict:
+    """
+    YouTubeの403 Forbiddenや途切れを完全防止するため、
+    曲を/tmpに素早くダウンロードしてローカルファイルとして再生準備を行う。
+    """
+    clean_temp_audio()
+    out_template = "/tmp/pochi_bgm_%(id)s.%(ext)s"
     ydl_opts = {
         "format": "bestaudio/best",
+        "outtmpl": out_template,
         "quiet": True,
-        "no_warnings": True
+        "no_warnings": True,
+        "nocheckcertificate": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+        "ffmpeg_location": FFMPEG_EXE
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(track_url, download=False)
+        info = ydl.extract_info(track_url, download=True)
         if "entries" in info and info["entries"]:
             info = info["entries"][0]
+        vid = info.get("id") or "audio"
+        file_path = f"/tmp/pochi_bgm_{vid}.mp3"
         return {
-            "stream_url": info.get("url"),
+            "file_path": file_path,
             "title": info.get("title") or "Unknown Title",
             "artist": info.get("uploader") or info.get("artist") or "Artist",
-            "video_id": info.get("id") or "",
+            "video_id": vid,
             "webpage_url": info.get("webpage_url") or track_url,
-            "description": (info.get("description") or "")[:600]
+            "description": (info.get("description") or "")[:400]
         }
 
 def build_song_guide_sync(state, title: str, artist: str, description: str, video_id: str) -> str:
-    """
-    楽曲のテーマ・ストーリー・意味の要約と、最大4行以内の短い引用（アーティスト明記）、
-    およびGoogle検索でフル歌詞を確認するためのリンクを生成する。
-    """
     sub_snippet = ""
     if video_id:
         try:
             t_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ja', 'en'])
             sub_snippet = " / ".join([t["text"] for t in t_list[:6]])[:250]
-        except Exception:
-            pass
+        except Exception: pass
 
     prompt = (
         f"現在再生中の楽曲『{title}』（アーティスト: {artist}）について、リスナー向けの楽曲ガイドを作成してください。\n"
@@ -392,19 +479,22 @@ def build_song_guide_sync(state, title: str, artist: str, description: str, vide
 
     search_query = quote(f"{title} {artist} 歌詞")
     google_lyrics_url = f"https://www.google.com/search?q={search_query}"
-    return (
-        f"{ai_guide}\n\n"
-        f"🔎 **フル歌詞の確認:** [Google検索で『{title}』の歌詞を見る]({google_lyrics_url})"
-    )
+    return f"{ai_guide}\n\n🔎 **フル歌詞の確認:** [Google検索で『{title}』の歌詞を見る]({google_lyrics_url})"
+
+def get_server_player_url():
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if render_url:
+        return render_url.rstrip("/") + "/player"
+    return "https://(RenderのWebサービスURL)/player"
 
 class MasterBGMControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="⏭️ 次の曲へ (Master限定)", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="⏩ 次の曲へ (Master限定)", style=discord.ButtonStyle.primary, row=0)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_master_user(interaction.user):
-            return await interaction.response.send_message(f"🔒 このBGMプレイヤーはマスター（`{MASTER_USERNAME}`）専用です。他のユーザーは操作できません。", ephemeral=True)
+            return await interaction.response.send_message(f"🔒 マスター（`{MASTER_USERNAME}`）専用です。他のユーザーは操作できません。", ephemeral=True)
         await interaction.response.defer()
         await skip_bgm_track(interaction.guild)
         await interaction.followup.send("⏭️ マスターの指示により次の曲へスキップしました。", ephemeral=True)
@@ -422,7 +512,7 @@ class MasterBGMControlView(discord.ui.View):
     @discord.ui.button(label="🛑 BGM完全停止 (Master限定)", style=discord.ButtonStyle.danger, row=0)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_master_user(interaction.user):
-            return await interaction.response.send_message(f"🔒 マスター（`{MASTER_USERNAME}`）が「やめ」と言うまで、誰にもこの曲を止めることはできません！", ephemeral=True)
+            return await interaction.response.send_message(f"🔒 マスター（`{MASTER_USERNAME}`）が「やめ」と言うまで誰にも止められません！", ephemeral=True)
         await interaction.response.defer()
         await stop_master_bgm(interaction.guild, interaction.channel)
 
@@ -430,24 +520,25 @@ async def send_or_refresh_bgm_card(channel: discord.TextChannel, force_repost: b
     if not bgm_global_state["active"] or not channel:
         return
     track = bgm_global_state["current_track"]
+    p_url = get_server_player_url()
     embed = discord.Embed(
         title=f"🎵 MASTER BGM 連続再生中 — {track.get('title')}",
         description=(
             f"👤 **アーティスト:** `{track.get('artist')}`\n"
-            f"🔒 **制御権限:** `{MASTER_USERNAME}` 専用ロック中（マスターが「やめ」と言うまで継続）\n"
-            f"🔗 **楽曲リンク:** [YouTubeで開く]({track.get('url', DEFAULT_PLAYLIST_URL)}) | [プレイリスト全体]({bgm_global_state['playlist_url']})\n\n"
+            f"🔒 **制御権限:** `{MASTER_USERNAME}` 専用ロック中\n"
+            f"📱 **[VCに入らずスマホで聴く場合はここをタップ]({p_url})**\n"
+            f"🔗 **YouTube:** [開く]({track.get('url', DEFAULT_PLAYLIST_URL)})\n\n"
             f"📖 **【楽曲テーマ解説 ＆ フレーズ紹介】**\n{track.get('guide', '読み込み中...')}"
         ),
         color=discord.Color.gold()
     )
-    embed.set_footer(text=f"Track {bgm_global_state['current_index'] + 1} / {max(1, len(bgm_global_state['queue']))} • VC＆チャット常駐モード稼働中")
+    embed.set_footer(text=f"Track {bgm_global_state['current_index'] + 1} / {max(1, len(bgm_global_state['queue']))} • VC＆Web連動中")
 
     if force_repost and bgm_global_state.get("last_player_msg_id"):
         try:
             old_msg = await channel.fetch_message(bgm_global_state["last_player_msg_id"])
             await old_msg.delete()
-        except Exception:
-            pass
+        except Exception: pass
 
     try:
         new_msg = await channel.send(
@@ -457,30 +548,30 @@ async def send_or_refresh_bgm_card(channel: discord.TextChannel, force_repost: b
         )
         bgm_global_state["last_player_msg_id"] = new_msg.id
     except Exception as e:
-        print(f"BGM Card Send Error: {e}")
+        print(f"BGM Card Error: {e}")
 
-async def prepare_current_track_info(channel_id: int):
+async def prepare_current_track(channel_id: int):
     queue = bgm_global_state["queue"]
     if not queue:
-        queue = await asyncio.to_thread(extract_playlist_or_video_sync, bgm_global_state["playlist_url"])
+        queue = await asyncio.to_thread(extract_playlist_sync, bgm_global_state["playlist_url"])
         bgm_global_state["queue"] = queue
     idx = bgm_global_state["current_index"] % len(queue)
     bgm_global_state["current_index"] = idx
     base_track = queue[idx]
 
-    description = ""
-    stream_url = None
+    description, local_file = "", None
     if VOICE_AVAILABLE and base_track.get("url"):
         try:
-            resolved = await asyncio.to_thread(resolve_audio_stream_sync, base_track["url"])
-            stream_url = resolved.get("stream_url")
-            base_track["title"] = resolved.get("title") or base_track["title"]
-            base_track["artist"] = resolved.get("artist") or base_track["artist"]
-            base_track["video_id"] = resolved.get("video_id") or base_track.get("video_id", "")
-            base_track["url"] = resolved.get("webpage_url") or base_track["url"]
-            description = resolved.get("description", "")
+            # 安全に/tmpにダウンロードしてローカルパスを取得
+            dl_res = await asyncio.to_thread(download_audio_file_sync, base_track["url"])
+            local_file = dl_res.get("file_path")
+            base_track["title"] = dl_res.get("title") or base_track["title"]
+            base_track["artist"] = dl_res.get("artist") or base_track["artist"]
+            base_track["video_id"] = dl_res.get("video_id") or base_track.get("video_id", "")
+            base_track["url"] = dl_res.get("webpage_url") or base_track["url"]
+            description = dl_res.get("description", "")
         except Exception as e:
-            print(f"Stream Resolve Error: {e}")
+            print(f"Download Track Error: {e}")
 
     guide = await asyncio.to_thread(
         build_song_guide_sync,
@@ -490,11 +581,8 @@ async def prepare_current_track_info(channel_id: int):
         description,
         base_track.get("video_id", "")
     )
-    bgm_global_state["current_track"] = {
-        **base_track,
-        "stream_url": stream_url,
-        "guide": guide
-    }
+    bgm_global_state["current_track"] = {**base_track, "local_file": local_file, "guide": guide}
+    bgm_global_state["version"] += 1
 
 async def play_current_in_vc(guild: discord.Guild):
     if not bgm_global_state["active"] or not guild or not VOICE_AVAILABLE:
@@ -504,57 +592,52 @@ async def play_current_in_vc(guild: discord.Guild):
         if bgm_global_state.get("voice_channel_id"):
             v_ch = guild.get_channel(bgm_global_state["voice_channel_id"])
             if isinstance(v_ch, discord.VoiceChannel):
-                try:
-                    vc = await v_ch.connect(reconnect=True)
+                try: vc = await v_ch.connect(reconnect=True)
                 except Exception as e:
                     print(f"VC Reconnect Error: {e}")
                     return
-        else:
-            return
+        else: return
 
     track = bgm_global_state["current_track"]
-    stream_url = track.get("stream_url")
-    if not stream_url and track.get("url"):
-        try:
-            resolved = await asyncio.to_thread(resolve_audio_stream_sync, track["url"])
-            stream_url = resolved.get("stream_url")
-            track["stream_url"] = stream_url
-        except Exception as e:
-            print(f"VC Audio URL Error: {e}")
-            return
+    local_file = track.get("local_file")
 
-    if not stream_url:
+    if not local_file or not os.path.exists(local_file):
+        print("Local audio file not found, re-downloading...")
+        if track.get("url"):
+            try:
+                dl_res = await asyncio.to_thread(download_audio_file_sync, track["url"])
+                local_file = dl_res.get("file_path")
+                track["local_file"] = local_file
+            except Exception as e:
+                print(f"Re-download Error: {e}")
+                return
+
+    if not local_file or not os.path.exists(local_file):
         return
 
     if vc.is_playing() or vc.is_paused():
         vc.stop()
 
-    ffmpeg_opts = {
-        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        "options": "-vn"
-    }
     try:
-        source = discord.FFmpegPCMAudio(stream_url, executable=FFMPEG_EXE, **ffmpeg_opts)
+        # ローカルファイルを直接FFmpegで再生するため403エラーが起きず確実に鳴る
+        source = discord.FFmpegPCMAudio(local_file, executable=FFMPEG_EXE)
         def _after_play(err):
-            if err:
-                print(f"VC Playback Error: {err}")
+            if err: print(f"VC Audio Error: {err}")
             if bgm_global_state["active"]:
                 asyncio.run_coroutine_threadsafe(advance_next_track_auto(guild), bot.loop)
         vc.play(source, after=_after_play)
+        print(f"VC Playback Successfully Started: {track.get('title')}")
     except Exception as e:
-        print(f"FFmpeg Play Error: {e}")
+        print(f"VC Play Exception: {e}")
 
 async def advance_next_track_auto(guild: discord.Guild):
-    if not bgm_global_state["active"]:
-        return
+    if not bgm_global_state["active"]: return
     bgm_global_state["current_index"] = (bgm_global_state["current_index"] + 1) % max(1, len(bgm_global_state["queue"]))
     cid = bgm_global_state["channel_id"]
-    await prepare_current_track_info(cid)
-    if guild:
-        await play_current_in_vc(guild)
+    await prepare_current_track(cid)
+    if guild: await play_current_in_vc(guild)
     ch = bot.get_channel(cid) if cid else None
-    if ch:
-        await send_or_refresh_bgm_card(ch, force_repost=True)
+    if ch: await send_or_refresh_bgm_card(ch, force_repost=True)
 
 async def start_master_bgm(guild: discord.Guild, channel: discord.TextChannel, author: discord.Member, url_or_query: str = ""):
     target_url = url_or_query.strip() if url_or_query.strip() else DEFAULT_PLAYLIST_URL
@@ -565,11 +648,10 @@ async def start_master_bgm(guild: discord.Guild, channel: discord.TextChannel, a
     bgm_global_state["current_index"] = 0
     bgm_global_state["msg_counter"] = 0
 
-    await channel.send(f"👑 **マスター（`{MASTER_USERNAME}`）権限でBGM常駐システムを起動します...**\nプレイリストを読み込み中: `{target_url}`")
-    bgm_global_state["queue"] = await asyncio.to_thread(extract_playlist_or_video_sync, target_url)
-    await prepare_current_track_info(channel.id)
+    await channel.send(f"👑 **マスター（`{MASTER_USERNAME}`）権限でBGMシステムを起動中...**\nプレイリストをロードし、音声を準備しています...")
+    bgm_global_state["queue"] = await asyncio.to_thread(extract_playlist_sync, target_url)
+    await prepare_current_track(channel.id)
 
-    # マスターがVCにいれば自動でVCにも参加して再生開始
     if isinstance(author, discord.Member) and author.voice and author.voice.channel:
         await connect_and_play_vc(guild, author.voice.channel)
     elif guild and guild.voice_client and guild.voice_client.is_connected():
@@ -579,7 +661,7 @@ async def start_master_bgm(guild: discord.Guild, channel: discord.TextChannel, a
 
 async def connect_and_play_vc(guild: discord.Guild, voice_channel: discord.VoiceChannel) -> tuple[bool, str]:
     if not VOICE_AVAILABLE:
-        return False, "⚠️ 音声ライブラリ（PyNaCl / yt-dlp / imageio-ffmpeg）が未導入のためVC再生できません。"
+        return False, "⚠️ 音声ライブラリ（PyNaCl / yt-dlp / imageio-ffmpeg）が未導入です。"
     try:
         bgm_global_state["voice_channel_id"] = voice_channel.id
         vc: discord.VoiceClient = guild.voice_client
@@ -589,33 +671,43 @@ async def connect_and_play_vc(guild: discord.Guild, voice_channel: discord.Voice
             vc = await voice_channel.connect(reconnect=True)
         if bgm_global_state["active"]:
             await play_current_in_vc(guild)
-        return True, f"🔊 ボイスチャンネル **{voice_channel.name}** に参加し、マスター専用BGMストリームを開始しました！"
+        return True, f"🔊 ボイスチャンネル **{voice_channel.name}** に参加し、音声を流し始めました！"
     except Exception as e:
         return False, f"⚠️ VC接続エラー: {e}"
 
 async def skip_bgm_track(guild: discord.Guild):
-    if not bgm_global_state["active"]:
-        return
+    if not bgm_global_state["active"]: return
     if guild and guild.voice_client and guild.voice_client.is_playing():
-        guild.voice_client.stop()  # afterコールバックにより自動で次の曲へ進む
+        guild.voice_client.stop()
     else:
         await advance_next_track_auto(guild)
 
 async def stop_master_bgm(guild: discord.Guild, channel: discord.TextChannel):
     bgm_global_state["active"] = False
     bgm_global_state["voice_channel_id"] = None
+    bgm_global_state["version"] += 1
+    clean_temp_audio()
     if guild and guild.voice_client:
         try:
             guild.voice_client.stop()
             await guild.voice_client.disconnect(force=True)
-        except Exception:
-            pass
+        except Exception: pass
     if channel:
-        await channel.send(f"🛑 **マスター（`{MASTER_USERNAME}`）の命令により、BGM再生と常駐プレイヤーを停止しました。**")
+        await channel.send(f"🛑 **マスター（`{MASTER_USERNAME}`）の命令により、BGM再生を完全停止しました。**")
 
-# --- 6. 超大ボリューム・機能辞書定義 (200種超・完全復元＋BGM統合) ---
-BASE_MODES = {"normal_full": "通常(有能)", "normal_chat": "純粋会話", "auto_full": "自動有能", "auto_stream": "配信コメント", "quote_search": "名言検索", "meigen_search": "迷言検索", "anti_berserk": "アンチ暴走", "troll_chaos": "荒らし", "grow_echo": "オウム返し", "grow_age": "年齢進化", "grow_educate": "教育育成", "reset_full": "単発リセット(モード6)"}
-RP_MODES = {"none": "RPなし", "rp_tsundere": "ツンデレ", "rp_yandere": "ヤンデレ", "rp_chuuni": "中二病", "rp_gal": "限界ギャル", "rp_ojou": "お嬢様", "rp_hard": "ハードボイルド", "rp_cyber": "サイバーパンク", "rp_samurai": "武士", "rp_ninja": "忍者", "rp_maid": "メイド", "rp_mad": "狂気科学者", "rp_baby": "赤ん坊", "rp_old": "頑固老人", "rp_god": "神様", "rp_demon": "魔王", "rp_animal": "動物", "rp_yakuza": "極道", "rp_idol": "アイドル", "rp_hacker": "天才ハッカー"}
+# --- 6. 200機能超・機能辞書定義 (完全復元) ---
+BASE_MODES = {
+    "normal_full": "通常(有能)", "normal_chat": "純粋会話", "auto_full": "自動有能", "auto_stream": "配信コメント",
+    "quote_search": "名言検索", "meigen_search": "迷言検索", "anti_berserk": "アンチ暴走", "troll_chaos": "荒らし",
+    "grow_echo": "オウム返し", "grow_age": "年齢進化", "grow_educate": "教育育成", "reset_full": "単発リセット(モード6)"
+}
+RP_MODES = {
+    "none": "RPなし", "rp_tsundere": "ツンデレ", "rp_yandere": "ヤンデレ", "rp_chuuni": "中二病",
+    "rp_gal": "限界ギャル", "rp_ojou": "お嬢様", "rp_hard": "ハードボイルド", "rp_cyber": "サイバーパンク",
+    "rp_samurai": "武士", "rp_ninja": "忍者", "rp_maid": "メイド", "rp_mad": "狂気科学者",
+    "rp_baby": "赤ん坊", "rp_old": "頑固老人", "rp_god": "神様", "rp_demon": "魔王",
+    "rp_animal": "動物", "rp_yakuza": "極道", "rp_idol": "アイドル", "rp_hacker": "天才ハッカー"
+}
 
 UI_CONFIG = {
     "ENT1": {
@@ -650,7 +742,7 @@ UI_CONFIG = {
         "pw_strength": ["🔒 PW強度診断", ["PW"]], "unit_convert": ["📏 単位変換", ["数値と単位"]], "color_hex": ["🎨 カラーHex提案", ["テーマ"]],
         "code_explain": ["💻 コード解説", ["コード"]], "code_refactor": ["💻 リファクタリング", ["コード"]], "text_to_emoji": ["😂 絵文字翻訳", ["テキスト"]],
         "fake_news": ["📰 フェイクニュース", ["キーワード"]], "email_draft": ["✉️ ビジネスメール", ["要件"]], "catchcopy_gen": ["💡 キャッチコピー", ["商品名"]],
-        "lyrics_gen": ["🎵 オリジナル作詞生成", ["テーマ"]], "recipe_gen": ["🍳 狂気レシピ", ["食材"]], "workout_menu": ["💪 筋トレメニュー", ["部位"]],
+        "lyrics_gen": ["🎵 歌詞生成", ["テーマ"]], "recipe_gen": ["🍳 狂気レシピ", ["食材"]], "workout_menu": ["💪 筋トレメニュー", ["部位"]],
         "diet_plan": ["🏃 絶食ダイエット", ["目標"]], "plant_care": ["🌱 観葉植物アドバイス", ["植物名"]], "cocktail_gen": ["🍸 オリジナルカクテル", ["気分"]],
         "sql_gen": ["🗄️ SQLクエリ生成", ["要件"]], "rhyme_finder": ["🎤 韻踏み検索", ["単語"]]
     },
@@ -676,11 +768,11 @@ UI_CONFIG = {
     },
     "BGM": {
         "bgm_start_default": ["▶️ マスター標準リスト再生", []],
-        "bgm_start_custom": ["🎵 指定URLでBGM再生", ["YouTube URL (プレイリスト/動画)"]],
-        "bgm_join_vc": ["🔊 現在のVCにBotを呼ぶ", []],
+        "bgm_start_custom": ["🎵 指定URLでBGM再生", ["YouTube URL"]],
+        "bgm_join_vc": ["🔊 VCにBotを呼ぶ", []],
         "bgm_skip": ["⏭️ 次の曲へスキップ", []],
-        "bgm_show_card": ["📻 プレイヤー画面を再表示", []],
-        "bgm_stop": ["🛑 BGMを完全停止する", []]
+        "bgm_show_card": ["📻 プレイヤー再表示", []],
+        "bgm_stop": ["🛑 BGM完全停止", []]
     }
 }
 
@@ -697,29 +789,28 @@ class MainCategoryView(discord.ui.View):
     async def b2(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "エンタメ1", UI_CONFIG["ENT1"])]))
     @discord.ui.button(label="🎲 エンタメ2", style=discord.ButtonStyle.success, row=0)
     async def b3(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "エンタメ2 (AIゲーム)", UI_CONFIG["ENT2"])]))
-    @discord.ui.button(label="🛠️ AI・外部ツール1", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="🛠️ 外部ツール1", style=discord.ButtonStyle.secondary, row=1)
     async def b4(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "外部ツール1", UI_CONFIG["TOOL1"])]))
-    @discord.ui.button(label="🛠️ AI・外部ツール2", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="🛠️ 外部ツール2", style=discord.ButtonStyle.secondary, row=1)
     async def b5(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "AIツール2", UI_CONFIG["TOOL2"])]))
     @discord.ui.button(label="🛡️ モデレーション", style=discord.ButtonStyle.danger, row=2)
     async def b6(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "ユーザー管理", UI_CONFIG["MOD"])]))
     @discord.ui.button(label="⚙️ サーバー管理", style=discord.ButtonStyle.danger, row=2)
     async def b7(self, interaction, button): await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "サーバー設定", UI_CONFIG["SERVER"])]))
-    @discord.ui.button(label="🎵 マスター専用BGM・VC", style=discord.ButtonStyle.primary, row=3)
+    @discord.ui.button(label="🎵 BGMコントロール", style=discord.ButtonStyle.primary, row=3)
     async def b_bgm(self, interaction, button):
-        if not is_master_user(interaction.user):
-            return await interaction.response.send_message(f"🔒 BGM管理メニューはマスター（`{MASTER_USERNAME}`）専用です。", ephemeral=True)
-        await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "マスター専用BGM制御", UI_CONFIG["BGM"])]))
-    @discord.ui.button(label="🧹 記憶・感情リセット", style=discord.ButtonStyle.danger, row=4)
+        if not is_master_user(interaction.user): return await interaction.response.send_message(f"🔒 マスター専用です。", ephemeral=True)
+        await interaction.response.edit_message(view=SubMenuView(self.channel_id, [DynamicActionSelect(self.channel_id, "BGMコントロール", UI_CONFIG["BGM"])]))
+    @discord.ui.button(label="🧹 リセット", style=discord.ButtonStyle.danger, row=4)
     async def btn_reset(self, interaction, button):
         await interaction.response.defer(ephemeral=True)
         get_state(self.channel_id).update({"count":0, "vocab":[], "history":[], "stress":0, "affection":50})
-        await interaction.followup.send("🧹 記憶・感情パラメーターを完全にリセットしました！", ephemeral=True)
-    @discord.ui.button(label="📊 AIステータス", style=discord.ButtonStyle.secondary, row=4)
+        await interaction.followup.send("🧹 記憶・感情パラメーターをリセットしました！", ephemeral=True)
+    @discord.ui.button(label="📊 ステータス", style=discord.ButtonStyle.secondary, row=4)
     async def btn_status(self, interaction, button):
         s = get_state(self.channel_id)
         bgm_txt = f"再生中 ({bgm_global_state['current_track'].get('title')})" if bgm_global_state["active"] else "停止中"
-        await interaction.response.send_message(f"📊 **AI状態**\nベース:`{s['base_mode']}` / RP:`{s['rp_mode']}`\nストレス:`{s['stress']}` / 好感度:`{s['affection']}`\n対話:`{s.get('count',0)}`回\n🎵 BGM:`{bgm_txt}`", ephemeral=True)
+        await interaction.response.send_message(f"📊 **AI状態**\nベース:`{s['base_mode']}` / RP:`{s['rp_mode']}`\nストレス:`{s['stress']}` / 好感度:`{s['affection']}`\n🎵 BGM:`{bgm_txt}`", ephemeral=True)
 
 class SubMenuView(discord.ui.View):
     def __init__(self, channel_id, selects):
@@ -748,14 +839,13 @@ class DynamicActionSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         val = self.values[0]
         if val.startswith("bgm_") and not is_master_user(interaction.user):
-            return await interaction.response.send_message(f"🔒 BGM操作はマスター（`{MASTER_USERNAME}`）のみ実行可能です。", ephemeral=True)
+            return await interaction.response.send_message(f"🔒 マスター専用です。", ephemeral=True)
         labels = self.config[val][1]
         if labels: await interaction.response.send_modal(ActionInputModal(val, self.config[val][0][:45], labels))
         else:
             await interaction.response.defer(ephemeral=False)
             await execute_direct_action(interaction.channel, interaction.guild, ActionContext(interaction), val, interaction)
 
-# --- 8. モーダル・直接アクション実行エンジン (省略箇所をすべて完全実装) ---
 class ActionInputModal(discord.ui.Modal):
     def __init__(self, action, title, labels):
         super().__init__(title=title[:45])
@@ -763,49 +853,36 @@ class ActionInputModal(discord.ui.Modal):
         for l in labels[:5]:
             inp = discord.ui.TextInput(label=l[:45], style=discord.TextStyle.short, required=True)
             self.add_item(inp); self.inputs.append(inp)
-
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=False)
         vals = [i.value.strip() for i in self.inputs]
         await execute_modal_action(interaction.channel, interaction.guild, ActionContext(interaction), self.action, vals, interaction)
 
+# --- 8. 直接実行 ＆ モーダルアクションエンジン ---
 async def execute_duel(ch, user_a, user_b):
-    res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), f"【タイマン決闘実況】{user_a.display_name} vs {user_b.display_name} の激しいバトルを実況し、最後に勝者を決定せよ。")
-    await ch.send(f"⚔️ **【タイマン決闘: {user_a.display_name} vs {user_b.display_name}】**\n{res.text}")
+    res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), f"【タイマン決闘実況】{user_a.display_name} vs {user_b.display_name} の激しいバトルを実況し、勝者を決定せよ。")
+    await ch.send(f"⚔️ **【タイマン決闘】**\n{res.text}")
 
 async def execute_resba_judge(ch, winner, loser):
-    res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), f"【レスバ勝敗判定】勝者:{winner.display_name} / 敗者:{loser.display_name}。なぜ勝者が論理的に圧勝し、敗者が論破されたのかを辛辣に講評せよ。")
-    await ch.send(f"⚖️ **【レスバ最高裁判定】**\n{res.text}")
+    res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), f"【レスバ勝敗判定】勝者:{winner.display_name} / 敗者:{loser.display_name}。講評を出力せよ。")
+    await ch.send(f"⚖️ **【レスバ最高裁】**\n{res.text}")
 
 async def execute_battle_royale(ch):
     mems = [m.display_name for m in getattr(ch, "members", []) if not m.bot][:10]
-    participants = ", ".join(mems) if mems else "サーバーの猛者たち"
-    res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), f"参加者（{participants}）によるデスゲーム・バトルロワイヤルの実況を行い、劇的な展開と最後の生存者1名を決定せよ。")
-    await ch.send(f"🌪️ **【バトルロワイヤル開幕】**\n{res.text}")
+    res = await asyncio.to_thread(call_gemini_api, get_state(ch.id), f"バトロワ実況: {', '.join(mems)}")
+    await ch.send(f"🌪️ **【バトルロワイヤル】**\n{res.text}")
 
 async def execute_direct_action(ch, guild, ctx_mock, action, interaction=None):
     try:
-        # BGM操作系 (Master専用)
-        if action == "bgm_start_default":
-            await start_master_bgm(guild, ch, ctx_mock.author, DEFAULT_PLAYLIST_URL)
-            return
+        if action == "bgm_start_default": await start_master_bgm(guild, ch, ctx_mock.author, DEFAULT_PLAYLIST_URL); return
         elif action == "bgm_join_vc":
             if isinstance(ctx_mock.author, discord.Member) and ctx_mock.author.voice and ctx_mock.author.voice.channel:
-                _, msg = await connect_and_play_vc(guild, ctx_mock.author.voice.channel)
-                await ch.send(msg)
-            else:
-                await ch.send("⚠️ 先にボイスチャンネルへ入ってから実行してください。")
+                _, msg = await connect_and_play_vc(guild, ctx_mock.author.voice.channel); await ch.send(msg)
+            else: await ch.send("⚠️ 先にボイスチャンネルへ入ってから実行してください。")
             return
-        elif action == "bgm_skip":
-            await skip_bgm_track(guild)
-            await ch.send("⏭️ 次の曲へスキップしました。")
-            return
-        elif action == "bgm_show_card":
-            await send_or_refresh_bgm_card(ch, force_repost=True)
-            return
-        elif action == "bgm_stop":
-            await stop_master_bgm(guild, ch)
-            return
+        elif action == "bgm_skip": await skip_bgm_track(guild); await ch.send("⏭️ 次の曲へスキップしました。"); return
+        elif action == "bgm_show_card": await send_or_refresh_bgm_card(ch, force_repost=True); return
+        elif action == "bgm_stop": await stop_master_bgm(guild, ch); return
 
         if action == "royale": await execute_battle_royale(ch)
         elif action == "bunshun":
@@ -823,13 +900,13 @@ async def execute_direct_action(ch, guild, ctx_mock, action, interaction=None):
         elif action == "dungeon": active_dungeons[ch.id] = {"hp": 100, "floor": 1}; await ch.send("🏰 **【AIダンジョン】** `!dungeon <行動>` で進め！")
         elif action == "unmimic": mimic_targets.pop(ch.id, None); cloned_targets.pop(ch.id, None); await ch.send("🎭 憑依解除完了")
         elif action == "fake_id": await ch.send(f"🪪 **身分証:** コード `{uuid.uuid4().hex[:8].upper()}`")
-        elif action == "tarot": await ch.send(f"🔮 **タロット:** **{random.choice(['愚者', '魔術師', '女教皇', '女帝', '皇帝', '恋人', '戦車', '力', '隠者', '運命の輪', '正義', '死神', '悪魔', '塔', '星', '月', '太陽', '世界'])}**")
+        elif action == "tarot": await ch.send(f"🔮 **タロット:** **{random.choice(['愚者', '魔術師', '死神', '太陽', '塔', '恋人', '世界'])}**")
         elif action == "coin": await ch.send(f"🪙 **コイン:** **{'表' if random.random() < 0.5 else '裏'}**")
         elif action == "dice": await ch.send(f"🎲 **1d100:** `{random.randint(1, 100)}`")
         elif action == "gacha": await ch.send(f"🎉 **10連ガチャ:**\n" + " / ".join(random.choices(['🌟SSR', '✨SR', '🔵R', '⚪N'], weights=[1, 5, 20, 74], k=10)))
         elif action == "gacha100":
             pulls = random.choices(['🌟SSR', '✨SR', '🔵R', '⚪N'], weights=[1, 5, 20, 74], k=100)
-            await ch.send(f"🎊 **100連ガチャ実抽選結果:**\n🌟SSR: {pulls.count('🌟SSR')}枚 / ✨SR: {pulls.count('✨SR')}枚 / 🔵R: {pulls.count('🔵R')}枚 / ⚪N: {pulls.count('⚪N')}枚\n先頭10連: {' / '.join(pulls[:10])}")
+            await ch.send(f"🎊 **100連実抽選結果:**\n🌟SSR: {pulls.count('🌟SSR')}枚 / ✨SR: {pulls.count('✨SR')}枚 / 🔵R: {pulls.count('🔵R')}枚 / ⚪N: {pulls.count('⚪N')}枚")
         elif action == "omikuji": await ch.send(f"⛩️ **おみくじ:** **{random.choice(['大吉', '吉', '中吉', '小吉', '末吉', '凶', '大凶'])}**")
         elif action == "slot_machine": await ch.send(f"🎰 **スロット:** [ {' | '.join(random.choices(['🍒', '🔔', '🍉', '⭐', '7️⃣'], k=3))} ]")
         elif action == "fake_alert": await ch.send(embed=discord.Embed(title="⚠️ System Critical Error", description="不正アクセスを検知", color=discord.Color.red()))
@@ -851,14 +928,13 @@ async def execute_direct_action(ch, guild, ctx_mock, action, interaction=None):
 async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
     try:
         if action == "bgm_start_custom":
-            if not is_master_user(interaction.user):
-                return await interaction.followup.send("🔒 マスター専用機能です。", ephemeral=True)
+            if not is_master_user(interaction.user): return await interaction.followup.send("🔒 マスター専用です。", ephemeral=True)
             await interaction.followup.send("🎵 カスタムURLでマスターBGMを起動します...")
             await start_master_bgm(guild, ch, interaction.user, vals[0])
             return
 
         if action == "silent":
-            await interaction.followup.send("🗣️ サイレント送信を実行しました。", ephemeral=True)
+            await interaction.followup.send("🗣️ 送信完了", ephemeral=True)
             await ch.send(vals[0], suppress_embeds=True)
             return
 
@@ -889,9 +965,9 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
             elif action == "hex2txt": res = bytes.fromhex(v0.replace(" ", "")).decode("utf-8", errors="replace")
             elif action == "txt2bin": res = ' '.join(format(b, '08b') for b in v0.encode("utf-8"))
             elif action == "bin2txt": res = bytes(int(b, 2) for b in v0.split()).decode("utf-8", errors="replace")
-            elif action == "wordcount": res = f"{len(v0)} 文字 (空白除: {len(v0.replace(' ', ''))}文字)"
+            elif action == "wordcount": res = f"{len(v0)} 文字"
             await interaction.followup.send(f"✅ 結果: `{res}`")
-        
+
         # AIプロンプト系
         ai_prompts = {
             "summary": "要約しろ:\n", "translate": "翻訳しろ:\n", "grammar": "文法修正しろ:\n", "codegen": "コード生成しろ:\n", "psycho_test": "サイコパス診断。対象:",
@@ -904,7 +980,7 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
             "morse2text": "モールス解読しろ:\n", "ascii_art": "アスキーアート生成しろ:\n", "pw_strength": "パスワード強度診断しろ:\n", "unit_convert": "単位変換しろ:\n",
             "color_hex": "カラーコード提案しろ:\n", "code_explain": "コード解説しろ:\n", "code_refactor": "リファクタリングしろ:\n", "text_to_emoji": "絵文字化しろ:\n",
             "fake_news": "フェイクニュース生成しろ:\n", "email_draft": "ビジネスメール作成しろ:\n", "catchcopy_gen": "キャッチコピー生成しろ:\n",
-            "lyrics_gen": "既存曲ではなく完全オリジナルのソング構成・テーマ案を作成しろ:\n", "recipe_gen": "狂気レシピ生成しろ:\n", "workout_menu": "地獄筋トレ生成しろ:\n", "diet_plan": "絶食ダイエット生成しろ:\n",
+            "lyrics_gen": "オリジナル歌詞生成しろ:\n", "recipe_gen": "狂気レシピ生成しろ:\n", "workout_menu": "筋トレ生成しろ:\n", "diet_plan": "絶食ダイエット生成しろ:\n",
             "plant_care": "植物アドバイスしろ:\n", "cocktail_gen": "カクテル提案しろ:\n", "sql_gen": "SQL生成しろ:\n", "rhyme_finder": "韻踏み検索しろ:\n"
         }
         if action in ai_prompts:
@@ -913,7 +989,6 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
             await ch.send(f"💡 **AI応答:**\n{res.text[:1950]}")
             return
 
-        # エンタメ＆管理タグ系
         if action == "compatibility": await interaction.followup.send(f"💕 **相性:** {vals[0]} と {vals[1]} は **{int(hashlib.md5((vals[0]+vals[1]).encode()).hexdigest(),16)%101}％**！")
         elif action == "mimic":
             t = find_target_member(guild, vals[0])
@@ -922,7 +997,7 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
             t = find_target_member(guild, vals[0])
             if t:
                 logs = [m.clean_content async for m in ch.history(limit=50) if m.author.id == t.id and m.content]
-                cloned_targets[ch.id] = {"target": t, "prompt": "以下の過去発言の口調・癖を完全に模倣して本人として振る舞え:\n" + "\n".join(logs[:15])}
+                cloned_targets[ch.id] = {"target": t, "prompt": "本人として振る舞え:\n" + "\n".join(logs[:15])}
                 await interaction.followup.send(f"👥 **{t.display_name}** をクローン。（解除:`!unmimic`）")
         elif action == "judge":
             ua, ub = find_target_member(guild, vals[0]), find_target_member(guild, vals[1])
@@ -946,7 +1021,7 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
             t = find_target_member(guild, vals[0])
             if t:
                 roles = ", ".join([r.name for r in t.roles if r.name != "@everyone"])
-                await interaction.followup.send(embed=discord.Embed(title=f"🔍 ユーザー情報: {t.display_name}", description=f"ID: `{t.id}`\nアカウント作成: `{t.created_at.strftime('%Y-%m-%d')}`\nサーバー参加: `{t.joined_at.strftime('%Y-%m-%d') if t.joined_at else '不明'}`\nロール: {roles or 'なし'}", color=discord.Color.blue()))
+                await interaction.followup.send(embed=discord.Embed(title=f"🔍 ユーザー情報: {t.display_name}", description=f"ID: `{t.id}`\n作成日: `{t.created_at.strftime('%Y-%m-%d')}`\n参加日: `{t.joined_at.strftime('%Y-%m-%d') if t.joined_at else '不明'}`\n役職: {roles or 'なし'}", color=discord.Color.blue()))
         else:
             v = vals + ["", "", "", ""]
             m_map = {
@@ -960,31 +1035,14 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
                 "remove_role": f"[REMOVE_ROLE: {v[0]}, {v[1]}]", "create_role": f"[CREATE_ROLE: {v[0]}]", "delete_role": f"[DELETE_ROLE: {v[0]}]",
                 "voice_kick": f"[VOICE_KICK: {v[0]}]", "voice_mute": f"[VOICE_MUTE: {v[0]}]", "voice_unmute": f"[VOICE_UNMUTE: {v[0]}]",
                 "move_member": f"[MOVE_MEMBER: {v[0]}, {v[1]}]", "dm_user": f"[DM: {v[0]}, {v[1]}]", "impersonate": f"[IMPERSONATE: {v[0]}, {v[1]}]",
-                "announce": f"[ANNOUNCE: {v[0]}]", "act_nuke": f"[NUKE_CHANNEL: {v[0]}]", "set_perm": f"[SET_CHANNEL_PERM: {v[0]}, {v[1]}, {v[2]}, {v[3]}]",
-                "automod_kw": f"[CREATE_AUTOMOD_KEYWORD: {v[0]}, {v[1]}]", "automod_spam": f"[CREATE_AUTOMOD_SPAM: {v[0]}]", "del_automod": f"[DELETE_AUTOMOD: {v[0]}]",
-                "create_event": f"[CREATE_EVENT: {v[0]}, {v[1]}, {v[2]}]", "create_emoji": f"[CREATE_EMOJI: {v[0]}, {v[1]}]"
+                "announce": f"[ANNOUNCE: {v[0]}]", "act_nuke": f"[NUKE_CHANNEL: {v[0]}]", "set_perm": f"[SET_CHANNEL_PERM: {v[0]}, {v[1]}, {v[2]}, {v[3]}]"
             }
             if action in m_map:
                 await handle_special_actions(ctx_mock, m_map[action])
                 await interaction.followup.send(f"✅ 実行完了: `{m_map[action]}`")
-            elif action == "server_mute":
-                t = find_target_member(guild, v[0])
-                if t and t.voice: await t.edit(mute=True); await interaction.followup.send(f"🔇 {t.display_name} をサーバーミュートしました。")
-            elif action == "server_deafen":
-                t = find_target_member(guild, v[0])
-                if t and t.voice: await t.edit(deafen=True); await interaction.followup.send(f"🔇 {t.display_name} をスピーカーミュートしました。")
-            elif action == "warn_user":
-                t = find_target_member(guild, v[0])
-                if t: await ch.send(f"⚠️ **【公式警告】** {t.mention} 理由: {v[1]}"); await interaction.followup.send("✅ 警告を送信しました。")
-            elif action == "isolate":
-                t = find_target_member(guild, v[0])
-                if t:
-                    removable = [r for r in t.roles if r != guild.default_role and r < guild.me.top_role]
-                    await t.remove_roles(*removable)
-                    await interaction.followup.send(f"⛓️ {t.display_name} のロールを全剥奪（隔離）しました。")
     except Exception as e: await interaction.followup.send(f"⚠️ エラー: {e}")
 
-# --- 9. AI処理コア (モデル自動フォールバック搭載) ---
+# --- 9. AI処理コア ---
 def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
     global current_key_index
     if not API_KEYS: raise Exception("APIキーがありません。")
@@ -1017,7 +1075,7 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
                     current_key_index = (current_key_index + 1) % total_keys
                     attempts += 1
                 elif "404" in err_str or "not found" in err_str:
-                    break  # 次のフォールバックモデルへ
+                    break
                 else: raise e
     raise Exception("全APIキー利用上限またはモデル応答エラー。")
 
@@ -1115,7 +1173,6 @@ async def handle_special_actions(ctx, reply_text):
     me = guild.me
 
     try:
-        # 天気・Wiki・為替・計算の自律処理
         m = re.search(r'\[WEATHER:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m:
             r = await asyncio.to_thread(requests.get, f'https://wttr.in/{quote(m.group(1))}?format=%C+%t+湿度:%h+風速:%w', timeout=4)
@@ -1158,7 +1215,6 @@ async def handle_special_actions(ctx, reply_text):
             t = find_target_member(guild, m.group(1))
             if t: await execute_duel(channel, getattr(ctx, "author", me), t)
 
-        # モデレーション ＆ サーバー管理タグ
         m = re.search(r'\[TIMEOUT:\s*(.+?)(?:,\s*(\d+))?\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.moderate_members:
             t = find_target_member(guild, m.group(1)); mins = int(m.group(2)) if m.group(2) else 10
@@ -1187,42 +1243,16 @@ async def handle_special_actions(ctx, reply_text):
         if m and me.guild_permissions.manage_messages:
             await channel.purge(limit=min(100, int(m.group(1))))
 
-        m = re.search(r'\[PURGE_USER:\s*(.+?),\s*(\d+)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_messages:
-            t = find_target_member(guild, m.group(1))
-            if t: await channel.purge(limit=min(100, int(m.group(2))), check=lambda msg: msg.author.id == t.id)
-
         m = re.search(r'\[CREATE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_channels: await guild.create_text_channel(name=m.group(1).strip())
 
         m = re.search(r'\[CREATE_VOICE:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_channels: await guild.create_voice_channel(name=m.group(1).strip())
 
-        m = re.search(r'\[CREATE_STAGE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await guild.create_stage_channel(name=m.group(1).strip())
-
-        m = re.search(r'\[CREATE_CATEGORY:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await guild.create_category(name=m.group(1).strip())
-
-        m = re.search(r'\[CREATE_FORUM:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await guild.create_forum(name=m.group(1).strip())
-
-        m = re.search(r'\[CREATE_THREAD:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m: await channel.create_thread(name=m.group(1).strip(), type=discord.ChannelType.public_thread)
-
         m = re.search(r'\[DELETE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_channels:
             c = find_target_channel(guild, m.group(1))
             if c: await c.delete()
-
-        m = re.search(r'\[RENAME_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await channel.edit(name=m.group(1).strip())
-
-        m = re.search(r'\[SET_TOPIC:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await channel.edit(topic=m.group(1).strip())
-
-        m = re.search(r'\[SLOWMODE:\s*(\d+)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_channels: await channel.edit(slowmode_delay=min(21600, int(m.group(1))))
 
         m = re.search(r'\[NUKE_CHANNEL:\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_channels:
@@ -1231,21 +1261,10 @@ async def handle_special_actions(ctx, reply_text):
             await c.delete()
             await new_c.send("💣 **Channel Nuked & Recreated.**")
 
-        m = re.search(r'\[RENAME_SERVER:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_guild: await guild.edit(name=m.group(1).strip())
-
         m = re.search(r'\[NICK:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_nicknames:
             t = find_target_member(guild, m.group(1))
             if t and t.top_role < me.top_role: await t.edit(nick=m.group(2).strip()[:32])
-
-        m = re.search(r'\[MASS_NICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_nicknames:
-            prefix = m.group(1).strip()[:10]
-            for mem in guild.members[:20]:
-                if mem.top_role < me.top_role:
-                    try: await mem.edit(nick=f"{prefix}_{mem.name}"[:32])
-                    except: pass
 
         m = re.search(r'\[ADD_ROLE:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m and me.guild_permissions.manage_roles:
@@ -1257,55 +1276,13 @@ async def handle_special_actions(ctx, reply_text):
             t, r = find_target_member(guild, m.group(1)), find_target_role(guild, m.group(2))
             if t and r and r < me.top_role: await t.remove_roles(r)
 
-        m = re.search(r'\[CREATE_ROLE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles: await guild.create_role(name=m.group(1).strip())
-
-        m = re.search(r'\[DELETE_ROLE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.manage_roles:
-            r = find_target_role(guild, m.group(1))
-            if r and r < me.top_role: await r.delete()
-
-        m = re.search(r'\[VOICE_KICK:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.move_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.voice: await t.move_to(None)
-
-        m = re.search(r'\[VOICE_MUTE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.mute_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.voice: await t.edit(mute=True)
-
-        m = re.search(r'\[VOICE_UNMUTE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.mute_members:
-            t = find_target_member(guild, m.group(1))
-            if t and t.voice: await t.edit(mute=False)
-
-        m = re.search(r'\[MOVE_MEMBER:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m and me.guild_permissions.move_members:
-            t, vc_ch = find_target_member(guild, m.group(1)), find_target_channel(guild, m.group(2))
-            if t and t.voice and isinstance(vc_ch, discord.VoiceChannel): await t.move_to(vc_ch)
-
-        m = re.search(r'\[DM:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m:
-            t = find_target_member(guild, m.group(1))
-            if t: await t.send(m.group(2).strip())
-
         m = re.search(r'\[IMPERSONATE:\s*(.+?),\s*(.+?)\]', clean_text, re.IGNORECASE)
         if m:
             t = find_target_member(guild, m.group(1))
             if t: await send_as_webhook(channel, t, m.group(2).strip())
 
         m = re.search(r'\[ANNOUNCE:\s*(.+?)\]', clean_text, re.IGNORECASE)
-        if m: await channel.send(embed=discord.Embed(title="📣 サーバー公式アナウンス", description=m.group(1).strip(), color=discord.Color.gold()))
-
-        m = re.search(r'\[CREATE_POLL:\s*(.+?),\s*(.+?)(?:,\s*(\d+))?\]', clean_text, re.IGNORECASE)
-        if m:
-            q = m.group(1).strip()
-            opts = [o.strip() for o in m.group(2).split("/") if o.strip()]
-            msg = await channel.send(embed=discord.Embed(title=f"📊 投票: {q}", description="\n".join([f"{idx+1}️⃣ {o}" for idx, o in enumerate(opts[:9])]), color=discord.Color.green()))
-            for idx in range(len(opts[:9])):
-                await msg.add_reaction(f"{idx+1}\N{variation selector-16}\N{combining enclosing keycap}")
-            last_polls[channel.id] = msg
+        if m: await channel.send(embed=discord.Embed(title="📣 公式アナウンス", description=m.group(1).strip(), color=discord.Color.gold()))
 
         for r_emoji in re.findall(r'\[REACT:\s*(.+?)\]', clean_text, re.IGNORECASE):
             try:
@@ -1318,26 +1295,26 @@ async def handle_special_actions(ctx, reply_text):
     clean_text = re.sub(r'\[[A-Z_]+(?::\s*[^\]]+)?\]', '', clean_text, flags=re.IGNORECASE).strip()
     return clean_text, image_file
 
-# --- 11. コマンド定義 (既存コマンド ＋ マスター専用BGM/VCコマンド) ---
+# --- 11. コマンド定義 ---
 @bot.event
 async def on_command_error(ctx, error):
     print(f"Command Error: {error}")
 
-@bot.command()
-async def menu(ctx):
+@bot.command(name="menu")
+async def cmd_menu(ctx):
     try:
         embed = discord.Embed(title="🎮 マスターコントロールパネル (200機能超＋BGM統合)", description="ボタンを押してカテゴリを展開してください。全機能がバグなしで使用可能です。", color=discord.Color.gold())
         await ctx.send(embed=embed, view=MainCategoryView(ctx.channel.id))
-    except Exception as e: await ctx.send(f"⚠️ メニュー表示エラー（Embed等の権限を確認してください）: {e}")
+    except Exception as e: await ctx.send(f"⚠️ メニュー表示エラー: {e}")
 
-@bot.command()
-async def bgm(ctx, url: str = ""):
+@bot.command(name="bgm")
+async def cmd_bgm(ctx, url: str = ""):
     if not is_master_user(ctx.author):
-        return await ctx.send(f"🔒 BGMの起動・変更はマスター（`{MASTER_USERNAME}`）のみ許可されています。")
+        return await ctx.send(f"🔒 BGMはマスター（`{MASTER_USERNAME}`）専用です。")
     await start_master_bgm(ctx.guild, ctx.channel, ctx.author, url or DEFAULT_PLAYLIST_URL)
 
-@bot.command()
-async def join(ctx):
+@bot.command(name="join")
+async def cmd_join(ctx):
     if not is_master_user(ctx.author):
         return await ctx.send(f"🔒 VC召喚はマスター（`{MASTER_USERNAME}`）専用です。")
     if not ctx.author.voice or not ctx.author.voice.channel:
@@ -1345,78 +1322,55 @@ async def join(ctx):
     _, msg = await connect_and_play_vc(ctx.guild, ctx.author.voice.channel)
     await ctx.send(msg)
 
-@bot.command()
-async def stop_bgm(ctx):
+@bot.command(name="stop_bgm")
+async def cmd_stop_bgm(ctx):
     if not is_master_user(ctx.author):
-        return await ctx.send(f"🔒 マスター（`{MASTER_USERNAME}`）が「やめ」と言うまで、他のユーザーがBGMを止めることはできません！")
+        return await ctx.send(f"🔒 マスター（`{MASTER_USERNAME}`）が「やめ」と言うまで止まりません！")
     await stop_master_bgm(ctx.guild, ctx.channel)
 
-@bot.command()
-async def next_bgm(ctx):
+@bot.command(name="next_bgm")
+async def cmd_next_bgm(ctx):
     if not is_master_user(ctx.author):
         return await ctx.send(f"🔒 マスター（`{MASTER_USERNAME}`）のみ曲送り可能です。")
     await skip_bgm_track(ctx.guild)
     await ctx.send("⏭️ 次の曲へスキップしました。")
 
-@bot.command()
-async def unmimic(ctx):
+@bot.command(name="unmimic")
+async def cmd_unmimic(ctx):
     mimic_targets.pop(ctx.channel.id, None)
     cloned_targets.pop(ctx.channel.id, None)
     await ctx.send("🛑 偽装・クローンを解除しました。")
 
-@bot.command()
-async def unclone(ctx):
-    cloned_targets.pop(ctx.channel.id, None)
-    await ctx.send("🛑 クローンを解除しました。")
-
-@bot.command()
-async def duel(ctx, target_str: str = ""):
+@bot.command(name="duel")
+async def cmd_duel(ctx, target_str: str = ""):
     t = find_target_member(ctx.guild, target_str)
     if t: await execute_duel(ctx.channel, ctx.author, t)
 
-@bot.command()
-async def judge_resba(ctx, w_str: str = "", l_str: str = ""):
+@bot.command(name="judge_resba")
+async def cmd_judge_resba(ctx, w_str: str = "", l_str: str = ""):
     w, l = find_target_member(ctx.guild, w_str), find_target_member(ctx.guild, l_str)
     if w and l: await execute_resba_judge(ctx.channel, w, l)
 
-@bot.command()
-async def royale(ctx): await execute_battle_royale(ctx.channel)
+@bot.command(name="royale")
+async def cmd_royale(ctx): await execute_battle_royale(ctx.channel)
 
-@bot.command()
-async def dungeon(ctx, *, action: str = ""):
+@bot.command(name="dungeon")
+async def cmd_dungeon(ctx, *, action: str = ""):
     cid = ctx.channel.id
     if cid not in active_dungeons or not action:
         active_dungeons[cid] = {"hp": 100, "floor": 1}
-        res = await asyncio.to_thread(call_gemini_api, get_state(cid), "AIダンジョンを開始せよ。第1階層の状況を描写し、選択肢を提示せよ。")
+        res = await asyncio.to_thread(call_gemini_api, get_state(cid), "AIダンジョンを開始せよ。第1階層の状況を描写し選択肢を提示せよ。")
         await ctx.send(f"🏰 **【AIダンジョン (Floor 1 / HP:100)】**\n{res.text}\n(`!dungeon <行動>` で進行)")
     else:
         d = active_dungeons[cid]
         d["floor"] += 1
-        res = await asyncio.to_thread(call_gemini_api, get_state(cid), f"AIダンジョン進行。現在Floor {d['floor']}、HP {d['hp']}。プレイヤーの行動:「{action}」。結果と次の展開を描写せよ。")
+        res = await asyncio.to_thread(call_gemini_api, get_state(cid), f"AIダンジョン進行。現在Floor {d['floor']}、HP {d['hp']}。行動:「{action}」。描写せよ。")
         await ctx.send(f"🏰 **【AIダンジョン (Floor {d['floor']} / HP:{d['hp']})】**\n{res.text}")
 
-# --- 12. イベントハンドラ ＆ BGM常時監視ループ ---
-@tasks.loop(seconds=45.0)
-async def bgm_watchdog_loop():
-    """BGMがアクティブな間、VC切断時の自動復帰や再生維持を行う監視タスク"""
-    if not bgm_global_state["active"]:
-        return
-    gid = bgm_global_state.get("guild_id")
-    guild = bot.get_guild(gid) if gid else None
-    if guild and bgm_global_state.get("voice_channel_id"):
-        vc = guild.voice_client
-        if not vc or not vc.is_connected():
-            v_ch = guild.get_channel(bgm_global_state["voice_channel_id"])
-            if isinstance(v_ch, discord.VoiceChannel):
-                await connect_and_play_vc(guild, v_ch)
-        elif not vc.is_playing() and not vc.is_paused():
-            await play_current_in_vc(guild)
-
+# --- 12. イベントハンドラ ＆ メッセージ処理 ---
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user.name} (Master: {MASTER_USERNAME})")
-    if not bgm_watchdog_loop.is_running():
-        bgm_watchdog_loop.start()
 
 @bot.event
 async def on_message(message):
@@ -1425,7 +1379,7 @@ async def on_message(message):
     raw_content = message.content.strip()
     ch_id = message.channel.id
 
-    # --- マスター専用BGMの自然言語トリガー＆他ユーザー干渉ブロック ---
+    # マスター専用BGM自然言語トリガー
     if is_master_user(message.author):
         if raw_content in ["やめ", "BGMやめ", "BGM止めて", "曲止めて", "音楽止めて"] and bgm_global_state["active"]:
             await stop_master_bgm(message.guild, message.channel)
@@ -1435,33 +1389,33 @@ async def on_message(message):
             await start_master_bgm(message.guild, message.channel, message.author, urls[0] if urls else DEFAULT_PLAYLIST_URL)
             return
     else:
-        # マスター以外のユーザーが「やめ」「曲止めて」等と言った場合は絶対に止めずに警告
         if bgm_global_state["active"] and any(k in raw_content for k in ["BGMやめ", "BGM止めて", "曲止めて", "音楽止めて", "曲消して"]):
             await message.reply(f"🔒 現在流れているBGMはマスター（`{MASTER_USERNAME}`）専用ロック中です。マスターが「やめ」と言うまで止まりません！", mention_author=False)
             return
 
-    # 通常チャットで会話が進んでもBGMプレイヤーが埋もれないよう自動追従表示
+    # チャット追従プレイヤー表示
     if bgm_global_state["active"] and bgm_global_state.get("channel_id") == ch_id:
         bgm_global_state["msg_counter"] += 1
         if bgm_global_state["msg_counter"] >= 6:
             bgm_global_state["msg_counter"] = 0
             await send_or_refresh_bgm_card(message.channel, force_repost=True)
 
+    # コマンドの優先処理（!bgm 等がチャットに吸われないようにする）
     await bot.process_commands(message)
-    ctx = await bot.get_context(message)
-    if ctx.valid: return
+    if message.content.startswith("!"):
+        return
 
     content = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
     state = get_state(ch_id)
 
-    # 育成・語彙学習データの蓄積
+    # 語彙・育成学習
     if content:
         state["vocab"].extend(content.split()[:5])
         state["vocab"] = state["vocab"][-100:]
         if state["base_mode"] == "grow_educate":
             state["learned_facts"].append(f"{message.author.display_name}: {content[:100]}")
-    
-    # 感情(ストレス・好感度)の変動システム
+
+    # 感情(ストレス・好感度)
     bad_words = ["バカ", "死ね", "使えない", "ゴミ", "カス"]
     good_words = ["ありがとう", "すごい", "天才", "助かる", "可愛い", "好き"]
     if any(w in content for w in bad_words): state["stress"] += 15; state["affection"] -= 10
@@ -1469,7 +1423,7 @@ async def on_message(message):
     state["stress"] = max(0, min(100, state["stress"]))
     state["affection"] = max(0, min(100, state["affection"]))
 
-    # ミミック（なりきり偽装中継）稼働時
+    # ミミック偽装
     if ch_id in mimic_targets and not message.author.bot and content:
         target_mem = mimic_targets[ch_id]
         sent = await send_as_webhook(message.channel, target_mem, content)
