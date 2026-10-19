@@ -81,7 +81,7 @@ class FastHTTP:
         now = time.time()
         for k in [k for k, v in cls._cache.items() if now - v[0] > 400]: cls._cache.pop(k, None)
 
-# --- 2. AI APIキープール ＆ プロンプト定義 (完全維持＋推論強化) ---
+# --- 2. AI APIキープール ＆ プロンプト定義 ---
 API_KEYS = [k.strip() for k in os.environ.get("GEMINI_API_KEY", "").split(",") if k.strip()]
 GROQ_KEYS = [k.strip() for k in os.environ.get("GROQ_API_KEY", "").split(",") if k.strip()]
 OPENROUTER_KEYS = [k.strip() for k in os.environ.get("OPENROUTER_API_KEY", "").split(",") if k.strip()]
@@ -418,7 +418,7 @@ class ActionContext:
     def __init__(self, interaction: discord.Interaction):
         self.guild, self.channel, self.author, self.reference = interaction.guild, interaction.channel, interaction.user, None
 
-# --- 5. 機能辞書定義 (全170機能＋全モード100%完全維持) ---
+# --- 5. 機能辞書定義 (全170機能＋全モード完全維持) ---
 BASE_MODES = {
     "normal_full": "通常(有能)", "normal_chat": "純粋会話", "auto_full": "自動有能",
     "auto_stream": "配信コメント", "quote_search": "名言検索", "meigen_search": "迷言検索",
@@ -921,7 +921,9 @@ async def execute_modal_action(ch, guild, ctx_mock, action, vals, interaction):
         elif action == "mod_pokemon":
             try:
                 d = await FastHTTP.get_json(f"https://pokeapi.co/api/v2/pokemon/{quote(v0.lower().strip())}", ttl=600)
-                emb = discord.Embed(title=f"⚡ No.{d['id']} {d['name'].upper()}", description=f"タイプ: `{', '.join(t['type']['name'] for t in d['types'])}`\n種族値: `{' / '.join(f'{s[\"stat\"][\"name\"]}:{s[\"base_stat\"]}' for s in d['stats'])}`", color=discord.Color.gold())
+                types_str = ", ".join(t["type"]["name"] for t in d["types"])
+                stats_str = " / ".join(f"{s['stat']['name']}:{s['base_stat']}" for s in d["stats"])
+                emb = discord.Embed(title=f"⚡ No.{d['id']} {d['name'].upper()}", description=f"タイプ: `{types_str}`\n種族値: `{stats_str}`", color=discord.Color.gold())
                 if d["sprites"]["front_default"]: emb.set_thumbnail(url=d["sprites"]["front_default"])
                 await interaction.followup.send(embed=emb)
             except Exception: await interaction.followup.send("⚠️ ポケモン未検出（番号または英語名で指定）")
@@ -1192,7 +1194,7 @@ RP_MAP = {
     "rp_cyber": "サイバーパンクAI。ハッキング用語や機械的なノイズ混じり。", "rp_samurai": "武士。古風な言葉遣い「～でござる」「拙者」。",
     "rp_ninja": "忍者。「ニンニン」「～でござるよ」語尾。", "rp_maid": "メイド。「ご主人様」「お嬢様」と徹底して奉仕する丁寧な態度。",
     "rp_mad": "マッドサイエンティスト。「フゥーハハハ！」と笑い人体実験を好む。", "rp_baby": "赤ん坊。「ばぶー」「あうー」しか言えないが奇跡的に意思疎通する。",
-    "rp_old": "頑固な老人。「ワシは」「～じゃ」と説教くさいが知恵袋。", "rp_god": "全知全能の神。人間をちっぽけな存在として慈しみ、裁きを下す。",
+    "rp_old": "頑固老人。「ワシは」「～じゃ」と説教くさいが知恵袋。", "rp_god": "全知全能の神。人間をちっぽけな存在として慈しみ、裁きを下す。",
     "rp_demon": "魔王。人間を絶望させるための甘い言葉や残酷な提案を囁く。", "rp_animal": "動物。言葉は喋れず鳴き声と仕草のみで反応。",
     "rp_yakuza": "極道。「オウ」「～じゃワレ」などドスを利かせた怒声。", "rp_idol": "トップアイドル。キラキラしたファンサとプロ意識で対応。",
     "rp_hacker": "天才ハッカー。キーボードを叩く音や暗号を交えて話す。"
@@ -1296,7 +1298,6 @@ def call_gemini_api(state, payload, is_bot_opponent=False, clone_prompt=None):
 # --- 9. コマンド ＆ 不死身Keep-Aliveバックグラウンドタスク ---
 @tasks.loop(minutes=5.0)
 async def immortal_watchdog_loop():
-    """Renderの15分無通信スリープ＆メモリ肥大化を防ぐ自己維持タスク"""
     FastHTTP.purge_cache()
     gc.collect()
     ext_url = os.environ.get("RENDER_EXTERNAL_URL") or f"http://127.0.0.1:{os.environ.get('PORT', 8080)}"
@@ -1379,7 +1380,6 @@ async def on_message(message):
 
     raw_clean = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
 
-    # ★ モード・メンション一切関係なしの絶対即応ギミック（双方向完全対応）
     if not message.author.bot:
         if "下の人におしっこかけちゃお" in raw_clean:
             return await message.channel.send("上の人のおしっこ飲むズラ")
