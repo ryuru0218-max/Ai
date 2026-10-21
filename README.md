@@ -1,7 +1,35 @@
-# POCHI ULTIMATE — 自律Discordエージェント & 公式ダッシュボード
+# POCHI ULTIMATE — 自律Discordエージェント & AIチャットサイト
 
-Discord Bot（**1ファイル / 11,900行**）と、実装済みの公式Webダッシュボードを一体化したものです。
-外部API・Mod・自動修復・空気感オートノミーまで-containedで動作します。
+Discord Bot（**1ファイル 12,000行**）と、**友達と会話を共有できるAIチャットサイト**を一体化したものです。
+外部API・Mod・自動修復・空気感オートノミーまですべてこの1ファイルにcontainedされています。
+
+---
+
+## 💬 AIチャットサイト（メイン）
+
+**招待リンク**（6文字のコード）を送ると、友達と同じ部屋に入り、
+**同じ会話をリアルタイム共有**できます
+（SSE / タイピング表示 / 参加者一覧 / Markdown書き出し）。
+
+| 機能 | 詳細 |
+|---|---|
+| 招待リンク | 6文字コード + URL。リンクを送ればそのまま参加 |
+| リアルタイム | SSE 配信で友達のメッセージが即時に届く / タイピング表示 |
+| AI 設定 | 会話モード26種・人格35種・応答スタイル8種を部屋ごとに切替 |
+| メモリ | 会話は永続化され、POCHIの長期記憶にも連携 |
+| 書き出し | 会話をMarkdownでダウンロード |
+
+REST API：
+```
+POST /api/chat/rooms                     部屋作成 / 招待コードで参加
+GET  /api/chat/rooms/{id}/messages       メッセージ取得
+POST /api/chat/rooms/{id}/messages       メッセージ送信(AI応答は非同期生成)
+GET  /api/chat/stream/{id}               SSE リアルタイム
+GET  /api/chat/rooms/{id}/export         Markdown書き出し
+```
+
+### 監視ダッシュボード
+`/dashboard` で内部状態（CPU/メモリ/AI/記憶/市場/ログ/コンソール）を確認できます。
 
 ---
 
@@ -9,8 +37,8 @@ Discord Bot（**1ファイル / 11,900行**）と、実装済みの公式Webダ�
 
 | 用途 | リンク |
 |---|---|
-| **公式サイト（GitHub Pages）** | **https://ryuru0218-max.github.io/Ai/** ← すぐに開けます |
-| **ダッシュボード** | **https://pochi-ai.onrender.com/** |
+| **チャットサイト** | **https://pochi-ai.onrender.com/** |
+| ダッシュボード | https://pochi-ai.onrender.com/dashboard |
 | 生存確認 | https://pochi-ai.onrender.com/healthz |
 | メトリクス (Prometheus) | https://pochi-ai.onrender.com/metrics |
 | 状態 JSON | https://pochi-ai.onrender.com/api/status |
@@ -113,6 +141,7 @@ python main.py --preflight    # 起動前チェック(サイトの公開可否�
 | `render.yaml` | Render Blueprint（デプロイ設定） |
 | `README.md` | このファイル（機能一覧・リンク） |
 | `docs/index.html` | 公式トップページ（GitHub Pages で公開） |
+| `web/chat.html` | AIチャットサイトの本体（`/` で配信） |
 
 ---
 

@@ -35,6 +35,7 @@ import json
 import gzip
 import math
 import time
+import queue
 import random
 import string
 import base64
@@ -2359,6 +2360,10 @@ def call_ai(state: dict, payload, is_bot_opponent: bool = False,
 
 def local_reasoning(state: dict, text: str, council: dict | None = None) -> str:
     """APIキー不要で成立するルールベース応答エンジン(フォールバック兼オフライン動作)。"""
+    # プロンプト包みの場合は「発言本文」だけを抽出する(エコー防止)
+    m = re.search(r"今\s*\S+\s*が言った[:：]\s*「(.+?)」", text or "", re.S)
+    if m:
+        text = m.group(1)
     emo = sentiment_score(text)
     intent = detect_intent(text)
     rp = state.get("rp_mode", "none")
@@ -4426,6 +4431,7 @@ mimic_targets: dict[int, object] = {}
 last_polls: dict[int, object] = {}
 bot_stats = {"calls": 0, "errors": 0, "latencies": deque(maxlen=200), "start_time": time.time(),
              "tags_executed": 0, "replies": 0}
+MAIN_LOOP: "asyncio.AbstractEventLoop | None" = None
 
 
 def get_state(cid: int) -> dict:
@@ -7499,6 +7505,8 @@ async def memory_maintenance_loop():
 # --- イベントハンドラ --------------------------------------------------------
 @bot.event
 async def on_ready():
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
     LOG.info(f"ログイン完了: {bot.user.name} / モデル {CONFIG['MODEL']} / "
              f"Geminiキー {len(CONFIG['GEMINI_KEYS'])}")
     public = CONFIG.get("POCHI_PUBLIC_URL") or f"http://127.0.0.1:{CONFIG['PORT']}"
@@ -8614,8 +8622,252 @@ MODS = ModInstaller()
 
 
 # =============================================================================
+#  SECTION 16.5 -  AI CHAT SITE(友達と共有できる会話ルーム)
+# =============================================================================
+CHAT_STYLES = {
+    "normal": "標準", "short": "簡潔", "detail": "詳細", "funny": "ユーモア",
+    "polite": "丁寧", "casual": "カジュアル", "teacher": "先生風", "business": "ビジネス",
+}
+
+
+class ChatStore:
+    """チャットルーム・メッセージ・参加者の管理(SQLite永続化)。"""
+
+    def __init__(self, path: str = DB_PATH):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
+        self.subscribers: dict[str, set] = defaultdict(set)
+        self.presence: dict[str, dict] = defaultdict(dict)   # room -> {member: last_seen}
+        with self.lock:
+            self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS rooms(
+                id TEXT PRIMARY KEY, code TEXT UNIQUE, name TEXT, created REAL,
+                mode TEXT DEFAULT 'normal_full', persona TEXT DEFAULT 'none',
+                style TEXT DEFAULT 'normal', owner TEXT
+            );
+            CREATE TABLE IF NOT EXISTS chat_messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT, role TEXT, author TEXT,
+                text TEXT, ts REAL, meta TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_room ON chat_messages(room, id);
+            """)
+            self.conn.commit()
+
+    def _new_code(self) -> str:
+        alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        with self.lock:
+            for _ in range(200):
+                code = "".join(random.choice(alphabet) for _ in range(6))
+                if not self.conn.execute("SELECT 1 FROM rooms WHERE code=?", (code,)).fetchone():
+                    return code
+        return uuid.uuid4().hex[:6].upper()
+
+    def create_room(self, name: str, owner: str = "", mode: str = "normal_full",
+                    persona: str = "none", style: str = "normal") -> dict:
+        room_id = uuid.uuid4().hex[:16]
+        code = self._new_code()
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO rooms(id, code, name, created, mode, persona, style, owner) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (room_id, code, name or "POCHIの部屋", time.time(), mode, persona, style, owner))
+            self.conn.commit()
+        return self.get_room(room_id)
+
+    def get_room(self, room_id: str) -> dict | None:
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
+            if row is None:
+                row = self.conn.execute("SELECT * FROM rooms WHERE code=?", (room_id,)).fetchone()
+        return self._room_dict(row) if row else None
+
+    def get_room_by_code(self, code: str) -> dict | None:
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM rooms WHERE code=?",
+                                    ((code or "").strip().upper(),)).fetchone()
+        return self._room_dict(row) if row else None
+
+    def _room_dict(self, row) -> dict:
+        rid = row["id"]
+        with self.lock:
+            cnt = self.conn.execute(
+                "SELECT COUNT(*) c FROM chat_messages WHERE room=? AND role='user'", (rid,)).fetchone()["c"]
+            last = self.conn.execute(
+                "SELECT COUNT(*) c FROM chat_messages WHERE room=?", (rid,)).fetchone()["c"]
+        return {"id": rid, "code": row["code"], "name": row["name"],
+                "created": row["created"], "mode": row["mode"], "persona": row["persona"],
+                "style": row["style"], "owner": row["owner"],
+                "messages": last, "members": cnt,
+                "url": f"{self.public_base()}/room/{row['code']}"}
+
+    @staticmethod
+    def public_base() -> str:
+        return ((CONFIG.get("POCHI_PUBLIC_URL") or "").rstrip("/")
+                or f"http://127.0.0.1:{CONFIG['PORT']}")
+
+    def set_settings(self, room_id: str, mode: str = "", persona: str = "", style: str = "") -> None:
+        sets, vals = [], []
+        for k, v in (("mode", mode), ("persona", persona), ("style", style)):
+            if v:
+                sets.append(f"{k}=?")
+                vals.append(v)
+        if not sets:
+            return
+        with self.lock:
+            self.conn.execute(f"UPDATE rooms SET {','.join(sets)} WHERE id=?", (*vals, room_id))
+            self.conn.commit()
+
+    # ---- メッセージ ----
+    def add_message(self, room_id: str, role: str, author: str, text: str,
+                    meta: dict | None = None) -> dict:
+        with self.lock:
+            cur = self.conn.execute(
+                "INSERT INTO chat_messages(room, role, author, text, ts, meta) VALUES(?,?,?,?,?,?)",
+                (room_id, role, author or "POCHI", text, time.time(),
+                 json.dumps(meta or {}, ensure_ascii=False)))
+            self.conn.commit()
+            mid = cur.lastrowid
+        return {"id": mid, "room": room_id, "role": role, "author": author or "POCHI",
+                "text": text, "ts": time.time(), "kind": "message"}
+
+    def messages(self, room_id: str, after: int = 0, limit: int = 200) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM chat_messages WHERE room=? AND id>? ORDER BY id ASC LIMIT ?",
+                (room_id, after, limit)).fetchall()
+        out = []
+        for r in rows:
+            try:
+                meta = json.loads(r["meta"] or "{}")
+            except Exception:  # noqa: BLE001
+                meta = {}
+            out.append({"id": r["id"], "role": r["role"], "author": r["author"],
+                        "text": r["text"], "ts": r["ts"], "kind": "message", "meta": meta})
+        return out
+
+    def participants(self, room_id: str) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT author, COUNT(*) c, MAX(ts) last FROM chat_messages "
+                "WHERE room=? GROUP BY author", (room_id,)).fetchall()
+        now = time.time()
+        out = []
+        for r in rows:
+            last_seen = self.presence.get(room_id, {}).get(r["author"], r["last"])
+            out.append({"name": r["author"], "count": r["c"],
+                        "online": (now - last_seen) < 60, "is_ai": r["author"] == "POCHI"})
+        out.sort(key=lambda p: (-p["count"], p["name"]))
+        return out
+
+    def touch(self, room_id: str, member: str) -> None:
+        with self.lock:
+            self.presence[room_id][member] = time.time()
+
+    def export_markdown(self, room_id: str) -> str:
+        room = self.get_room(room_id)
+        if not room:
+            return "# 部屋が見つかりません"
+        msgs = self.messages(room_id, 0, 1000)
+        lines = [f"# {room['name']} — POCHI CHAT 書き出し",
+                 f"招待コード: {room['code']} / 作成: {datetime.fromtimestamp(room['created'], JST):%Y-%m-%d %H:%M}",
+                 f"共有URL: {room['url']}", "", "---", ""]
+        last_day = ""
+        for m in msgs:
+            day = datetime.fromtimestamp(m["ts"], JST).strftime("%Y-%m-%d")
+            if day != last_day:
+                lines += [f"## {day}", ""]
+                last_day = day
+            who = "POCHI" if m["role"] == "ai" else m["author"]
+            lines.append(f"**{who}** ({datetime.fromtimestamp(m['ts'], JST):%H:%M})  \n{m['text']}\n")
+        return "\n".join(lines)
+
+    # ---- リアルタイム通知 ----
+    def subscribe(self, room_id: str) -> "asyncio.Queue":
+        q: asyncio.Queue = asyncio.Queue()
+        with self.lock:
+            self.subscribers[room_id].add(q)
+        return q
+
+    def unsubscribe(self, room_id: str, q) -> None:
+        with self.lock:
+            self.subscribers[room_id].discard(q)
+
+    def publish(self, room_id: str, payload: dict) -> None:
+        with self.lock:
+            subs = list(self.subscribers.get(room_id, ()))
+        for q in subs:
+            try:
+                q.put_nowait(payload)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def stats(self) -> dict:
+        with self.lock:
+            rooms = self.conn.execute("SELECT COUNT(*) c FROM rooms").fetchone()["c"]
+            msgs = self.conn.execute("SELECT COUNT(*) c FROM chat_messages").fetchone()["c"]
+        return {"rooms": rooms, "messages": msgs,
+                "live_rooms": len([r for r, s in self.subscribers.items() if s])}
+
+
+CHAT = ChatStore()
+
+
+CHAT_SYSTEM_HINT = (
+    "あなたは部屋で友達と雑談しているAI「POCHI」です。部屋の参加者全員に発言して聞こえます。"
+    "直近の会話の文脈を踏まえ、自然に続けてください。"
+)
+
+
+async def _chat_reply(room_id: str, text: str, author: str, mode: str, persona: str, style: str):
+    """POCHI の応答を生成して保存・配信する。"""
+    try:
+        room = CHAT.get_room(room_id)
+        if room is None:
+            return
+        history = CHAT.messages(room_id, 0, 40)
+        convo = "\n".join(
+            f"{'POCHI' if m['role'] == 'ai' else m['author']}: {m['text']}" for m in history[-14:])
+        state = {"base_mode": mode if mode in BASE_MODES else "normal_full",
+                 "rp_mode": persona if persona in RP_MODES else "none",
+                 "ai_engine": "gemini", "history": [], "count": 0, "stress": 0, "affection": 60,
+                 "vocab": [], "learned_facts": []}
+        style_hint = {
+            "short": "短く(2文以内)で。", "detail": "詳しく。背景と具体例も。",
+            "funny": "ユーモラスに。", "polite": "丁寧に。", "casual": "カジュアルに。",
+            "teacher": "先生のように、データで説明してください。",
+            "business": "簡潔に業務寄りで。",
+        }.get(style, "")
+        prompt = (f"{CHAT_SYSTEM_HINT}\n{style_hint}\n"
+                  f"会話履歴:\n{convo}\n"
+                  f"今 {author} が言った: 「{text}」\n"
+                  f"POCHI としての返信を1つ出力してください。")
+        council = await COUNCIL.deliberate(text, state)
+        res = await asyncio.to_thread(call_ai, state, prompt, False, None, council)
+        reply = (res.text or "").strip() or "…考え中です。"
+        if len(reply) > 3800:
+            reply = reply[:3800] + "…"
+        CHAT.add_message(room_id, "ai", "POCHI", reply,
+                         {"mode": mode, "persona": persona, "style": style,
+                          "engine": res.engine, "latency_ms": round(res.latency_ms)})
+        with contextlib.suppress(Exception):
+            MEMORY.remember(f"[{room['code']}] {author}: {text} / POCHI: {reply[:120]}",
+                            "chat", {"room": room_id, "author": author})
+        CHAT.publish(room_id, {"type": "message"})
+        CHAT.publish(room_id, {"type": "typing", "on": False})
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"chat reply failed: {exc}")
+        with contextlib.suppress(Exception):
+            CHAT.add_message(room_id, "ai", "POCHI", f"⚠️ 応答生成に失敗しました: {exc}")
+            CHAT.publish(room_id, {"type": "message"})
+            CHAT.publish(room_id, {"type": "typing", "on": False})
+
+
+# =============================================================================
 #  SECTION 16 -  WEB APPLICATION(公式ダッシュボード / REST API / SSE)
 # =============================================================================
+
+
 class WebApp:
     """依存ゼロ(標準ライブラリのみ)のWebアプリケーション。
 
@@ -8675,6 +8927,129 @@ def _json_bytes(payload) -> bytes:
     return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
 
 
+@WEB.route("GET", "/api/chat/config")
+def _r_chat_config(params, query, body, headers):
+    """チャットUI用のドロップダウンオプション。"""
+    return 200, {"modes": BASE_MODES, "personas": RP_MODES, "styles": CHAT_STYLES,
+                 "model": CONFIG["MODEL"], "ai_ready": bool(
+                     CONFIG["GEMINI_KEYS"] or CONFIG["GROQ_KEYS"] or CONFIG["OPENROUTER_KEYS"])}
+
+
+def _chat_html() -> bytes:
+    """チャットサイトのHTMLを返す(web/chat.html)。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "chat.html")
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+@WEB.route("GET", "/chat")
+def _r_chat_page(params, query, body, headers):
+    return 200, _chat_html(), "text/html; charset=utf-8"
+
+
+@WEB.route("GET", "/room/{code}")
+def _r_chat_room_page(params, query, body, headers):
+    return 200, _chat_html(), "text/html; charset=utf-8"
+
+
+@WEB.route("POST", "/api/chat/rooms")
+def _r_chat_create(params, query, body, headers):
+    """部屋を作成、または招待コードから参加する。"""
+    name = str((body or {}).get("name", "")).strip()[:40] or "ゲスト"
+    code = str((body or {}).get("code", "")).strip().upper()
+    member = str((body or {}).get("author", "")).strip()[:24] or name
+    if code:
+        room = CHAT.get_room_by_code(code)
+        if room is None:
+            return 404, {"error": f"招待コード {code} の部屋が見つかりません"}
+    else:
+        room = CHAT.create_room(name=name, owner=member)
+        CHAT.add_message(room["id"], "system", member,
+                         f"**{member}** が部屋「{room['name']}」を作りました。\n"
+                         f"招待コード: `{room['code']}` — 友達に共有リンクを送ってください。")
+        CHAT.publish(room["id"], {"type": "message"})
+    CHAT.touch(room["id"], member)
+    room["me"] = member
+    return 200, {"room": room, "user": member}
+
+
+@WEB.route("GET", "/api/chat/rooms/{rid}")
+def _r_chat_room(params, query, body, headers):
+    room = CHAT.get_room(params["rid"])
+    if room is None:
+        return 404, {"error": "部屋が見つかりません"}
+    member = str((query.get("me") or [""])[0]) or room.get("owner") or "ゲスト"
+    CHAT.touch(room["id"], member)
+    room["me"] = member
+    return 200, {"room": room, "participants": CHAT.participants(room["id"]),
+                 "modes": BASE_MODES, "personas": RP_MODES, "styles": CHAT_STYLES}
+
+
+@WEB.route("GET", "/api/chat/rooms/{rid}/messages")
+def _r_chat_messages(params, query, body, headers):
+    room = CHAT.get_room(params["rid"])
+    if room is None:
+        return 404, {"error": "部屋が見つかりません"}
+    try:
+        after = int((query.get("after") or ["0"])[0])
+    except (TypeError, ValueError):
+        after = 0
+    member = str((query.get("me") or [""])[0])
+    if member:
+        CHAT.touch(room["id"], member)
+    return 200, {"room": room, "messages": CHAT.messages(room["id"], after),
+                 "participants": CHAT.participants(room["id"]),
+                 "modes": BASE_MODES, "personas": RP_MODES, "styles": CHAT_STYLES}
+
+
+@WEB.route("POST", "/api/chat/rooms/{rid}/messages")
+def _r_chat_post(params, query, body, headers):
+    """メッセージ投稿 → POCHI が応答を生成する(非同期で配信)。"""
+    room = CHAT.get_room(params["rid"])
+    if room is None:
+        return 404, {"error": "部屋が見つかりません"}
+    text = str((body or {}).get("text", "")).strip()[:4000]
+    author = str((body or {}).get("author", "")).strip()[:24] or "ゲスト"
+    if not text:
+        return 400, {"error": "メッセージが空です"}
+    mode = str((body or {}).get("mode", room["mode"]))[:32]
+    persona = str((body or {}).get("persona", room["persona"]))[:32]
+    style = str((body or {}).get("style", room["style"]))[:32]
+    CHAT.set_settings(room["id"], mode, persona, style)
+    CHAT.touch(room["id"], author)
+    CHAT.add_message(room["id"], "user", author, text)
+    CHAT.publish(room["id"], {"type": "message"})
+    CHAT.publish(room["id"], {"type": "typing", "on": True})
+    # 応答生成はバックグラウンドで(リクエストを待たせない)
+    # HTTPスレッドにはイベントループが無いので本体のループへ run_coroutine_threadsafe で投げる
+    loop = MAIN_LOOP
+    if loop is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _chat_reply(room["id"], text, author, mode, persona, style), loop)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warn(f"chat reply scheduling failed: {exc}")
+    else:
+        # まだループ未起動(オフライン時)なら同期的に生成
+        with contextlib.suppress(Exception):
+            asyncio.run(_chat_reply(room["id"], text, author, mode, persona, style))
+    return 200, {"ok": True, "room": CHAT.get_room(room["id"])}
+
+
+@WEB.route("GET", "/api/chat/rooms/{rid}/export")
+def _r_chat_export(params, query, body, headers):
+    room = CHAT.get_room(params["rid"])
+    if room is None:
+        return 404, {"error": "部屋が見つかりません"}
+    return 200, CHAT.export_markdown(room["id"]).encode("utf-8"), "text/markdown; charset=utf-8"
+
+
+@WEB.route("GET", "/api/chat/stream/{rid}")
+def _r_chat_stream(params, query, body, headers):
+    """SSE: 新しいメッセージ/参加者更新を配信する。"""
+    return 200, "stream", None
+
+
 @WEB.route("GET", "/api/health")
 def _r_health(params, query, body, headers):
     return 200, {"status": "healthy" if GOV.mode != "CRITICAL" else "degraded",
@@ -8721,6 +9096,7 @@ def _r_status(params, query, body, headers):
         "playlists": len(PLAYLISTS.list(0)),
         "trends": {str(cid): TRENDS.analyze(cid) for cid in list(TRENDS.series)[:8]},
         "web": dict(WEB.stats),
+        "chat": CHAT.stats(),
         "public_url": CONFIG.get("POCHI_PUBLIC_URL", ""),
         "web_token_protected": bool(CONFIG.get("POCHI_WEB_TOKEN")),
     }
@@ -8871,9 +9247,15 @@ def _r_config(params, query, body, headers):
                  if isinstance(v, (str, int, float, bool)) and "KEY" not in k and "TOKEN" not in k}
 
 
-@WEB.route("GET", "/")
+@WEB.route("GET", "/dashboard")
 def _r_index(params, query, body, headers):
     return 200, DASHBOARD_HTML, "text/html; charset=utf-8"
+
+
+@WEB.route("GET", "/")
+def _r_home(params, query, body, headers):
+    """トップはチャットサイト(友達と共有できる会話)。"""
+    return 200, _chat_html(), "text/html; charset=utf-8"
 
 
 @WEB.route("GET", "/favicon.ico")
@@ -9435,6 +9817,9 @@ class _WebHandler(BaseHTTPRequestHandler):
         WEB.stats["requests"] += 1
         if path == "/api/stream":
             return self._sse()
+        if path.startswith("/api/chat/stream/"):
+            rid = path.rsplit("/", 1)[-1]
+            return self._chat_sse(rid, (query.get("me") or [""])[0])
         result = WEB.dispatch("GET", path, query, {}, self.headers)
         if result is None:
             return self._respond(404, {"error": "not found", "path": path})
@@ -9456,6 +9841,68 @@ class _WebHandler(BaseHTTPRequestHandler):
         ctype = result[2] if len(result) > 2 else "application/json; charset=utf-8"
         raw = ctype.startswith("text/")
         self._respond(status, payload, ctype, raw)
+
+    def _chat_sse(self, room_id: str, member: str):
+        """チャットルームのSSE(新しいメッセージ/参加者更新を配信)。
+
+        HTTPスレッドとasyncioループは別スレッドなので、
+        ループ側 → スレッド側へ queue.Queue で橋渡しする。
+        """
+        room = CHAT.get_room(room_id)
+        if room is None:
+            return self._respond(404, {"error": "room not found"})
+        out_q: "queue.Queue" = queue.Queue()
+        loop = MAIN_LOOP
+        if loop is not None:
+            def _spawn():
+                async def _pump():
+                    q = CHAT.subscribe(room["id"])
+                    try:
+                        while True:
+                            payload = await q.get()
+                            if member:
+                                CHAT.touch(room["id"], member)
+                            if payload.get("type") == "participants":
+                                payload["participants"] = CHAT.participants(room["id"])
+                            out_q.put(payload)
+                    except asyncio.CancelledError:
+                        raise
+                    finally:
+                        CHAT.unsubscribe(room["id"], q)
+                return asyncio.ensure_future(_pump())
+
+            try:
+                asyncio.run_coroutine_threadsafe(_spawn(), loop)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warn(f"chat sse spawn failed: {exc}")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            with contextlib.suppress(Exception):
+                self.wfile.write(("data: " + json.dumps(
+                    {"type": "participants",
+                     "participants": CHAT.participants(room["id"])},
+                    ensure_ascii=False) + "\n\n").encode("utf-8"))
+                self.wfile.flush()
+            while True:
+                try:
+                    payload = out_q.get(timeout=15.0)
+                except queue.Empty:
+                    with contextlib.suppress(Exception):
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                    if member:
+                        CHAT.touch(room["id"], member)
+                    continue
+                with contextlib.suppress(Exception):
+                    self.wfile.write(("data: " + json.dumps(payload, ensure_ascii=False)
+                                      + "\n\n").encode("utf-8"))
+                    self.wfile.flush()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _sse(self):
         """Server-Sent Events: リアルタイム指標を5秒間隔で配信。"""
