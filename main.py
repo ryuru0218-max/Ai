@@ -2349,33 +2349,117 @@ class FastHTTP:
             cls._cache.pop(k, None)
 
 
+def _urllib_fetch(url: str, headers: dict | None = None, timeout: float = 15.0,
+                  retries: int = 3) -> tuple[int, bytes]:
+    """標準ライブラリのみで HTTP(S) を取得する(requests/aiohttp 不在時のフォールバック)。
+    - 一時的な接続リセット/429/5xx は指数バックオフで再試行
+    - WAF が User-Agent によって 403/404 を返すサイトがあるため UA もローテーションする
+    """
+    import ssl
+    import urllib.error
+    import urllib.request
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    base_headers = dict(headers or {})
+    uas = list(FastHTTP.USER_AGENTS)
+    if base_headers.get("User-Agent"):
+        uas.insert(0, base_headers["User-Agent"])
+    last_exc: Exception | None = None
+    ua_index = 0
+    for attempt in range(max(1, retries)):
+        req_headers = dict(base_headers)
+        req_headers["User-Agent"] = uas[ua_index % len(uas)]
+        req = urllib.request.Request(url, headers=req_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code in (403, 404) and len(uas) > 1:
+                # UA 依存のブロックなら別の UA で試す
+                ua_index += 1
+                continue
+            if exc.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    return 0, b""
+
+
+def _requests_fetch(url: str, headers: dict | None = None, timeout: float = 15.0,
+                    retries: int = 3) -> tuple[int, bytes]:
+    """requests を使った取得。403/404 の場合は User-Agent をローテーションして再試行。"""
+    base = dict(headers or {})
+    uas = list(FastHTTP.USER_AGENTS)
+    if base.get("User-Agent"):
+        uas.insert(0, base["User-Agent"])
+    last_exc: Exception | None = None
+    for attempt in range(max(1, retries)):
+        h = dict(base)
+        h["User-Agent"] = uas[attempt % len(uas)]
+        try:
+            r = requests.get(url, headers=h, timeout=timeout)
+            if r.status_code in (403, 404) and len(uas) > 1 and attempt < retries - 1:
+                continue
+            return r.status_code, r.content
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    return 0, b""
+
+
 def _sync_get_text(url: str, headers: dict | None = None) -> str:
-    if not HAS_REQUESTS:
-        return ""
+    if HAS_REQUESTS:
+        try:
+            status, body = _requests_fetch(url, headers, 12.0)
+            return body.decode("utf-8", "replace") if status == 200 else ""
+        except Exception:  # noqa: BLE001
+            return ""
     try:
-        r = requests.get(url, headers=headers or {"User-Agent": FastHTTP.USER_AGENTS[0]}, timeout=12)
-        return r.text if r.status_code == 200 else ""
+        status, body = _urllib_fetch(url, headers, 15.0)
+        return body.decode("utf-8", "replace") if status == 200 else ""
     except Exception:  # noqa: BLE001
         return ""
 
 
 def _sync_get_json(url: str):
-    if not HAS_REQUESTS:
-        return None
+    if HAS_REQUESTS:
+        try:
+            status, body = _requests_fetch(url, None, 12.0)
+            return json.loads(body.decode("utf-8", "replace")) if status == 200 else None
+        except Exception:  # noqa: BLE001
+            return None
     try:
-        r = requests.get(url, timeout=12,
-                         headers={"User-Agent": FastHTTP.USER_AGENTS[0]})
-        return r.json() if r.status_code == 200 else None
+        status, body = _urllib_fetch(url, None, 15.0)
+        return json.loads(body.decode("utf-8", "replace")) if status == 200 else None
     except Exception:  # noqa: BLE001
         return None
 
 
 def _sync_get_bytes(url: str) -> bytes | None:
-    if not HAS_REQUESTS:
-        return None
+    if HAS_REQUESTS:
+        try:
+            status, body = _requests_fetch(url, None, 20.0)
+            return body if status == 200 else None
+        except Exception:  # noqa: BLE001
+            return None
     try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": FastHTTP.USER_AGENTS[0]})
-        return r.content if r.status_code == 200 else None
+        status, body = _urllib_fetch(url, None, 25.0)
+        return body if status == 200 else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -2397,6 +2481,19 @@ def strip_html(html: str) -> str:
     return re.sub(r"\s+", " ", _html.unescape(text)).strip()
 
 
+def _ddg_clean_url(url: str) -> str:
+    """DuckDuckGo のリダイレクトURL(//duckduckgo.com/l/?uddg=...)を実URLへ展開する。"""
+    if not url:
+        return url
+    if url.startswith("//"):
+        url = "https:" + url
+    if "duckduckgo.com/l/" in url and "uddg=" in url:
+        m = re.search(r"uddg=([^&]+)", url)
+        if m:
+            return unquote(m.group(1))
+    return url
+
+
 def parse_ddg_results(html: str, limit: int = 6) -> list[dict]:
     """DuckDuckGo HTML版をパースして検索結果配列にする(bs4なしでも動作)。"""
     out: list[dict] = []
@@ -2410,15 +2507,15 @@ def parse_ddg_results(html: str, limit: int = 6) -> list[dict]:
                 sn = res.select_one(".result__snippet")
                 if a:
                     out.append({"title": a.get_text(" ", strip=True),
-                                "url": a.get("href", ""),
+                                "url": _ddg_clean_url(a.get("href", "")),
                                 "snippet": sn.get_text(" ", strip=True) if sn else ""})
             if out:
                 return out
     # フォールバック: 正規表現による粗い抽出
-    for m in re.finditer(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, re.S):
-        title = strip_html(m.group(2))
-        url = m.group(1)
-        out.append({"title": title, "url": url, "snippet": ""})
+    for m in re.finditer(r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.S):
+        out.append({"title": strip_html(m.group(2)),
+                    "url": _ddg_clean_url(m.group(1)),
+                    "snippet": ""})
         if len(out) >= limit:
             break
     return out
@@ -2541,8 +2638,11 @@ async def api_earthquake() -> str:
     for x in data:
         eq = x.get("earthquake", {})
         hypo = eq.get("hypocenter", {})
-        lines.append(f"・**{hypo.get('name', '不明')}** M{eq.get('magnitude', '?')} "
-                     f"(最大震度 {eq.get('maxScale', 0) // 10}) {eq.get('time', '')}")
+        # magnitude は hypocenter 配下にある(APIの入れ子構造に依存しないよう両方を参照)
+        mag = hypo.get("magnitude", eq.get("magnitude", "?"))
+        scale = eq.get("maxScale", 0) or 0
+        lines.append(f"・**{hypo.get('name', '不明')}** M{mag} "
+                     f"(最大震度 {scale // 10}) {eq.get('time', x.get('time', ''))}")
     return "🌋 **最新地震情報**\n" + ("\n".join(lines) or "データなし")
 
 
@@ -2569,13 +2669,46 @@ async def api_pokemon(name_or_id: str) -> str:
 
 
 async def api_anime(title: str) -> str:
+    """Jikan API (キー不要)。失敗時は AniList GraphQL へフォールバック。"""
     data = await FastHTTP.get_json(f"https://api.jikan.moe/v4/anime?q={quote(title)}&limit=1", ttl=600)
-    if not data or not data.get("data"):
-        return "⚠️ アニメが見つかりません"
-    a = data["data"][0]
-    return (f"🎬 **{a.get('title_japanese') or a.get('title')}**\n"
-            f"⭐{a.get('score', 'N/A')} / {a.get('episodes', '?')}話 / {a.get('year', '?')}年\n"
-            f"{(a.get('synopsis') or '')[:600]}\n{a.get('url', '')}")
+    if data and data.get("data"):
+        a = data["data"][0]
+        return (f"🎬 **{a.get('title_japanese') or a.get('title')}**\n"
+                f"⭐{a.get('score', 'N/A')} / {a.get('episodes', '?')}話 / {a.get('year', '?')}年\n"
+                f"{(a.get('synopsis') or '')[:600]}\n{a.get('url', '')}")
+    # フォールバック: AniList GraphQL(SDL, キー不要)
+    query = ('query ($s: String) { Media(search: $s, type: ANIME) { id title { romaji native } '
+             'description(asHtml: false) averageScore episodes startDate { year } siteUrl } }')
+    gq = await FastHTTP.get_json("https://graphql.anilist.co",
+                                 ttl=600,
+                                 headers={"Content-Type": "application/json"})
+    if gq is None:
+        # GET ではなく POST が 필요한ため、urllib で直接投げる
+        body = json.dumps({"query": query, "variables": {"s": title}}).encode("utf-8")
+        try:
+            import urllib.request
+            import ssl
+            req = urllib.request.Request(
+                "https://graphql.anilist.co", data=body,
+                headers={"Content-Type": "application/json",
+                         "User-Agent": FastHTTP.USER_AGENTS[0]})
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+                gq = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001
+            gq = None
+    media = ((gq or {}).get("data") or {}).get("Media")
+    if media:
+        desc = (media.get("description") or "")[:600]
+        desc = re.sub(r"<[^>]+>", "", desc)
+        title_txt = (media.get("title") or {}).get("native") or (media.get("title") or {}).get("romaji")
+        return (f"🎬 **{title_txt}**\n"
+                f"⭐{media.get('averageScore', 'N/A')} / {media.get('episodes', '?')}話 / "
+                f"{(media.get('startDate') or {}).get('year', '?')}年\n"
+                f"{desc}\n{media.get('siteUrl', '')}")
+    return "⚠️ アニメが見つかりません"
 
 
 async def api_trivia() -> str:
@@ -2623,16 +2756,29 @@ async def api_lyrics(artist: str, title: str) -> str:
 
 
 async def api_dictionary(word: str) -> str:
+    """英単語の定義。dictionaryapi.dev を優先し、失敗時は Wiktionary へフォールバック。"""
     data = await FastHTTP.get_json(
         f"https://api.dictionaryapi.dev/api/v2/entries/en/{quote(word)}", ttl=3600)
-    if not data or not isinstance(data, list):
-        return f"⚠️ 英単語「{word}」の定義が見つかりません"
-    d = data[0]
-    meanings = []
-    for m in d.get("meanings", [])[:3]:
-        defs = "; ".join(x.get("definition", "") for x in m.get("definitions", [])[:3])
-        meanings.append(f"({m.get('partOfSpeech','')}) {defs}")
-    return f"📖 **{d.get('word', word)}**\n" + "\n".join(meanings)
+    if data and isinstance(data, list):
+        d = data[0]
+        meanings = []
+        for m in d.get("meanings", [])[:3]:
+            defs = "; ".join(x.get("definition", "") for x in m.get("definitions", [])[:3])
+            meanings.append(f"({m.get('partOfSpeech', '')}) {defs}")
+        if meanings:
+            return f"📖 **{d.get('word', word)}**\n" + "\n".join(meanings)
+    # フォールバック: Wiktionary REST (キー不要)
+    wk = await FastHTTP.get_json(
+        f"https://en.wiktionary.org/api/rest_v1/word/{quote(word)}/definition", ttl=3600)
+    if isinstance(wk, list) and wk:
+        lines = []
+        for entry in wk[:2]:
+            part = entry.get("partOfSpeech", "")
+            for df in entry.get("definitions", [])[:3]:
+                lines.append(f"({part}) {df.get('definition', '')[:180]}")
+        if lines:
+            return f"📖 **{word}**\n" + "\n".join(lines[:6])
+    return f"⚠️ 英単語「{word}」の定義が見つかりません"
 
 
 async def api_ddg_news(query: str = "") -> str:
@@ -2645,15 +2791,15 @@ async def api_ddg_news(query: str = "") -> str:
 
 
 async def api_github_trending() -> str:
+    """GitHub Trending のスクレイピング(bs4 なしでもリポジトリ名と説明を抽出)。"""
     html = await FastHTTP.get_text("https://github.com/trending?since=daily", ttl=600)
     if not html:
         return "⚠️ GitHub トリンディング取得失敗"
+    lines: list[str] = []
     if HAS_BS4:
         with contextlib.suppress(Exception):
             soup = bs4.BeautifulSoup(html, "html.parser")
-            rows = soup.select("article.Box-row")[:6]
-            lines = []
-            for row in rows:
+            for row in soup.select("article.Box-row")[:6]:
                 h2 = row.select_one("h2 a")
                 if not h2:
                     continue
@@ -2661,10 +2807,28 @@ async def api_github_trending() -> str:
                 desc_el = row.select_one("p")
                 desc = desc_el.get_text(" ", strip=True) if desc_el else ""
                 stars = row.select_one("a[href$='/stargazers']")
-                lines.append(f"・**{repo}** ⭐{stars.get_text(strip=True) if stars else '?'}\n  {truncate(desc, 120)}")
-            if lines:
-                return "💻 **GitHub Trending**\n" + "\n".join(lines)
-    return "💻 **GitHub Trending**\n" + truncate(strip_html(html), 1200)
+                lines.append(f"・**{repo}** ⭐{stars.get_text(strip=True) if stars else '?'}\n"
+                             f"  {truncate(desc, 120)}")
+    if not lines:
+        # フォールバック: h2 内のリポジトリパスと説明文を正規表現で拾う
+        for m in re.finditer(
+                r'<h2[^>]*>\s*<a[^>]*href="/([^"]+)"[^>]*>(.*?)</a>.*?</h2>(.*?)</article>',
+                html, re.S):
+            repo = m.group(1).strip()
+            if not repo or repo.count("/") != 1:
+                continue
+            desc = ""
+            dm = re.search(r'<p[^>]*>(.*?)</p>', m.group(3), re.S)
+            if dm:
+                desc = truncate(strip_html(dm.group(1)), 120)
+            sm = re.search(r'href="/[^"]+/stargazers"[^>]*>(.*?)</a>', m.group(3), re.S)
+            stars = strip_html(sm.group(1)).strip() if sm else "?"
+            lines.append(f"・**{repo}** ⭐{stars}\n  {desc}")
+            if len(lines) >= 6:
+                break
+    if lines:
+        return "💻 **GitHub Trending**\n" + "\n".join(lines)
+    return "💻 **GitHub Trending**\n" + truncate(strip_html(html), 1000)
 
 
 async def api_exchange_rate_list() -> str:

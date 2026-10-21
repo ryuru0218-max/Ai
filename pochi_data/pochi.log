@@ -38,3 +38,15 @@
 09:20:07 [INFO   ] Pocket[dice] メモリ展開完了 (関数: ['run'])
 09:20:07 [INFO   ] Pocket[t_dice] メモリ展開完了 (関数: ['run'])
 09:20:07 [INFO   ] Pocket[hotplug] メモリ展開完了 (関数: ['run'])
+09:26:47 [INFO   ] Pocket[selftest] メモリ展開完了 (関数: ['run'])
+09:26:47 [INFO   ] KeepAliveサーバーを port=8082 で起動
+09:26:49 [INFO   ] Pocket[dice] メモリ展開完了 (関数: ['run'])
+09:26:49 [INFO   ] Pocket[t_dice] メモリ展開完了 (関数: ['run'])
+09:26:49 [INFO   ] Pocket[hotplug] メモリ展開完了 (関数: ['run'])
+09:27:20 [INFO   ] Pocket[selftest] メモリ展開完了 (関数: ['run'])
+09:27:20 [INFO   ] KeepAliveサーバーを port=8082 で起動
+09:27:23 [INFO   ] Pocket[dice] メモリ展開完了 (関数: ['run'])
+09:27:23 [INFO   ] Pocket[t_dice] メモリ展開完了 (関数: ['run'])
+09:27:23 [INFO   ] Pocket[hotplug] メモリ展開完了 (関数: ['run'])
+09:27:34 [WARN   ] Cloud Restore スキップ: 'Bot' object has no attribute 'guilds'
+09:28:01 [WARN   ] Cloud Restore スキップ: 'Bot' object has no attribute 'guilds'
