@@ -2400,7 +2400,7 @@ def local_reasoning(state: dict, text: str, council: dict | None = None) -> str:
     if emo["valence"] < -0.4:
         emo_note = "\n※相手の熱量がやや高め。荒々しくならないよう添え、敷衍は禁止。"
     elif emo["valence"] > 0.4:
-        emo_note = "\n※对方的情绪是正向的。可以稍微加大热情和玩笑。"
+        emo_note = "\n※相手は楽しんでいる。熱量を多一些、冗談も多めに。"
     return f"{head}{body}{emo_note}"
 
 # =============================================================================
@@ -3203,7 +3203,7 @@ class MusicManager:
                 "volume": self.volume}
 
     def render_waveform(self, seed: str = "", bars: int = 32) -> str:
-        """疑似波形バー(音楽 Sistemsの视觉效果)。"""
+        """疑似波形バー(音楽システムの視覚効果)。"""
         h = hashlib.sha256(seed.encode()).digest()
         out = []
         for i in range(bars):
@@ -8881,9 +8881,9 @@ class ChatStore:
             lines.append(f"**{who}** ({datetime.fromtimestamp(m['ts'], JST):%H:%M})  \n{m['text']}\n")
         return "\n".join(lines)
 
-    # ---- リアルタイム通知 ----
-    def subscribe(self, room_id: str) -> "asyncio.Queue":
-        q: asyncio.Queue = asyncio.Queue()
+    # ---- リアルタイム通知(thread-safe / ループ非依存) ----------------------
+    def subscribe(self, room_id: str) -> "queue.Queue":
+        q: queue.Queue = queue.Queue()
         with self.lock:
             self.subscribers[room_id].add(q)
         return q
@@ -8920,14 +8920,221 @@ class ChatStore:
 CHAT = ChatStore()
 
 
+class ConversationBrain:
+    """APIキーなしでも自然に会話できる文脈応答エンジン。"""
+
+    GREET = [
+        "やあ、{who}。今日の話題は何？",
+        "こんにちは。何かお手伝いできることは？",
+        "よー。今日はどんな一日？",
+        "はじめまして。よろしくお願いします。",
+    ]
+    THANKS = [
+        "こちらこそ。何かあればいつでもどうぞ。",
+        "どういたしまして。いつでも声をかけてね。",
+        "こちらこそ。よい時間だったよ。",
+    ]
+    BYE = [
+        "またね。いい一日を！",
+        "じゃあ、また。いつでもどうぞ。",
+        "お疲れさま。またいつでもね。",
+    ]
+    CASUAL = [
+        "{topic} って話、面白いね。もう少し詳しく聞いてもいい？",
+        "うん、{topic} のその視点は新しいね。あなたはどう思う？",
+        "なるほど。{topic} からもっと広げられるかもしれないね。",
+        "へぇ、{topic} ってことは結構大事だね。どこを深掘りしようか。",
+    ]
+    ASK = [
+        "{topic} について考えるなら、3つに分けると分かりやすいよ。\n"
+        "・まず目的を確定する\n・次に手段を選ぶ\n・最後に検証方法を決める\n"
+        "あなたは今どのあたりの話から入りたい？",
+        "{topic} ってことは歴史的に重要なポイントだと思う。\n"
+        "最初に「何を達成したいか」を決めると、残りの手順は自ずと出てくるよ。\n"
+        "そのゴールは決まってる？",
+        "{topic} なら、まずは一番動かしやすい部分から試すのがおすすめ。\n"
+        "小さな試作を一つ作って、反応を見てから広げるのが早い。\n"
+        "今の状況ってどう？",
+    ]
+    HOWTO = [
+        "{topic} の進め方ならこう。\n"
+        "1) 目的と「完了」の定義を確定する\n"
+        "2) 動かせる最小構成を作って試す\n"
+        "3) 結果を見ながら機能を増やす\n"
+        "1番目が一番大事で、ここを固めると全部が楽になるよ。",
+        "{topic} なら手順は这么简单。\n"
+        "・対象を1つだけ決める\n・手早い方法から試す\n・結果を見てから増やす\n"
+        "まず何から手をつきたい？",
+    ]
+    EMOTION = [
+        "{topic} のことだとしんどくなるよね。話してくれてありがとう。\n"
+        "もう少し詳しく聞いてもいいかな？",
+        "きつかったね。{topic} のことを自分でも抱えてるから、わかるよ。\n"
+        "休むのも大事だから、無理しないでね。",
+        "その気持ち、よくわかる。{topic} について話せるの、少し安心するんじゃない？",
+    ]
+    OPINION = [
+        "{topic} について私の見解は、効果の大部分は実行の粒度で決まると思う。\n"
+        "粗い粒度だとうまくいかないけど、細かい粒度なら可能性がある。\n"
+        "あなたなら成功の基準をどう設定する？",
+        "{topic} のポイントは「やるか否か」よりも、どこで終わりを定義するかだと思う。\n"
+        "そのゴールを一緒に決めたいね。",
+    ]
+    LIST = [
+        "{topic} を整理するならこの3つ。\n"
+        "・目的：何をしたいか\n・手段：どう実現するか\n・検証：効果を測る方法\n"
+        "どれから深掘りしたい？",
+    ]
+
+    def __init__(self):
+        self._last_topic = ""
+
+    # ---- 意図判定 --------------------------------------------------------
+    EMOTION_WORDS = ("疲れた", "疲い", "きつい", "しんどい", "鬱", "泣", "辛い", "嫌だ",
+                     "悲しい", "無理だ", "絶望", " tired", "sad", "exhausted", "exhausted")
+    BYE_WORDS = ("さようなら", "またね", "ばいばい", "bye", "おやすみ", "じゃあね", "また明日",
+                 "また今度", "じゃあと", "失礼")
+    HOWTO_WORDS = ("お願い", "して", "作って", "書いて", "教えて", "how to", "方法", "手順",
+                   "やり方", "(strategy", "howto")
+
+    def classify(self, text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return "empty"
+        if re.search(r"(ありがとう|ありがと|thank|thx)", t, re.I):
+            return "thanks"
+        if any(w in t for w in self.BYE_WORDS) or re.search(r"\bbye\b", t, re.I):
+            return "bye"
+        if re.search(r"^(こんにちは|こんばんは|おはよう|はじめまして|hey|hi |hello|やあ|よー|ご)", t, re.I):
+            return "greet"
+        if any(w in t for w in self.HOWTO_WORDS) or re.search(r"how to|方法|手順", t, re.I):
+            return "howto"
+        if re.search(r"(\?|？|なぜ|どうして|how|why|what|いつ|どこ|誰|何|如何)", t):
+            return "ask"
+        if re.search(r"(你觉得|どう思う|意見|看法|认为|opinion|どう考える)", t):
+            return "opinion"
+        if re.search(r"(列表|要点|まとめ|列举|step|步骤|ポイント)", t):
+            return "list"
+        if any(w in t for w in self.EMOTION_WORDS):
+            return "emotion"
+        emo = sentiment_score(t)
+        if emo["valence"] < -0.35:
+            return "emotion"
+        return "casual"
+
+    # ---- 話題抽出 -------------------------------------------------------
+    NOISE_SUFFIX = ("んだけど", "けど", "かな", "よね", "ですね", "です", "ます", "だよね",
+                     "かなあ", "かなぁ", "よな", "んだ", "から", "けどね")
+
+    def extract_topic(self, text: str, history: list[str] | None = None) -> str:
+        t = (text or "").strip()
+        core = re.sub(r"^(こんにちは|やあ|hey|hi|hello|それ|それで|あと|また|そう|うん|ええ|はい|いいえ)[、。!！\s]*",
+                      "", t, flags=re.I)
+        core = core.strip("。．.!！?？、 \t\n")
+        for suf in self.NOISE_SUFFIX:
+            if core.endswith(suf) and len(core) > len(suf) + 1:
+                core = core[:-len(suf)]
+                break
+        core = core.strip("。．.!！?？、 \t\n")
+        if len(core) < 2:
+            if history:
+                for h in reversed(history):
+                    if len(h.strip()) > 2:
+                        core = h.strip()[:24]
+                        break
+            core = core or self._last_topic or "それ"
+        self._last_topic = core[:24]
+        return core[:24]
+
+    # ---- 口調調整 --------------------------------------------------------
+    def _apply_style(self, text: str, style: str, persona: str) -> str:
+        if style == "short":
+            text = (text.split("。")[0] + "。") if "。" in text else text
+        elif style == "detail":
+            text += "\n\nもう少し詳しく言えば、背景と制約条件も一緒に確認したい。" \
+                    "今いちばん気になっているのはそこですか？"
+        elif style == "funny":
+            text += " （再現はいいけど、最悪の展開は出ないはず…！）"
+        elif style == "polite":
+            text = text.replace("ください", "くださいませ")
+        elif style == "business":
+            text = text.replace("ね。", "です。").replace("よ。", "です。")
+        if persona == "rp_cat":
+            text += " にゃあ。"
+        elif persona == "rp_grandma":
+            text = text.replace("ね。", "のぉ。")
+        elif persona == "rp_teacher":
+            text += " （ここが一番のポイント、ノートに残しておくと後で楽になりますよ）"
+        elif persona == "rp_dj":
+            text += " 🎧 このノーツ、選曲したくなるね。"
+        return text
+
+    def reply(self, text: str, author: str = "あなた", history: list[str] | None = None,
+              mode: str = "normal_full", persona: str = "none", style: str = "normal") -> str:
+        kind = self.classify(text)
+        topic = self.extract_topic(text, history)
+        who = f"{author}さん" if author and author not in ("POCHI", "あなた") else ""
+        pools = {
+            "greet": self.GREET, "thanks": self.THANKS, "bye": self.BYE,
+            "casual": self.CASUAL, "ask": self.ASK, "howto": self.HOWTO,
+            "emotion": self.EMOTION, "opinion": self.OPINION, "list": self.LIST,
+        }
+        pool = pools.get(kind, self.CASUAL)
+        body = random.choice(pool)
+        try:
+            body = body.format(who=who, topic=topic)
+        except Exception:  # noqa: BLE001
+            body = body.replace("{who}", who).replace("{topic}", topic)
+        return self._apply_style(body, style, persona)
+
+
+BRAIN = ConversationBrain()
+
+
 CHAT_SYSTEM_HINT = (
     "あなたは部屋で友達と雑談しているAI「POCHI」です。部屋の参加者全員に発言して聞こえます。"
     "直近の会話の文脈を踏まえ、自然に続けてください。"
 )
 
 
+def _stream_chunks(text: str, size: int = 26) -> list[str]:
+    """テキストを自然な境界で分割する(ストリーミング表示用)。"""
+    if not text:
+        return []
+    out: list[str] = []
+    buf = ""
+    for ch in text:
+        buf += ch
+        if len(buf) >= size and ch in "。、！？!?\n .・":
+            out.append(buf)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+
+def _schedule_chat_reply(room_id: str, text: str, author: str, mode: str, persona: str, style: str):
+    """チャット応答をバックグラウンドで起動する(ループ非依存)。"""
+    coro = _chat_reply(room_id, text, author, mode, persona, style)
+    loop = MAIN_LOOP
+    if loop is not None and loop.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+            return
+        except Exception as exc:  # noqa: BLE001
+            LOG.warn(f"chat reply scheduling failed: {exc}")
+            coro.close()
+    # ループが無い(スタンドアロン起動)場合は専用スレッドで実行
+    def _runner():
+        try:
+            asyncio.run(coro)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warn(f"chat reply thread failed: {exc}")
+    threading.Thread(target=_runner, name="chat-reply", daemon=True).start()
+
+
 async def _chat_reply(room_id: str, text: str, author: str, mode: str, persona: str, style: str):
-    """POCHI の応答を生成して保存・配信する。"""
+    """POCHI の応答を生成し、ストリーミングで配信する。"""
     try:
         room = CHAT.get_room(room_id)
         if room is None:
@@ -8945,18 +9152,35 @@ async def _chat_reply(room_id: str, text: str, author: str, mode: str, persona: 
             "teacher": "先生のように、データで説明してください。",
             "business": "簡潔に業務寄りで。",
         }.get(style, "")
-        prompt = (f"{CHAT_SYSTEM_HINT}\n{style_hint}\n"
-                  f"会話履歴:\n{convo}\n"
-                  f"今 {author} が言った: 「{text}」\n"
-                  f"POCHI としての返信を1つ出力してください。")
-        council = await COUNCIL.deliberate(text, state)
-        res = await asyncio.to_thread(call_ai, state, prompt, False, None, council)
-        reply = (res.text or "").strip() or "…考え中です。"
+        has_key = bool(CONFIG["GEMINI_KEYS"] or CONFIG["GROQ_KEYS"] or CONFIG["OPENROUTER_KEYS"])
+        engine = "gemini" if has_key else "local"
+        if has_key:
+            prompt = (f"{CHAT_SYSTEM_HINT}\n{style_hint}\n"
+                      f"会話履歴:\n{convo}\n"
+                      f"今 {author} が言った: 「{text}」\n"
+                      f"POCHI としての返信を1つ出力してください。")
+            council = await COUNCIL.deliberate(text, state)
+            res = await asyncio.to_thread(call_ai, state, prompt, False, None, council)
+            reply = (res.text or "").strip()
+            latency = round(res.latency_ms)
+            if not reply:
+                reply = BRAIN.reply(text, author, [m["text"] for m in history[-6:]], mode, persona, style)
+        else:
+            reply = BRAIN.reply(text, author, [m["text"] for m in history[-6:]], mode, persona, style)
+            latency = 0
+        if not reply:
+            reply = "…考え中です。"
         if len(reply) > 3800:
             reply = reply[:3800] + "…"
+        # ストリーミング配信(トーストが気持ちよくなる)
+        sid = uuid.uuid4().hex[:8]
+        CHAT.publish(room_id, {"type": "stream_start", "sid": sid, "author": "POCHI"})
+        for chunk in _stream_chunks(reply):
+            CHAT.publish(room_id, {"type": "delta", "sid": sid, "text": chunk})
+            await asyncio.sleep(0.035)
         CHAT.add_message(room_id, "ai", "POCHI", reply,
                          {"mode": mode, "persona": persona, "style": style,
-                          "engine": res.engine, "latency_ms": round(res.latency_ms)})
+                          "engine": engine, "latency_ms": latency})
         with contextlib.suppress(Exception):
             MEMORY.remember(f"[{room['code']}] {author}: {text} / POCHI: {reply[:120]}",
                             "chat", {"room": room_id, "author": author})
@@ -9131,18 +9355,8 @@ def _r_chat_post(params, query, body, headers):
     CHAT.publish(room["id"], {"type": "message"})
     CHAT.publish(room["id"], {"type": "typing", "on": True})
     # 応答生成はバックグラウンドで(リクエストを待たせない)
-    # HTTPスレッドにはイベントループが無いので本体のループへ run_coroutine_threadsafe で投げる
-    loop = MAIN_LOOP
-    if loop is not None:
-        try:
-            asyncio.run_coroutine_threadsafe(
-                _chat_reply(room["id"], text, author, mode, persona, style), loop)
-        except Exception as exc:  # noqa: BLE001
-            LOG.warn(f"chat reply scheduling failed: {exc}")
-    else:
-        # まだループ未起動(オフライン時)なら同期的に生成
-        with contextlib.suppress(Exception):
-            asyncio.run(_chat_reply(room["id"], text, author, mode, persona, style))
+    # イベントループが無くても動くよう、スレッドでも起動できるようにする
+    _schedule_chat_reply(room["id"], text, author, mode, persona, style)
     return 200, {"ok": True, "room": CHAT.get_room(room["id"])}
 
 
@@ -9957,36 +10171,13 @@ class _WebHandler(BaseHTTPRequestHandler):
     def _chat_sse(self, room_id: str, member: str):
         """チャットルームのSSE(新しいメッセージ/参加者更新を配信)。
 
-        HTTPスレッドとasyncioループは別スレッドなので、
-        ループ側 → スレッド側へ queue.Queue で橋渡しする。
+        ループ非依存のため queue.Queue でスレッド間Directorする
+        (Bot未接続のスタンドアロン起動でもリアルタイム配信が動く)。
         """
         room = CHAT.get_room(room_id)
         if room is None:
             return self._respond(404, {"error": "room not found"})
-        out_q: "queue.Queue" = queue.Queue()
-        loop = MAIN_LOOP
-        if loop is not None:
-            def _spawn():
-                async def _pump():
-                    q = CHAT.subscribe(room["id"])
-                    try:
-                        while True:
-                            payload = await q.get()
-                            if member:
-                                CHAT.touch(room["id"], member)
-                            if payload.get("type") == "participants":
-                                payload["participants"] = CHAT.participants(room["id"])
-                            out_q.put(payload)
-                    except asyncio.CancelledError:
-                        raise
-                    finally:
-                        CHAT.unsubscribe(room["id"], q)
-                return asyncio.ensure_future(_pump())
-
-            try:
-                asyncio.run_coroutine_threadsafe(_spawn(), loop)
-            except Exception as exc:  # noqa: BLE001
-                LOG.warn(f"chat sse spawn failed: {exc}")
+        q = CHAT.subscribe(room["id"])
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -10001,7 +10192,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             while True:
                 try:
-                    payload = out_q.get(timeout=15.0)
+                    payload = q.get(timeout=10.0)
                 except queue.Empty:
                     with contextlib.suppress(Exception):
                         self.wfile.write(b": ping\n\n")
@@ -10009,12 +10200,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                     if member:
                         CHAT.touch(room["id"], member)
                     continue
+                if member:
+                    CHAT.touch(room["id"], member)
+                if payload.get("type") == "participants":
+                    payload["participants"] = CHAT.participants(room["id"])
                 with contextlib.suppress(Exception):
                     self.wfile.write(("data: " + json.dumps(payload, ensure_ascii=False)
                                       + "\n\n").encode("utf-8"))
                     self.wfile.flush()
         except Exception:  # noqa: BLE001
             pass
+        finally:
+            CHAT.unsubscribe(room["id"], q)
 
     def _sse(self):
         """Server-Sent Events: リアルタイム指標を5秒間隔で配信。"""
