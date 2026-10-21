@@ -1343,24 +1343,29 @@ class SelfRepair:
         except Exception:  # noqa: BLE001
             return None
 
-    def apply(self, func, diag: dict) -> bool:
-        """書き換えた関数を同一名前空間で再バインドし、呼び出し側を熱交換する。"""
+    def apply(self, func, diag: dict):
+        """書き換えた関数を同一名前空間で再バインドし、呼び出し側を熱交換する。
+        戻り値: 成功時は新しい関数オブジェクト、失敗時は None。"""
         new_src = self.rewrite_function(func, diag)
         if not new_src:
             self.patches_failed += 1
-            return False
+            return None
         gvars = getattr(func, "__globals__", {})
         try:
             exec(compile(new_src, "<self_heal>", "exec"), gvars)
         except Exception as exc:  # noqa: BLE001
             self.patches_failed += 1
             LOG.error(f"SELF_HEAL compile failed: {exc}")
-            return False
+            return None
+        new_func = gvars.get(func.__name__)
+        if not callable(new_func):
+            self.patches_failed += 1
+            return None
         self.patches_applied += 1
         self.repairs.append({"fn": func.__name__, "diag": diag, "ts": jst_stamp()})
         self.repairs = self.repairs[-50:]
         LOG.info(f"SELF_HEAL: 関数 {func.__name__} にガードを注入しました ({diag.get('type')})")
-        return True
+        return new_func
 
     def stats(self) -> dict:
         return {"applied": self.patches_applied, "failed": self.patches_failed,
@@ -1495,15 +1500,31 @@ HEDGE_WORDS = {"たぶん", "かも", "もし", "たぶんね", "あなたの", 
 SARCASM_MARKERS = {"笑", "w", "www", "?", "!", "!!!", "ふふ", "草"}
 
 
+def _lexicon_score(text: str, lexicon: dict) -> float:
+    """辞書との一致スコアを算出する。
+    CJK は部分文字列(「バカ死ね」の中の「死ね」も拾う)、ASCII は単語境界で照合する。"""
+    if not text or not lexicon:
+        return 0.0
+    total = 0.0
+    for word, weight in lexicon.items():
+        if not word:
+            continue
+        if re.match(r"^[A-Za-z0-9 ]+$", word):
+            if re.search(rf"\b{re.escape(word)}\b", text, re.IGNORECASE):
+                total += weight
+        elif word in text:
+            total += weight
+    return total
+
+
 def sentiment_score(text: str) -> dict:
     """辞書ベースの極性スコアリング (valence / arousal / irony / toxicity)。"""
     t = text or ""
-    tokens = re.findall(r"[ぁ-んァ-ヶ一-龠A-Za-z]+", t)
-    pos = sum(POSITIVE_WORDS.get(w, 0.0) for w in tokens)
-    neg = sum(NEGATIVE_WORDS.get(w, 0.0) for w in tokens)
     exclam = t.count("!") + t.count("！")
     quest = t.count("?") + t.count("？")
     long_mark = t.count("…") + t.count("...")
+    pos = _lexicon_score(t, POSITIVE_WORDS)
+    neg = _lexicon_score(t, NEGATIVE_WORDS)
     irony = 0.0
     for m in SARCASM_MARKERS:
         if m and m in t:
@@ -1513,7 +1534,7 @@ def sentiment_score(text: str) -> dict:
     if neg < 0 and exclam > 0:
         irony += 0.15
     hedge = sum(1 for w in HEDGE_WORDS if w and w in t)
-    toxic = sum(TOXIC_WORDS.get(w, 0.0) for w in tokens)
+    toxic = _lexicon_score(t, TOXIC_WORDS)
     if exclam >= 4:
         toxic += 0.15
     if quest >= 3 and len(t) < 12:
@@ -3625,15 +3646,25 @@ def run(args):
 '''
 
     def _extract_code(self, raw: str) -> str:
-        """AI出力からPythonコードだけを抽出する。"""
+        """AI出力からPythonコードだけを抽出する。
+        先頭の import / from / def / class / @ から開始位置を確定し、
+        前置き(Markdown等)だけを除去する(import は消さない = 安全検査で見えるように)。"""
         text = (raw or "").strip()
         fence = re.search(r"```(?:python)?\n(.*?)```", text, re.S)
         if fence:
             text = fence.group(1).strip()
-        idx = text.find("def ")
-        if idx > 0:
-            text = text[idx:]
-        return text
+        lines = text.split("\n")
+        start = 0
+        for i, ln in enumerate(lines):
+            if re.match(r"^\s*(import\s|from\s|def\s|class\s|@)", ln):
+                start = i
+                break
+        else:
+            idx = text.find("def ")
+            if idx > 0:
+                return text[idx:]
+            return text
+        return "\n".join(lines[start:]).strip()
 
     # ---- 検証 & ロード ---------------------------------------------------
     def validate(self, source: str) -> tuple[bool, str, list[str]]:
@@ -7081,34 +7112,38 @@ class TaskSupervisor:
         self.log: deque = deque(maxlen=80)
 
     async def run(self, key: str, coro_factory, interval: float = 60.0):
-        """coro_factory は呼び出すたびに新しいコルーチンを返す必要がある。"""
-        self.running[key] = {"started": time.time(), "runs": 0, "last_error": ""}
-        backoff = min(300.0, max(5.0, interval))
+        """coro_factory は呼び出すたびに新しいコルーチンを返す必要がある。
+        正常時は interval 間隔で、異常時は短い遅延で再試行し試行ごとに指数的に伸ばす。"""
+        self.running[key] = {"started": time.time(), "runs": 0, "last_error": "",
+                             "failures": 0}
+        retry_delay = min(30.0, max(0.5, interval / 10))
         while True:
             try:
                 await coro_factory()
                 self.retries[key] = 0
                 self.running[key]["runs"] += 1
                 self.running[key]["last_error"] = ""
+                retry_delay = min(30.0, max(0.5, interval / 10))
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self.failed += 1
                 self.running[key]["last_error"] = f"{type(exc).__name__}: {exc}"
+                self.running[key]["failures"] = self.running[key].get("failures", 0) + 1
                 diag = REPAIR.diagnose(type(exc), exc, exc.__traceback__)
                 suggestions = REPAIR.suggest(diag)
                 self.log.append({"key": key, "error": self.running[key]["last_error"][:120],
                                  "suggest": suggestions[:2], "ts": jst_stamp()})
                 LOG.error(f"[{self.name}/{key}] タスク失敗: {exc} / 提案={suggestions[:2]}")
                 await BUS.emit("task.failed", {"key": key, "diag": diag})
-                # 診断不善でもetry して粘り強く回復する
+                # 診断が駄目でもリトライして粘り強く回復する
                 self.retries[key] += 1
                 if self.retries[key] > self.max_retries:
                     self.retries[key] = 0
-                    backoff = min(900.0, backoff * 2)
-                    LOG.warn(f"[{self.name}/{key}] リトライ上限超過。バックオフ {backoff:.0f}秒へ")
-                await asyncio.sleep(backoff)
+                    retry_delay = min(300.0, retry_delay * 2)
+                    LOG.warn(f"[{self.name}/{key}] リトライ上限超過。バックオフ {retry_delay:.0f}秒へ")
+                await asyncio.sleep(retry_delay)
 
     def status(self) -> dict:
         return {"name": self.name, "running": {k: dict(v) for k, v in self.running.items()},
@@ -7141,15 +7176,23 @@ class AutoPatcher:
         self.history: deque = deque(maxlen=40)
 
     def _extract_code(self, raw: str) -> str:
+        """AI出力からPythonコードだけを抽出する(import を残して安全検査にかけさせる)。"""
         text = (raw or "").strip()
         fence = re.search(r"```(?:python)?\n(.*?)```", text, re.S)
         if fence:
             text = fence.group(1).strip()
-        # 'def ' の直前を削る
-        idx = text.find("def ")
-        if idx > 0:
-            text = text[idx:]
-        return text
+        lines = text.split("\n")
+        start = 0
+        for i, ln in enumerate(lines):
+            if re.match(r"^\s*(import\s|from\s|def\s|class\s|@)", ln):
+                start = i
+                break
+        else:
+            idx = text.find("def ")
+            if idx > 0:
+                return text[idx:]
+            return text
+        return "\n".join(lines[start:]).strip()
 
     def build_prompt(self, func_name: str, func_src: str, diag: dict) -> str:
         frames = diag.get("frames", [])
