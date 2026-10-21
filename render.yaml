@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: pochi-ai
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: POCHI_WEB_TOKEN
+        generateValue: true
+      - key: POCHI_PUBLIC_URL
+        value: https://pochi-ai.onrender.com
+      - key: POCHI_PUBLIC_CHANNEL
+        sync: false

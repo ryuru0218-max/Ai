@@ -732,6 +732,9 @@ CONFIG = {
     "OPENROUTER_KEYS": [k.strip() for k in os.environ.get("OPENROUTER_API_KEY", "").split(",") if k.strip()],
     "OWNER_IDS": [int(x) for x in os.environ.get("OWNER_IDS", "").split(",") if x.strip().isdigit()],
     "POCHI_WEB_TOKEN": os.environ.get("POCHI_WEB_TOKEN", ""),
+    "POCHI_PUBLIC_URL": (os.environ.get("POCHI_PUBLIC_URL")
+                         or os.environ.get("RENDER_EXTERNAL_URL")
+                         or "").rstrip("/"),
     "PORT": int(os.environ.get("PORT", "8080")),
     "DATA_DIR": os.environ.get("POCHI_DATA_DIR", os.path.join(os.getcwd(), "pochi_data")),
     "PLUGIN_DIR": os.environ.get("POCHI_PLUGIN_DIR", os.path.join(os.getcwd(), "pochi_plugins")),
@@ -7498,7 +7501,11 @@ async def memory_maintenance_loop():
 async def on_ready():
     LOG.info(f"ログイン完了: {bot.user.name} / モデル {CONFIG['MODEL']} / "
              f"Geminiキー {len(CONFIG['GEMINI_KEYS'])}")
-    print(f"Logged in as {bot.user.name} (Model: {CONFIG['MODEL']} / Keys: {len(CONFIG['GEMINI_KEYS'])})")
+    public = CONFIG.get("POCHI_PUBLIC_URL") or f"http://127.0.0.1:{CONFIG['PORT']}"
+    LOG.info(f"🌐 Webダッシュボード: {public}/")
+    print(f"🌐 Webダッシュボード: {public}/")
+    print(f"   ├ 監視: {public}/healthz  / メトリクス: {public}/metrics")
+    print(f"   └ 認証トークン: {'設定済み' if CONFIG.get('POCHI_WEB_TOKEN') else '未設定(公開)'}")
     await load_cloud_backup()
     GOV.start()
     for loop in (immortal_watchdog_loop, auto_cloud_backup_loop,
@@ -8714,6 +8721,8 @@ def _r_status(params, query, body, headers):
         "playlists": len(PLAYLISTS.list(0)),
         "trends": {str(cid): TRENDS.analyze(cid) for cid in list(TRENDS.series)[:8]},
         "web": dict(WEB.stats),
+        "public_url": CONFIG.get("POCHI_PUBLIC_URL", ""),
+        "web_token_protected": bool(CONFIG.get("POCHI_WEB_TOKEN")),
     }
 
 
@@ -8999,6 +9008,7 @@ _DASHBOARD_HTML_BODY = r"""
       <span class="pill">CPU <span id="p-cpu">-</span></span>
       <span class="pill">MEM <span id="p-mem">-</span></span>
       <span class="pill">🤖 <span id="p-ai">-</span></span>
+      <a class="pill" id="p-url" href="#" target="_blank" rel="noopener">🌐 <span id="p-url-t">URL</span></a>
     </div>
   </div>
 
@@ -9337,6 +9347,7 @@ async function poll(){
   $('#p-up').textContent=fmt(s.uptime_sec);
   $('#p-cpu').textContent=s.resources.cpu+'%'; $('#p-mem').textContent=s.resources.mem_pct+'%';
   $('#p-ai').textContent=s.ai.calls;
+  if(s.public_url){$('#p-url').href=s.public_url;$('#p-url-t').textContent=s.public_url.replace(/^https?:\/\//,'');}
   if(!$('#tab-overview').classList.contains('hidden'))await ov();
  }catch(e){$('#d-health').className='dot err';$('#p-health').textContent='offline';}
 }
