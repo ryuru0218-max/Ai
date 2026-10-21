@@ -6,3 +6,4 @@ pochi_plugins/
 *.log
 .venv/
 .env
+.tmp/

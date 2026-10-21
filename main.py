@@ -744,6 +744,8 @@ CONFIG = {
         "POCHI_MODEL_FALLBACKS",
         "gemini-3.8-flash-lite,gemini-3.5-flash-lite,gemini-2.5-flash").split(",") if m],
     "MAX_CONCURRENCY": int(os.environ.get("POCHI_MAX_CONCURRENCY", "6")),
+    "AI_TIMEOUT": float(os.environ.get("POCHI_AI_TIMEOUT", "45")),
+    "AI_TOTAL_TIMEOUT": float(os.environ.get("POCHI_AI_TOTAL_TIMEOUT", "60")),
     "AUTO_AMBIENT": os.environ.get("POCHI_AUTO_AMBIENT", "1") not in ("0", "false", "False"),
     "SHELL_ALLOW": ["echo", "ls", "cat", "head", "tail", "wc", "grep", "find", "date",
                     "uname", "df", "du", "free", "ps", "uptime", "whoami", "hostname",
@@ -818,6 +820,38 @@ def safe_div(a, b, default=0.0):
 def truncate(text: str, limit: int = 1800) -> str:
     text = text or ""
     return text if len(text) <= limit else text[: limit - 2] + "…"
+
+
+# Discord操作タグ(実行対象)の正式な一覧。
+# この一覧に無い [xxx] は「リンク記法」などとして本文に残す(リンク破壊の防止)。
+ACTION_TAGS: frozenset[str] = frozenset({
+    "WEATHER", "WIKI", "SEARCH", "CALC", "CURRENCY", "IMAGE", "MUSIC", "ECON",
+    "ROYALE", "ROULETTE", "TAROT", "OMIKUJI", "SLOT", "TIMEOUT", "UNTIMEOUT",
+    "KICK", "BAN", "UNBAN", "PURGE", "PURGE_USER", "REACT", "NICK",
+    "CREATE_CHANNEL", "POLL", "END_POLL", "PIN", "UNPIN", "SILENT_MSG",
+    "ADD_ROLE", "REMOVE_ROLE", "CREATE_ROLE", "DELETE_ROLE", "COLOR_ROLE",
+    "HOIST_ROLE", "MENTIONABLE_ROLE", "RESET_NICK", "MASS_NICK", "DM",
+    "IMPERSONATE", "RENAME_CHANNEL", "SET_TOPIC", "CLONE_CHANNEL", "NUKE_CHANNEL",
+    "SET_NSFW", "SLOWMODE", "LOCK", "UNLOCK", "CREATE_CATEGORY", "CREATE_FORUM",
+    "CREATE_THREAD", "DELETE_CHANNEL", "CREATE_VOICE", "CREATE_STAGE",
+    "CREATE_EVENT", "CREATE_EMOJI", "RENAME_SERVER", "ANNOUNCE",
+    "VOICE_KICK", "VOICE_MUTE", "VOICE_UNMUTE", "SERVER_DEAFEN", "MOVE_MEMBER",
+    "CLEAR_REACTIONS", "CREATE_AUTOMOD_KEYWORD", "CREATE_AUTOMOD_SPAM",
+    "DELETE_AUTOMOD", "ISOLATE",
+})
+
+# 実行タグだけを除去する(既知タグの許可リスト方式)。
+# 旧実装の汎用正規表現は [Wikipedia](https://...) のようなMarkdownリンクを壊していた。
+_TAG_ALT = "(?:" + "|".join(sorted(ACTION_TAGS, key=len, reverse=True)) + ")"
+_TAG_STRIP_RE = re.compile(
+    r"\[" + _TAG_ALT + r"\]"          # 引数なしのタグ: [ROYALE]
+    r"|\[" + _TAG_ALT + r":\s*[^\]\n]*\]",  # 引数ありのタグ: [WEATHER: Tokyo]
+    re.IGNORECASE)
+
+
+def strip_action_tags(text: str) -> str:
+    """本文から実行用の操作タグだけを取り除く(リンク記法などは残す)。"""
+    return _TAG_STRIP_RE.sub("", text or "").strip()
 
 
 def smart_chunks(text: str, limit: int = 1900) -> list[str]:
@@ -2265,6 +2299,8 @@ def _gemini_call(model_name: str, key: str, system: str, user: str,
                  timeout: float = 30.0) -> str:
     if not HAS_GENAI:
         return ""
+    # 実リクエストにタイムアウトを適用する(応答遅延の main 原因だった)
+    req_opts = {"timeout": int(max(5, timeout))}
     try:
         genai.configure(api_key=key)
         model = genai.GenerativeModel(
@@ -2272,10 +2308,16 @@ def _gemini_call(model_name: str, key: str, system: str, user: str,
             system_instruction=system,
             generation_config={"temperature": 0.85, "top_p": 0.95, "max_output_tokens": 2500})
         if has_image:
-            res = model.generate_content(user)
+            try:
+                res = model.generate_content(user, request_options=req_opts)
+            except TypeError:
+                res = model.generate_content(user)
         else:
             chat = model.start_chat(history=list(history or []))
-            res = chat.send_message(user)
+            try:
+                res = chat.send_message(user, request_options=req_opts)
+            except TypeError:
+                res = chat.send_message(user)
         return getattr(res, "text", "") or ""
     except Exception as exc:  # noqa: BLE001
         LOG.warn(f"Gemini({model_name}) エラー: {exc}")
@@ -2307,50 +2349,109 @@ def call_ai(state: dict, payload, is_bot_opponent: bool = False,
         system = clone_prompt + mood + AUTONOMOUS_DIRECTIVE
 
     attempts: list[tuple[str, str, callable]] = []
+    ai_to = CONFIG.get("AI_TIMEOUT", 45.0)
     if engine == "groq" and GROQ_POOL.available():
         attempts.append(("groq", "llama-3.3-70b-versatile",
-                         lambda k: _openai_chat("https://api.groq.com/openai/v1/chat/completions",
-                                                k, "llama-3.3-70b-versatile", system, user_text, hist)))
+                         lambda k, t=ai_to: _openai_chat("https://api.groq.com/openai/v1/chat/completions",
+                                                       k, "llama-3.3-70b-versatile", system, user_text, hist,
+                                                       timeout=t)))
     elif engine.startswith("openrouter") and OPENROUTER_POOL.available():
         om = "deepseek/deepseek-r1:free" if engine == "openrouter_r1" else "meta-llama/llama-3.3-70b-instruct:free"
         attempts.append(("openrouter", om,
-                         lambda k, m=om: _openai_chat("https://openrouter.ai/api/v1/chat/completions",
-                                                      k, m, system, user_text, hist)))
+                         lambda k, t=ai_to, m=om: _openai_chat("https://openrouter.ai/api/v1/chat/completions",
+                                                              k, m, system, user_text, hist, timeout=t)))
     elif engine == "local":
         attempts.append(("local", "heuristic", lambda k: ""))
 
     if engine in ("gemini", "gemini_flash") or not attempts:
         pref = "gemini-3.8-flash-pro" if engine == "gemini_flash" else CONFIG["MODEL"]
         for m in [pref] + [x for x in CONFIG["MODEL_FALLBACKS"] if x != pref]:
-            attempts.append(("gemini", m, (lambda mm: lambda k: _gemini_call(mm, k, system, user_text, hist, has_image))(m)))
+            attempts.append(("gemini", m, (lambda mm: lambda k, t=ai_to: _gemini_call(
+                mm, k, system, user_text, hist, has_image, timeout=t))(m)))
         if engine == "groq" and GROQ_POOL.available():
             attempts.append(("groq", "llama-3.3-70b-versatile",
-                             lambda k: _openai_chat("https://api.groq.com/openai/v1/chat/completions",
-                                                    k, "llama-3.3-70b-versatile", system, user_text, hist)))
+                             lambda k, t=ai_to: _openai_chat("https://api.groq.com/openai/v1/chat/completions",
+                                                            k, "llama-3.3-70b-versatile", system, user_text, hist,
+                                                            timeout=t)))
         if engine.startswith("openrouter") and OPENROUTER_POOL.available():
             om = "deepseek/deepseek-r1:free" if engine == "openrouter_r1" else "meta-llama/llama-3.3-70b-instruct:free"
             attempts.append(("openrouter", om,
-                             lambda k, m=om: _openai_chat("https://openrouter.ai/api/v1/chat/completions",
-                                                          k, m, system, user_text, hist)))
+                             lambda k, t=ai_to, m=om: _openai_chat("https://openrouter.ai/api/v1/chat/completions",
+                                                                    k, m, system, user_text, hist, timeout=t)))
 
     last_err = ""
+    # --- 試行: (プロバイダ, モデル, 呼び出しFn) を並列実行して最初の一件を採用 ---
+    # 逐次実行だと「遅いモデル」「失敗するモデル」で応答が直列に遅れていた。
+    candidates: list[tuple[str, str, callable, int]] = []
     for prov, model_name, fn in attempts:
         pool = {"gemini": GEMINI_POOL, "groq": GROQ_POOL, "openrouter": OPENROUTER_POOL}.get(prov)
         if pool is None or not pool.available():
             continue
-        for _ in range(max(1, len(pool.keys))):
+        try:
+            idx, key = pool.pick()
+        except RuntimeError:
+            continue
+        candidates.append((prov, model_name, (lambda f, kk: (lambda: f(kk)))(fn, key), idx))
+        if len(candidates) >= 2:   # コストと並列度のバランス(最大2並列)
+            break
+
+    if candidates:
+        def _run(item):
+            prov, model_name, fn, idx = item
             try:
-                idx, key = pool.pick()
-            except RuntimeError:
-                continue
-            text = fn(key)
+                return item, fn()
+            except Exception as exc:  # noqa: BLE001
+                LOG.warn(f"{prov}/{model_name} 失敗: {exc}")
+                return item, ""
+
+        def _accept(item, text):
+            """成功した応答を採用して返す(Noneなら継続)。"""
+            prov, model_name, _fn, idx = item
+            pool = {"gemini": GEMINI_POOL, "groq": GROQ_POOL, "openrouter": OPENROUTER_POOL}.get(prov)
             if text and text.strip():
                 ms = (time.perf_counter() - t0) * 1000
-                pool.reward(idx, ms)
+                if pool is not None:
+                    pool.reward(idx, ms)
                 return AIResponse(text.strip(), f"{prov}:{model_name}", ms,
-                                   {"mode": mode, "engine": engine})
-            pool.penalize(idx, 30.0, f"{prov} empty response")
-            last_err = f"{prov}/{model_name}: empty"
+                                  {"mode": mode, "engine": engine})
+            if pool is not None:
+                pool.penalize(idx, 30.0, f"{prov} empty response")
+            return None
+
+        if len(candidates) == 1:
+            item, text = _run(candidates[0])
+            out = _accept(item, text)
+            if out is not None:
+                return out
+            last_err = f"{candidates[0][0]}/{candidates[0][1]}: empty"
+        else:
+            # 並列実行し、**最初に成功したものを即座に採用**する
+            # (全部終わるまで待つと、遅いモデル successful でも応答が遅くなる)
+            ex = futures.ThreadPoolExecutor(max_workers=len(candidates),
+                                            thread_name_prefix="ai")
+            deadline = time.monotonic() + CONFIG.get("AI_TOTAL_TIMEOUT", 60.0)
+            try:
+                futs = [ex.submit(_run, c) for c in candidates]
+                pending = set(futs)
+                while pending:
+                    remain = deadline - time.monotonic()
+                    if remain <= 0:
+                        break
+                    done, pending = futures.wait(pending, timeout=remain,
+                                                 return_when=futures.FIRST_COMPLETED)
+                    if not done:
+                        break
+                    for fut in done:
+                        with contextlib.suppress(Exception):
+                            item, text = fut.result()
+                            out = _accept(item, text)
+                            if out is not None:
+                                return out
+                            last_err = f"{item[0]}/{item[1]}: empty"
+            finally:
+                for fut in futs:
+                    fut.cancel()
+                ex.shutdown(wait=False)
     # ---- APIキーなしでも動くローカル推論エンジン(ルールベース) --------------
     if not CONFIG["GEMINI_KEYS"] and not CONFIG["GROQ_KEYS"] and not CONFIG["OPENROUTER_KEYS"]:
         local = local_reasoning(state, user_text, council)
@@ -2871,16 +2972,42 @@ async def api_number() -> str:
     return f"🎲 ランダムな数字: **{data if data else random.randint(1, 100)}**"
 
 
-async def api_music_search(query: str) -> str:
-    """iTunes Search API (キー不要) による曲検索。"""
+async def search_itunes_tracks(query: str, limit: int = 5) -> list[dict]:
+    """iTunes Search API(キー不要)で実在の曲を検索し、構造化データを返す。
+
+    Returns: [{"title","artist","album","preview_url","url","artwork","length_ms"}, ...]
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
     data = await FastHTTP.get_json(
-        f"https://itunes.apple.com/search?term={quote(query)}&entity=song&limit=5&country=JP", ttl=600)
-    if not data or not data.get("results"):
+        f"https://itunes.apple.com/search?term={quote(q)}&entity=song&limit={limit}&country=JP",
+        ttl=600)
+    out: list[dict] = []
+    for r in (data or {}).get("results", []):
+        out.append({
+            "title": r.get("trackName", "") or "",
+            "artist": r.get("artistName", "") or "",
+            "album": r.get("collectionName", "") or "",
+            "preview_url": r.get("previewUrl") or "",
+            "url": r.get("trackViewUrl") or "",
+            "artwork": r.get("artworkUrl100", "") or "",
+            "length_ms": int(r.get("trackTimeMillis") or 0),
+        })
+    return out
+
+
+async def api_music_search(query: str) -> str:
+    """iTunes Search API (キー不要) による曲検索。リンクはクリック可能な形式で返す。"""
+    rows = await search_itunes_tracks(query, 5)
+    if not rows:
         return "⚠️ 曲が見つかりません"
     lines = []
-    for r in data["results"][:5]:
-        lines.append(f"・**{r.get('trackName', '')}** / {r.get('artistName', '')} "
-                     f"({r.get('releaseDate', '')[:4]}) — {r.get('trackViewUrl', '')}")
+    for r in rows:
+        link = f"[🔗 開く]({r['url']})" if r["url"] else ""
+        preview = "🎧 試聴あり" if r["preview_url"] else ""
+        tail = " / ".join(x for x in (link, preview) if x)
+        lines.append(f"・**{r['title']}** / {r['artist']} ({r['album']}) {tail}".rstrip())
     return "🎵 **検索結果**\n" + "\n".join(lines)
 
 
@@ -3212,59 +3339,173 @@ class MusicManager:
             out.append("▁▂▃▄▅▆▇█"[min(7, height - 1)])
         return "".join(out)
 
-    # --- 手続き型シンセサイザ(外部依存ゼロで 실제 音声を生成) ---------------
-    SCALE_MAP = {"C": [0, 2, 4, 5, 7, 9, 11], "A": [0, 2, 4, 5, 7, 9, 11],
-                 "F": [0, 2, 4, 5, 7, 9, 11], "G": [0, 2, 4, 5, 7, 9, 11],
-                 "D": [0, 2, 4, 5, 7, 9, 11], "E": [0, 2, 4, 5, 7, 9, 11]}
+    # --- 手続き型シンセサイザ(外部依存ゼロで実際の「曲」を生成) --------------
+    MAJOR_SCALE = [0, 2, 4, 5, 7, 9, 11]
+    MINOR_SCALE = [0, 2, 3, 5, 7, 8, 10]
+    PROGRESSIONS = [
+        [0, 5, 3, 4],   # I - vi - IV - V
+        [0, 3, 4, 4],   # I - IV - V - V
+        [0, 4, 5, 3],   # I - V - vi - IV
+        [0, 5, 1, 4],   # I - vi - ii - V
+    ]
+    KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
-    def synth_wav(self, track: dict, seconds: float = 6.0, rate: int = 22050) -> bytes:
-        """曲情報からチップチューン風のWAVを生成する(外部API/ライブラリ不要)。"""
+    @staticmethod
+    def _hz(semitone: int) -> float:
+        """半音(0=C, 9=A) → 周波数(Hz)"""
+        return 440.0 * (2 ** ((semitone - 9) / 12.0))
+
+    def compose(self, track: dict, seconds: float = 8.0, rate: int = 44100) -> dict:
+        """タイトル/アーティストからコード進行つきの楽曲を生成する(外部API不要)。
+
+        - 和音進行 + ベース + パッド + メロディ + ドラムを合成
+        - 同じタイトルなら常に同じ曲(決定論的)
+        - Returns: {"wav": bytes, "bpm": int, "key": str, "progression": [str], "duration": float}
+        """
+        import array as _array
         import wave
-        seed = int(hashlib.sha256((track.get("title", "") + track.get("artist", "")).encode()
-                                  ).hexdigest()[:8], 16)
+        title = str(track.get("title", "") or "")
+        artist = str(track.get("artist", "") or "")
+        seed = int(hashlib.sha256((title + "|" + artist).encode("utf-8")).hexdigest()[:8], 16)
         rnd = random.Random(seed)
-        root = rnd.choice(list(self.SCALE_MAP.keys()))
-        base = 220.0 * (2 ** (rnd.randint(0, 2) / 12.0))
-        scale = self.SCALE_MAP[root]
-        bpm = rnd.choice([88, 100, 112, 128, 140])
+        key_pc = rnd.choice([0, 2, 3, 5, 7, 8, 10])
+        minor = rnd.random() < 0.4
+        scale = self.MINOR_SCALE if minor else self.MAJOR_SCALE
+        prog_deg = rnd.choice(self.PROGRESSIONS)
+        bpm = rnd.choice([84, 92, 100, 112, 124])
         beat = 60.0 / bpm
-        total = int(seconds * rate)
-        #  Adele/wave 形式でサンプル列を生成
-        samples = bytearray()
-        step = 0
-        note_len = max(1, int(rate * beat / 2))
-        env_len = min(note_len, int(rate * 0.25))
-        while len(samples) < total * 2:
-            degree = scale[rnd.randrange(len(scale))]
-            octave = rnd.choice([0, 0, 1, -1])
-            freq = base * (2 ** (degree / 12.0)) * (2 ** octave)
-            # 三角波 + 減衰でチップチューンらしい音色に
-            buf = bytearray()
-            for i in range(note_len):
-                if len(samples) // 2 + i >= total:
-                    break
+        total = max(1, int(seconds * rate))
+        buf = [0.0] * total
+
+        def mix(start: int, dur: int, freq: float, amp: float, shape: str = "tri",
+                atk: float = 0.006, dec: float = 3.0) -> None:
+            """1音を重ねる(三角波/サイン波 + 減衰エンベロープ)"""
+            if dur <= 0 or start >= total:
+                return
+            end = min(total, start + dur)
+            n = end - start
+            atk_n = max(1, int(rate * atk))
+            ph = 0.0
+            step = freq / rate
+            for i in range(n):
+                env = min(1.0, i / atk_n) * math.exp(-dec * (i / rate))
+                if shape == "sine":
+                    s = math.sin(2 * math.pi * ph)
+                else:
+                    s = 4.0 * abs(ph - 0.5) - 1.0
+                buf[start + i] += s * amp * env
+                ph += step
+                if ph >= 1.0:
+                    ph -= 1.0
+
+        def kick(start: int) -> None:
+            n = int(rate * 0.18)
+            for i in range(min(n, total - start)):
                 t = i / rate
-                attack = min(1.0, i / max(1, env_len))
-                decay = math.exp(-3.2 * t)
-                ph = (freq * t) % 1.0
-                tri = 4.0 * abs(ph - 0.5) - 1.0
-                val = tri * attack * decay * 0.35
-                buf += _struct.pack("<h", int(max(-1.0, min(1.0, val)) * 32767))
-            samples += buf
-            step += 1
-        samples = samples[:total * 2]
+                f = 42.0 + 90.0 * math.exp(-28.0 * t)
+                buf[start + i] += math.sin(2 * math.pi * f * t) * 0.45 * math.exp(-8.0 * t)
+
+        def snare(start: int) -> None:
+            n = int(rate * 0.15)
+            for i in range(min(n, total - start)):
+                t = i / rate
+                buf[start + i] += (rnd.uniform(-1, 1) * 0.30
+                                   + math.sin(2 * math.pi * 190.0 * t) * 0.10) * math.exp(-20.0 * t)
+
+        def hat(start: int, amp: float = 0.09) -> None:
+            n = int(rate * 0.045)
+            for i in range(min(n, total - start)):
+                t = i / rate
+                buf[start + i] += rnd.uniform(-1, 1) * amp * math.exp(-80.0 * t)
+
+        # --- 作曲(小節単位に和弦を配置) ---
+        bar_len = int(rate * beat * 4)
+        bar = 0
+        pos = 0
+        chord_names: list[str] = []
+        while pos < total and bar < 512:
+            deg = prog_deg[bar % len(prog_deg)]
+            root_pc = key_pc + scale[deg % 7] + 12 * (deg // 7)
+            tones = [root_pc + scale[(deg + i) % 7] + 12 * ((deg + i) // 7) for i in (0, 2, 4)]
+            chord_names.append(self.KEY_NAMES[root_pc % 12] + ("m" if minor else ""))
+            # ベース(1拍目 / 3拍目)
+            mix(pos, int(rate * beat * 0.85), self._hz(root_pc - 24), 0.34, "tri", dec=2.2)
+            mix(pos + int(rate * beat * 2), int(rate * beat * 0.85),
+                self._hz(root_pc - 24), 0.30, "tri", dec=2.2)
+            # パッド(和音を softly 重ねる)
+            for k, t_pc in enumerate(tones):
+                mix(pos + k * int(rate * 0.01), bar_len, self._hz(t_pc), 0.10, "sine",
+                    atk=0.05, dec=0.7)
+            # メロディ(8分音符 / 音程のうねりつき)
+            mel_pc = tones[0] + 12
+            for eighth in range(8):
+                if rnd.random() < 0.78:
+                    mel_pc = max(min(mel_pc + rnd.choice([-2, -1, 0, 0, 1, 2, 3]),
+                                     tones[-1] + 19), tones[0] + 7)
+                    dur = int(rate * beat * (0.5 if rnd.random() < 0.7 else 0.25))
+                    mix(pos + eighth * int(rate * beat * 0.5), dur,
+                        self._hz(mel_pc), 0.22, "tri", dec=5.0)
+            # ドラム(4拍の基本パターン)
+            kick(pos)
+            snare(pos + int(rate * beat))
+            kick(pos + int(rate * beat * 2))
+            snare(pos + int(rate * beat * 3))
+            for eighth in range(8):
+                hat(pos + eighth * int(rate * beat * 0.5), 0.07 if eighth % 2 else 0.10)
+            pos += bar_len
+            bar += 1
+
+        # --- 正規化 & フェード(クリック/_pop 防止) ---
+        peak = max((abs(v) for v in buf), default=0.0) or 1.0
+        gain = 0.89 / peak
+        fade_in = max(1, int(rate * 0.01))
+        fade_out = max(1, int(rate * 0.25))
+        pcm = _array.array("h", bytes(2 * total))
+        for i in range(total):
+            g = gain
+            if i < fade_in:
+                g *= i / fade_in
+            elif i > total - fade_out:
+                g *= (total - i) / fade_out
+            pcm[i] = int(max(-1.0, min(1.0, buf[i] * g)) * 32767)
         out = io.BytesIO()
         with wave.open(out, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(rate)
-            wf.writeframes(bytes(samples))
-        return out.getvalue()
+            wf.writeframes(pcm.tobytes())
+        return {"wav": out.getvalue(), "bpm": bpm,
+                "key": self.KEY_NAMES[key_pc % 12] + (" minor" if minor else " major"),
+                "progression": chord_names[:8],
+                "duration": round(total / rate, 2)}
 
-    def make_track(self, title: str, artist: str = "Unknown", album: str = "", length: int = 210) -> dict:
-        return {"title": title, "artist": artist, "album": album or "Single",
-                "length_ms": length * 1000, "url": f"https://music.example/{quote(title)}",
+    def synth_wav(self, track: dict, seconds: float = 6.0, rate: int = 22050) -> bytes:
+        """曲情報からチップチューン風のWAVを生成する(外部API/ライブラリ不要)。"""
+        return self.compose(track, seconds=seconds, rate=rate)["wav"]
+
+    def make_track(self, title: str, artist: str = "Unknown", album: str = "", length: int = 210,
+                   url: str = "", preview_url: str = "", artwork: str = "") -> dict:
+        """曲情報をトラック辞書に正規化する。"""
+        title = (title or "").strip() or "Unknown Title"
+        return {"title": title, "artist": artist or "Unknown", "album": album or "Single",
+                "length_ms": length * 1000,
+                "url": url or f"https://music.example/{quote(title)}",
+                "preview_url": preview_url,
+                "artwork": artwork,
                 "wave": self.render_waveform(title + artist)}
+
+    def set_now(self, guild: int, track: dict) -> dict:
+        """再生中曲を差し替え(キュー内の先頭から再生)。"""
+        self.now[guild] = track
+        self.started = time.time()
+        return track
+
+    def push(self, guild: int, track: dict) -> int:
+        """キューに追加し、再生中の曲が無い場合は再生を開始する。"""
+        self.queues[guild].append(track)
+        if not self.now.get(guild):
+            self.set_now(guild, self.queues[guild].pop(0))
+        return len(self.queues[guild])
 
 
 MUSIC = MusicManager()
@@ -3342,6 +3583,28 @@ class VoicePlayer:
             LOG.warn(f"Voice play failed: {exc}")
             return False, f"⚠️ 再生に失敗しました: {exc}"
 
+    async def play_url(self, guild_id: int, url: str, title: str = "POCHI Radio") -> tuple[bool, str]:
+        """指定した曲(URL)をボイスで実際に再生する(FFmpeg が必要)。
+
+        リモートURLを直接FFmpegへ渡すため、実在の楽曲を再生できる。
+        """
+        client = self.clients.get(guild_id)
+        if client is None:
+            return False, "⚠️ まずボイスチャンネルへ接続してください。"
+        if not self.ffmpeg_available():
+            return False, "⚠️ FFmpeg が未導入のため生再生できません。"
+        if not url:
+            return False, "⚠️ 再生可能な音源URLがありません。"
+        try:
+            source = discord.FFmpegOpusAudio(url)
+            source.volume = self.volume
+            client.play(source, after=lambda e: self._after(guild_id, e))
+            self.tracks[guild_id] = {"title": title, "started": time.time()}
+            return True, f"🎼 **{title}** の再生を開始しました。"
+        except Exception as exc:  # noqa: BLE001
+            LOG.warn(f"Voice play_url failed: {exc}")
+            return False, f"⚠️ 再生に失敗しました: {exc}"
+
     def _after(self, guild_id: int, error=None):
         if error:
             LOG.warn(f"Voice playback error: {error}")
@@ -3378,6 +3641,101 @@ class VoicePlayer:
 
 
 VOICE = VoicePlayer()
+
+
+# --- 指定した曲を「実際に再生」するサービス --------------------------------
+class SongPlayer:
+    """指定した曲名を実在の楽曲に変換し、音声として再生する。
+
+    - iTunes Search API(キー不要)で実在の曲を探して試聴音源(preview)を得る
+    - ボイス接続があればその音源を実再生、無ければ音声ファイル/リンクを提示
+    - 実在の曲が見つからない場合は POCHI によるオリジナル合成にフォールバック
+    """
+
+    @staticmethod
+    async def resolve(query: str) -> dict | None:
+        """曲名から実在の楽曲を1曲解決する(見つからない場合は None)。"""
+        rows = await search_itunes_tracks(query, 5)
+        if not rows:
+            return None
+        # タイトルがクエリに最も近いものを優先
+        q = (query or "").strip().lower()
+        best, best_score = rows[0], -1.0
+        for r in rows:
+            t = r["title"].lower()
+            score = 0.0
+            if t == q:
+                score = 100.0
+            elif q and (q in t or t in q):
+                score = 60.0 - abs(len(t) - len(q)) * 0.1
+            else:
+                score = 20.0 if r["artist"].lower() in q else 0.0
+            if r["preview_url"]:
+                score += 5.0
+            if score > best_score:
+                best, best_score = r, score
+        return best
+
+    @staticmethod
+    def to_track(row: dict) -> dict:
+        """iTunes の検索結果を内部トラック辞書へ変換する。"""
+        return MUSIC.make_track(row.get("title", ""), row.get("artist", ""),
+                                row.get("album", ""),
+                                length=int((row.get("length_ms") or 0) / 1000) or 210,
+                                url=row.get("url", ""),
+                                preview_url=row.get("preview_url", ""),
+                                artwork=row.get("artwork", ""))
+
+    @classmethod
+    async def play(cls, ch, guild_id: int, query: str,
+                   author_voice_channel=None) -> tuple[str, dict | None]:
+        """指定した曲を再生する。戻り値: (ユーザー向けメッセージ, 再生したトラック)。"""
+        query = (query or "").strip()
+        if not query:
+            return "⚠️ 曲名を指定してください。", None
+
+        row = await cls.resolve(query)
+        if not row:
+            # 実在の曲が無い場合はオリジナル合成へフォールバック
+            track = MUSIC.make_track(query, "POCHI Radio")
+            wav = await asyncio.to_thread(MUSIC.compose, track, 8.0)
+            MUSIC.set_now(guild_id, track)
+            try:
+                ok, msg = await VOICE.play_wav(guild_id, wav["wav"], track["title"])
+            except Exception:  # noqa: BLE001
+                ok, msg = False, "⚠️ 再生に失敗しました。"
+            head = (f"🎵 **{track['title']}** / POCHI Radio "
+                    f"({wav['key']} / {wav['bpm']} BPM / {' → '.join(wav['progression'])})")
+            if ok:
+                return head + f"\n{msg}", track
+            return (head + "\n⚠️ 実在の曲が見つからないため、POCHI がオリジナルを合成しました。\n"
+                    + msg), track
+
+        track = cls.to_track(row)
+        MUSIC.set_now(guild_id, track)
+        head = f"🎵 **{track['title']}** / {track['artist']} — {track['album']}"
+        if track["url"]:
+            head += f"\n🔗 {track['url']}"
+        # ボイス実再生(接続済み + 試聴音源あり)
+        if track["preview_url"] and VOICE.clients.get(guild_id):
+            ok, msg = await VOICE.play_url(guild_id, track["preview_url"],
+                                           f"{track['title']} / {track['artist']}")
+            return head + f"\n{msg}", track
+        # 未接続 or 音源なし: 試聴リンクとクリック可能なURLを提示
+        if not VOICE.clients.get(guild_id):
+            head += "\n💡 ボイスチャンネルで `!play` すると実音源が再生されます。"
+        return head, track
+
+
+SONG = SongPlayer()
+
+
+def _preview_filename(url: str) -> str:
+    """試聴音源URLから適切な拡張子を求める(m4a / mp3 など)。"""
+    ext = (url or "").split("?")[0].rsplit(".", 1)[-1].lower() if "." in (url or "") else ""
+    if ext not in ("m4a", "mp3", "mp4", "aac", "wav", "ogg", "opus"):
+        ext = "m4a"
+    return f"preview.{ext}"
 
 
 
@@ -5567,37 +5925,51 @@ async def synthesize_voice(text: str, speaker: int = 3) -> bytes | None:
     return None
 
 
-async def extract_link_context(text: str) -> str:
-    """本文中のURLを解析して外部コンテキスト(本文/字幕/PDF)を取得。"""
+async def _fetch_link_context(url: str) -> str:
+    """URL 1件の外部コンテキストを取得(YouTube字幕 / PDF / Web本文)。"""
+    yt = re.search(r"(?:v=|youtu\.be/|shorts/)([a-zA-Z0-9_-]{11})", url)
+    if yt and HAS_YT:
+        try:
+            tlist = await asyncio.to_thread(
+                YT_API.get_transcript, yt.group(1), languages=["ja", "en"])
+            return (f"\n【YouTube字幕 {yt.group(1)}】\n"
+                    f"{' '.join([t['text'] for t in tlist])[:1500]}\n")
+        except Exception:  # noqa: BLE001
+            return f"\n【YouTube {yt.group(1)}】字幕取得不可\n"
+    if url.lower().endswith(".pdf") and HAS_PDF:
+        try:
+            data = await FastHTTP.get_bytes(url)
+            if data:
+                reader = PdfReader(io.BytesIO(data))
+                txt = " ".join([(p.extract_text() or "") for p in reader.pages[:5]])
+                return f"\n【PDF抜粋】\n{truncate(txt, 1500)}\n"
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+    body = await fetch_article(url, 1400)
+    return f"\n【Web抜粋 {url[:60]}】\n{body}\n" if body else ""
+
+
+async def extract_link_context(text: str, timeout: float = 6.0) -> str:
+    """本文中のURLを解析して外部コンテキスト(本文/字幕/PDF)を取得。
+
+    URLは並列取得し、全体の待ち時間にも上限を設ける(返信遅延の_main原因だった)。
+    """
     urls = re.findall(r"https?://[^\s<>\"]+|www\.[^\s<>\"]+", text or "")
     if not urls:
         return ""
+    targets = [(u if u.startswith("http") else "http://" + u) for u in urls[:3]]
+    try:
+        parts = await asyncio.wait_for(
+            asyncio.gather(*[_fetch_link_context(u) for u in targets],
+                           return_exceptions=True),
+            timeout=timeout)
+    except asyncio.TimeoutError:
+        return ""
     summary = "\n--- 外部リンク解析データ ---"
-    for raw in urls[:3]:
-        url = raw if raw.startswith("http") else "http://" + raw
-        yt = re.search(r"(?:v=|youtu\.be/|shorts/)([a-zA-Z0-9_-]{11})", url)
-        if yt and HAS_YT:
-            try:
-                tlist = await asyncio.to_thread(
-                    YT_API.get_transcript, yt.group(1), languages=["ja", "en"])
-                summary += (f"\n【YouTube字幕 {yt.group(1)}】\n"
-                            f"{' '.join([t['text'] for t in tlist])[:1500]}\n")
-            except Exception:  # noqa: BLE001
-                summary += f"\n【YouTube {yt.group(1)}】字幕取得不可\n"
-            continue
-        if url.lower().endswith(".pdf") and HAS_PDF:
-            try:
-                data = await FastHTTP.get_bytes(url)
-                if data:
-                    reader = PdfReader(io.BytesIO(data))
-                    txt = " ".join([(p.extract_text() or "") for p in reader.pages[:5]])
-                    summary += f"\n【PDF抜粋】\n{truncate(txt, 1500)}\n"
-            except Exception:  # noqa: BLE001
-                pass
-            continue
-        body = await fetch_article(url, 1400)
-        if body:
-            summary += f"\n【Web抜粋 {url[:60]}】\n{body}\n"
+    for p in parts:
+        if isinstance(p, str) and p:
+            summary += p
     return summary if len(summary) > 30 else ""
 
 
@@ -5646,11 +6018,9 @@ async def handle_special_actions(ctx, reply_text: str) -> tuple[str, object | No
         if ib:
             img_file = discord.File(io.BytesIO(ib), filename="generated.png")
     if m := _m(r"\[MUSIC:\s*(.+?)\]"):
-        track = MUSIC.make_track(m.group(1), "POCHI Radio")
-        MUSIC.add(guild.id, track)
-        await _exec(ch.send(f"🎵 **@{MUSIC.render_waveform(track['title'])}**\n"
-                             f"**{track['title']}** / {track['artist']}\n"
-                             f"`{MUSIC.state(guild.id)['bar']}`", view=MusicControlView(guild.id)))
+        # 指定した曲を実際に再生する(実在の曲 → 試聴音源 / 無ければオリジナル合成)
+        msg, _track = await SONG.play(ch, guild.id, m.group(1))
+        await _exec(ch.send(msg, view=MusicControlView(guild.id)))
     if m := _m(r"\[ECON:\s*(.+?),\s*([\d\.]+)\]"):
         amt = float(m.group(2))
         if hasattr(author, "id"):
@@ -5846,7 +6216,7 @@ async def handle_special_actions(ctx, reply_text: str) -> tuple[str, object | No
     except Exception as exc:  # noqa: BLE001
         LOG.warn(f"高度タグ処理エラー: {exc}")
 
-    stripped = re.sub(r"\[[A-Z_]+(?::\s*[^\]]+)?\]", "", clean, flags=re.IGNORECASE).strip()
+    stripped = strip_action_tags(clean)
     return stripped, img_file
 
 # =============================================================================
@@ -6342,12 +6712,15 @@ async def execute_modal_action(ch, guild, ctx_mock, action: str, vals: list[str]
             await interaction.followup.send(
                 f"🐍 **【実行結果】**\n```\n{run_python_sandbox(v0)}\n```")
         elif action == "mod_voice_play":
-            track = MUSIC.make_track(v0, "POCHI Radio")
-            wav = await asyncio.to_thread(MUSIC.synth_wav, track, 8.0)
+            # 指定した実在の曲をボイスで実際に再生する
             gid = guild.id if guild else 0
-            ok, msg = await VOICE.play_wav(gid, wav, track["title"])
+            msg, track = await SONG.play(ch, gid, v0)
             await interaction.followup.send(msg)
-            await ch.send("🎼 **生成音源 (WAV)** を添付します。", file=discord.File(io.BytesIO(wav), "pochi_radio.wav"))
+            if track and track.get("preview_url") and not VOICE.clients.get(gid):
+                data = await FastHTTP.get_bytes(track["preview_url"], timeout_sec=30.0)
+                if data:
+                    await ch.send(f"🎧 **試聴音源**: {track['title']} / {track['artist']}",
+                                  file=discord.File(io.BytesIO(data), _preview_filename(track["preview_url"])))
         # --- 外部Modインストーラ ---
         elif action == "mod_pypi_install":
             await interaction.followup.send(f"📥 PyPI から『{v0}』を取得・展開中...")
@@ -6589,20 +6962,15 @@ async def execute_modal_action(ch, guild, ctx_mock, action: str, vals: list[str]
                 await interaction.followup.send(
                     f"🎲 **ギャンブル** 賭金 {amt:,.0f} → {'🎉 **当たり!** +' + format(payout, ',') if win else '💀 はずれ…'}")
         elif action == "music_play":
-            track = MUSIC.make_track(v0, "POCHI Radio")
-            MUSIC.add(gid, track)
-            stt = MUSIC.state(gid)
-            await interaction.followup.send(
-                f"🎵 **@{MUSIC.render_waveform(track['title'])}**\n**{track['title']}** / {track['artist']}\n"
-                f"`{stt['bar']}`  ({stt['elapsed']}/{stt['total']}s)\nキュー: {len(stt['queue'])}曲",
-                view=MusicControlView(gid))
-            # 実際の音声(WAV)を生成して添付する(外部依存ゼロ)
-            try:
-                wav = await asyncio.to_thread(MUSIC.synth_wav, track, 6.0)
-                await ch.send("🎼 **生成された音源** (チップチューン / 外部API不要)",
-                              file=discord.File(io.BytesIO(wav), "pochi_radio.wav"))
-            except Exception as exc:  # noqa: BLE001
-                LOG.warn(f"音源生成に失敗: {exc}")
+            # 指定した実在の曲を実際に再生する(見つからない場合はオリジナル合成)
+            msg, track = await SONG.play(ch, gid, v0)
+            await interaction.followup.send(msg, view=MusicControlView(gid))
+            if track and track.get("preview_url"):
+                # 試聴音源をダウンロードして添付 → ボイス未接続でも「聴ける」
+                data = await FastHTTP.get_bytes(track["preview_url"], timeout_sec=30.0)
+                if data:
+                    await ch.send(f"🎧 **試聴音源**: {track['title']} / {track['artist']}",
+                                  file=discord.File(io.BytesIO(data), _preview_filename(track["preview_url"])))
         elif action == "music_lyrics":
             parts = [p.strip() for p in re.split(r"[-–—]", v0, maxsplit=1)]
             if len(parts) < 2:
@@ -7275,20 +7643,51 @@ async def analyze(ctx, *, text: str = ""):
 
 @bot.command()
 async def radio(ctx, *, title: str = "POCHI Radio Theme"):
-    """POCHI Radio: 曲情報 + 実際に生成した音源(WAV)を再生する。"""
+    """POCHI Radio: オリジナル楽曲を合成して再生する(WAV添付)。"""
+    gid = ctx.guild.id if ctx.guild else 0
     track = MUSIC.make_track(title, "POCHI Radio")
-    MUSIC.add(ctx.guild.id if ctx.guild else 0, track)
-    stt = MUSIC.state(ctx.guild.id if ctx.guild else 0)
+    MUSIC.set_now(gid, track)
+    stt = MUSIC.state(gid)
+    try:
+        wav = await asyncio.to_thread(MUSIC.compose, track, 8.0)
+    except Exception as exc:  # noqa: BLE001
+        LOG.error(f"作曲に失敗: {exc}")
+        return await ctx.send(f"⚠️ 音源生成に失敗しました: {exc}")
     await ctx.send(f"🎵 **@{MUSIC.render_waveform(track['title'])}**\n"
                    f"**{track['title']}** / {track['artist']}\n"
+                   f"🎼 {wav['key']} / {wav['bpm']} BPM / "
+                   f"{' → '.join(wav['progression'])}\n"
                    f"`{stt['bar']}` ({stt['elapsed']}/{stt['total']}s)",
-                   view=MusicControlView(ctx.guild.id if ctx.guild else 0))
-    try:
-        wav = await asyncio.to_thread(MUSIC.synth_wav, track, 6.0)
-        await ctx.send("🎼 **生成音源** (チップチューン合成 / 外部API不要)",
-                       file=discord.File(io.BytesIO(wav), "pochi_radio.wav"))
-    except Exception as exc:  # noqa: BLE001
-        await ctx.send(f"⚠️ 音源生成に失敗しました: {exc}")
+                   view=MusicControlView(gid))
+    # ボイス再生(接続済みなら実際に音を出す)
+    if VOICE.clients.get(gid):
+        ok, msg = await VOICE.play_wav(gid, wav["wav"], track["title"])
+        if ok:
+            return
+    await ctx.send("🎼 **生成音源** (コード進行つきチップチューン / 外部API不要)",
+                   file=discord.File(io.BytesIO(wav["wav"]), "pochi_radio.wav"))
+
+
+@bot.command(name="play", aliases=["制定的曲", "音楽再生"])
+async def play(ctx, *, query: str = ""):
+    """指定した曲を実際に再生する(iTunes検索 → ボイス実再生 / リンク提示)。"""
+    if not query.strip():
+        return await ctx.send("⚠️ `!play <曲名>` (例: `!play 夜に駆ける`)")
+    gid = ctx.guild.id if ctx.guild else 0
+    # 呼び出し元のボイスチャンネルへ自動参加(未接続の場合)
+    if not VOICE.clients.get(gid):
+        vc = getattr(getattr(ctx.author, "voice", None), "channel", None)
+        if vc is not None:
+            with contextlib.suppress(Exception):
+                await VOICE.join(vc)
+    msg, track = await SONG.play(ctx.channel, gid, query)
+    await ctx.send(msg)
+    # ボイス未接続でも「聴ける」ように試聴音源を添付する
+    if track and track.get("preview_url") and not VOICE.clients.get(gid):
+        data = await FastHTTP.get_bytes(track["preview_url"], timeout_sec=30.0)
+        if data:
+            await ctx.send(f"🎧 **試聴音源**: {track['title']} / {track['artist']}",
+                           file=discord.File(io.BytesIO(data), _preview_filename(track["preview_url"])))
 
 
 @bot.command()
@@ -7723,13 +8122,16 @@ async def on_message(message):
         async with message.channel.typing():
             try:
                 st["count"] += 1
-                valid_imgs = []
-                for att in message.attachments:
-                    if any(att.filename.lower().endswith(e)
-                           for e in (".png", ".jpg", ".jpeg", ".gif", ".webp")):
-                        img = await download_attachment_as_pil(att)
-                        if img:
-                            valid_imgs.append(img)
+                # 添付画像のダウンロードは並列実行する(逐次だと枚数に比例して遅くなる)
+                img_atts = [att for att in message.attachments
+                            if any(att.filename.lower().endswith(e)
+                                   for e in (".png", ".jpg", ".jpeg", ".gif", ".webp"))]
+                valid_imgs: list = []
+                if img_atts:
+                    got = await asyncio.gather(
+                        *(download_attachment_as_pil(a) for a in img_atts),
+                        return_exceptions=True)
+                    valid_imgs = [im for im in got if im is not None and not isinstance(im, BaseException)]
                 link_ctx = await extract_link_context(raw) if raw else ""
                 ref = message.reference
                 reply_ctx = ""
@@ -7750,7 +8152,7 @@ async def on_message(message):
                 bot_stats["calls"] += 1
                 bot_stats["replies"] += 1
                 with contextlib.suppress(Exception):
-                    COSTS.record("gemini-flash", len(str(payload)) // 4)
+                    COSTS.record("gemini-flash", len(str(in_txt)) // 4)
                 if res.latency_ms:
                     bot_stats["latencies"].append(res.latency_ms)
 
@@ -11574,7 +11976,7 @@ HELP_CATEGORIES = {
     "モデレーション": ["timeout", "kick", "ban", "purge", "automod", "slowmode", "raidmode"],
     "サーバー管理": ["announce", "poll", "level", "note", "habit", "pomodoro", "macro"],
     "拡張・保守": ["modinstall", "modrun", "pocket", "repair", "diag", "save", "restore", "code"],
-    "その他": ["ping", "ambient", "digest", "radio", "analyze", "help"],
+    "その他": ["ping", "ambient", "digest", "radio", "play", "analyze", "help"],
 }
 
 USER_SETTINGS: dict[int, dict] = {}
@@ -12726,7 +13128,11 @@ async def nowplaying(ctx):
     emb.add_field(name="アルバム", value=cur.get("album", "?"))
     emb.add_field(name="再生位置", value=f"`{st['bar']}` {st['elapsed']}s / {st['total']}s")
     emb.add_field(name="キュー", value=", ".join(t["title"] for t in st.get("queue", [])[:8]) or "なし")
-    emb.set_thumbnail(url=cur.get("url", ""))
+    # 実在の曲ならクリック可能なリンクを添える(見れない/飛べない問題の解決)
+    if cur.get("url"):
+        emb.add_field(name="リンク", value=f"[🔗 曲を開く]({cur['url']})")
+    if cur.get("artwork"):
+        emb.set_thumbnail(url=cur["artwork"])
     await ctx.send(embed=emb, view=MusicControlView(gid))
 
 
@@ -12892,6 +13298,12 @@ def offline_selfcheck() -> int:
     check("economy_transfer", lambda: ECON.transfer(999, 998, 100, 0)["ok"])
     check("music_add", lambda: MUSIC.add(1, MUSIC.make_track("Test Song", "Tester")) is not None)
     check("music_wave", lambda: MUSIC.render_waveform("seed", 16))
+    check("music_compose", lambda: (lambda r: f"{r['key']} {r['bpm']}BPM "
+                                    f"{len(r['wav'])}B")(MUSIC.compose(
+                                        MUSIC.make_track("Selfcheck", "POCHI"), 3.0)))
+    check("music_preview_name", lambda: _preview_filename("https://x/y.plus.aac.p.m4a"))
+    check("tag_strip_keeps_links",
+          lambda: strip_action_tags("[Wikipedia](https://a.b) [MUSIC: X]"))
     check("gacha", lambda: len(gacha_pull(10)[0]))
     check("tarot", lambda: draw_tarot()[0])
     check("ttt_ai", lambda: TTT.ai_move(TTT.start(7)["board"]))
