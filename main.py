@@ -7451,6 +7451,17 @@ async def daily_digest_loop():
         LOG.warn(f"Daily digest failed: {exc}")
 
 
+@tasks.loop(minutes=3.0)
+async def market_tick_loop():
+    """市場の価格を更新する(ランダムウォーク + ニュース)。"""
+    try:
+        changed = MARKET.tick()
+        if changed and any(abs(c["change"]) > 0 for c in changed):
+            await BUS.emit("market.tick", changed)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"market tick failed: {exc}")
+
+
 @tasks.loop(minutes=5.0)
 async def memory_maintenance_loop():
     """記憶の自動統合と古いプロファイルの整理。"""
@@ -7476,7 +7487,7 @@ async def on_ready():
     GOV.start()
     for loop in (immortal_watchdog_loop, auto_cloud_backup_loop,
                  pocket_watch_loop, ambient_autonomy_loop,
-                 daily_digest_loop, memory_maintenance_loop):
+                 daily_digest_loop, memory_maintenance_loop, market_tick_loop):
         if not loop.is_running():
             loop.start()
     # 自律アクターを監督付きで起動(失敗しても自動で再起動する)
@@ -7565,6 +7576,8 @@ async def on_message(message):
 
     # 空気感の観測
     AMBIENT.observe(cid, message.author.id, raw, message.author.bot)
+    with contextlib.suppress(Exception):
+        TRENDS.observe(cid, emo)
 
     is_auto = st["base_mode"] in ("auto_full", "auto_stream", "anti_berserk",
                                   "troll_chaos", "quote_search", "meigen_search")
@@ -11330,6 +11343,348 @@ async def leaderboard(ctx):
         f"・{i+1}. `{r['uid']}` — {r['total']:,.0f}" for i, r in enumerate(rows))
         + "\n⭐レベル:\n" + "\n".join(
         f"・{i+1}. `{r['uid']}` — Lv.{r['level']}" for i, r in enumerate(lv)))
+
+
+# =============================================================================
+#  SECTION 19 -  既存機能の最大化(経済市場 / 音楽プレイリスト / 会話トレンド)
+# =============================================================================
+
+# =============================================================================
+#  SECTION 19 -  既存機能の最大化(経済市場 / 音楽プレイリスト / 会話トレンド)
+# =============================================================================
+class MarketSim:
+    """サーバー内株市場(ランダムウォーク + ニュース)による投資シミュレーション。"""
+
+    TICKERS = {
+        "POCH": ("ポチ商事", 1200.0, 0.035), "NOVA": ("星屑テック", 860.0, 0.028),
+        "KUMA": ("クマ商事", 2450.0, 0.020), "MEGA": ("メガブーム", 640.0, 0.045),
+        "YAGI": ("山羊出版", 320.0, 0.018), "TARO": ("タロ運輸", 1580.0, 0.024),
+    }
+
+    def __init__(self):
+        self.prices = {k: v[1] for k, v in self.TICKERS.items()}
+        self.history: dict[str, list] = {k: [v[1]] for k, v in self.TICKERS.items()}
+        self.holdings: dict[int, dict[str, int]] = defaultdict(dict)
+        self.lock = threading.RLock()
+        self.events: deque = deque(maxlen=30)
+
+    def tick(self) -> list[dict]:
+        """市場を1ティック進める(ランダムウォーク + ニュース)。"""
+        changed = []
+        with self.lock:
+            for code, (name, base, vol) in self.TICKERS.items():
+                drift = random.gauss(0.0004, vol)
+                shock = 0.0
+                if random.random() < 0.04:
+                    shock = random.choice([-1, 1]) * random.uniform(vol, vol * 4)
+                    self.events.append({"code": code, "shock": shock, "ts": jst_stamp()})
+                px = max(1.0, self.prices[code] * (1 + drift + shock))
+                self.prices[code] = round(px, 2)
+                self.history[code].append(px)
+                self.history[code] = self.history[code][-120:]
+                changed.append({"code": code, "price": px, "change": px - base})
+        return changed
+
+    def quote(self, code: str) -> dict | None:
+        code = code.upper()
+        with self.lock:
+            if code not in self.prices:
+                return None
+            px = self.prices[code]
+            base = self.TICKERS[code][1]
+            hist = list(self.history[code])
+        return {"code": code, "name": self.TICKERS[code][0], "price": px,
+                "change": round(px - base, 2),
+                "change_pct": round((px - base) / base * 100, 2),
+                "vol": self.TICKERS[code][2], "spark": hist[-24:]}
+
+    def buy(self, uid: int, code: str, shares: int) -> dict:
+        code = code.upper()
+        if code not in self.prices:
+            return {"ok": False, "error": f"銘柄「{code}」は存在しません"}
+        shares = max(1, min(10000, int(shares)))
+        cost = self.prices[code] * shares
+        ok, bal = ECON.debit(uid, cost, 0, "buy_stock", code)
+        if not ok:
+            return {"ok": False, "error": f"残高不足(必要 {cost:,.0f})"}
+        with self.lock:
+            self.holdings[uid][code] = self.holdings[uid].get(code, 0) + shares
+        return {"ok": True, "code": code, "shares": shares, "cost": cost,
+                "balance": bal["coins"]}
+
+    def sell(self, uid: int, code: str, shares: int) -> dict:
+        code = code.upper()
+        with self.lock:
+            held = self.holdings.get(uid, {}).get(code, 0)
+        if held <= 0:
+            return {"ok": False, "error": f"{code} を保有していません"}
+        shares = max(1, min(held, int(shares)))
+        gain = self.prices[code] * shares
+        with self.lock:
+            self.holdings[uid][code] = held - shares
+        ECON.credit(uid, gain, 0, "sell_stock", code)
+        return {"ok": True, "code": code, "shares": shares, "gain": gain}
+
+    def portfolio(self, uid: int) -> dict:
+        with self.lock:
+            holdings = dict(self.holdings.get(uid, {}))
+            prices = dict(self.prices)
+        rows = []
+        total = 0.0
+        for code, shares in holdings.items():
+            if shares <= 0:
+                continue
+            px = prices.get(code, 0.0)
+            value = px * shares
+            total += value
+            rows.append({"code": code, "shares": shares, "price": px, "value": value})
+        cash = ECON.balance(uid, 0)["coins"]
+        return {"holdings": rows, "assets": round(total, 2), "cash": cash,
+                "total": round(total + cash, 2)}
+
+    def leaderboard(self, limit: int = 10) -> list[dict]:
+        out = []
+        for uid in list(self.holdings)[:200]:
+            out.append({"uid": uid, "total": self.portfolio(uid)["total"]})
+        out.sort(key=lambda x: -x["total"])
+        return out[:limit]
+
+    def board(self) -> list[dict]:
+        return [q for q in (self.quote(c) for c in self.TICKERS) if q]
+
+
+MARKET = MarketSim()
+
+
+
+class PlaylistStore:
+    """名前付きプレイリスト(サーバー単位・永続化)。"""
+
+    def __init__(self, path: str = DB_PATH):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
+        with self.lock:
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS playlists(
+                guild INTEGER, name TEXT, tracks TEXT, created REAL,
+                PRIMARY KEY(guild, name)
+            )""")
+            self.conn.commit()
+
+    def save(self, guild: int, name: str, tracks: list[dict]) -> bool:
+        if not tracks:
+            return False
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO playlists(guild, name, tracks, created) VALUES(?,?,?,?)",
+                (guild, name.strip().lower(),
+                 json.dumps(tracks[:100], ensure_ascii=False), time.time()))
+            self.conn.commit()
+        return True
+
+    def load(self, guild: int, name: str) -> list[dict]:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT tracks FROM playlists WHERE guild=? AND name=?",
+                (guild, name.strip().lower())).fetchone()
+        if not row:
+            return []
+        with contextlib.suppress(Exception):
+            return json.loads(row["tracks"])
+        return []
+
+    def delete(self, guild: int, name: str) -> bool:
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM playlists WHERE guild=? AND name=?",
+                                    (guild, name.strip().lower()))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def list(self, guild: int) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT name, tracks, created FROM playlists WHERE guild=? ORDER BY created DESC",
+                (guild,)).fetchall()
+        out = []
+        for r in rows:
+            with contextlib.suppress(Exception):
+                out.append({"name": r["name"], "count": len(json.loads(r["tracks"] or "[]")),
+                            "created": datetime.fromtimestamp(r["created"], JST).strftime("%m-%d %H:%M")})
+        return out
+
+
+PLAYLISTS = PlaylistStore()
+
+
+class TrendAnalyzer:
+    """チャンネルの感情トレンドを時系列で分析し、能動的な提案を生成する。"""
+
+    def __init__(self):
+        self.series: dict[int, deque] = defaultdict(lambda: deque(maxlen=120))
+        self.lock = threading.RLock()
+
+    def observe(self, cid: int, emo: dict) -> None:
+        with self.lock:
+            self.series[cid].append((time.time(), emo["valence"], emo["arousal"], emo["toxicity"]))
+
+    def analyze(self, cid: int) -> dict:
+        with self.lock:
+            data = list(self.series.get(cid, []))
+        if len(data) < 3:
+            return {"ok": False, "reason": "データ不足", "samples": len(data)}
+        vals = [d[1] for d in data]
+        tox = [d[3] for d in data]
+        half = max(1, len(vals) // 2)
+        first = sum(vals[:half]) / half
+        second = sum(vals[half:]) / max(1, len(vals) - half)
+        delta = second - first
+        direction = "上昇" if delta > 0.15 else ("下降" if delta < -0.15 else "横ばい")
+        return {"ok": True, "samples": len(data), "avg": round(sum(vals) / len(vals), 3),
+                "recent": round(second, 3), "delta": round(delta, 3), "direction": direction,
+                "toxicity": round(sum(tox) / len(tox), 3),
+                "volatility": round(max(vals) - min(vals), 3)}
+
+    def suggest(self, cid: int) -> str | None:
+        """能動的な提案を返す( AutonomousActor から利用)。"""
+        a = self.analyze(cid)
+        if not a.get("ok"):
+            return None
+        if a["toxicity"] > 0.5:
+            return "⚠️ 感情が高ぶっています。宥容のメッセージかスローモードの導入を検討してください。"
+        if a["direction"] == "下降" and a["avg"] < -0.2:
+            return "💭 ムードが落ちています。軽い話題提供や声かけで切り替えましょう。"
+        if a["direction"] == "上昇" and a["avg"] > 0.4:
+            return "✨ ムードが上向いています。具体的な企画の提案が適しています。"
+        if a["volatility"] > 0.9:
+            return "🎭 感情の振れ幅が大きいです。落ち着いて対応するための工夫を検討しましょう。"
+        return None
+
+
+TRENDS = TrendAnalyzer()
+
+
+
+# --- 新コマンド(経済市場 / プレイリスト / トレンド) -------------------------
+@bot.command()
+async def market(ctx):
+    """サーバー内株市場の現在値。"""
+    rows = MARKET.board()
+    lines = []
+    for r in rows:
+        arrow = "▲" if r["change"] > 0 else ("▼" if r["change"] < 0 else "─")
+        spark = "".join("▁▂▃▄▅▆▇█"[min(7, max(0, int((p - min(r["spark"])) /
+                                    max(1e-9, max(r["spark"]) - min(r["spark"])) * 7)))]
+                       for p in r["spark"]) if r["spark"] else ""
+        lines.append(f"・**{r['code']}** {r['name']} — {r['price']:,.2f} "
+                     f"{arrow}{abs(r['change_pct']):.2f}%  `{spark}`")
+    await ctx.send("📈 **POCHI 市場**\n" + "\n".join(lines))
+
+
+@bot.command()
+async def buy(ctx, *, stock: str = "", shares: str = "1"):
+    """株を買う。"""
+    if not stock:
+        return await ctx.send("⚠️ `!buy <銘柄> [株数]`")
+    try:
+        n = int(shares)
+    except ValueError:
+        n = 1
+    res = MARKET.buy(ctx.author.id, stock, n)
+    if not res.get("ok"):
+        return await ctx.send(f"⚠️ {res.get('error')}")
+    AUDIT.record(ctx.author.id, "market.buy", f"{res['code']}x{res['shares']}")
+    await ctx.send(f"📈 **{res['code']}** を {res['shares']}株 購入 (-{res['cost']:,.0f})\n"
+                   f"残高: `{res['balance']:,.0f}`")
+
+
+@bot.command()
+async def sell(ctx, *, stock: str = "", shares: str = "1"):
+    """株を売る。"""
+    if not stock:
+        return await ctx.send("⚠️ `!sell <銘柄> [株数]`")
+    try:
+        n = int(shares)
+    except ValueError:
+        n = 1
+    res = MARKET.sell(ctx.author.id, stock, n)
+    if not res.get("ok"):
+        return await ctx.send(f"⚠️ {res.get('error')}")
+    AUDIT.record(ctx.author.id, "market.sell", f"{res['code']}x{res['shares']}")
+    await ctx.send(f"📉 **{res['code']}** を {res['shares']}株 売却 (+{res['gain']:,.0f})")
+
+
+@bot.command()
+async def portfolio(ctx):
+    """保有資産の確認。"""
+    p = MARKET.portfolio(ctx.author.id)
+    lines = [f"・**{h['code']}** {h['shares']}株 @{h['price']:,.2f} = {h['value']:,.0f}"
+             for h in p["holdings"]]
+    await ctx.send(f"💼 **ポートフォリオ**\n" + ("\n".join(lines) or "保有なし") +
+                   f"\n・資産 {p['assets']:,.0f} / 現金 {p['cash']:,.0f} / **合計 {p['total']:,.0f}**")
+
+
+@bot.command()
+async def playlist(ctx, *, args: str = ""):
+    """プレイリストの作成・保存・読み込み。"""
+    gid = ctx.guild.id if ctx.guild else 0
+    if not args:
+        rows = PLAYLISTS.list(gid)
+        return await ctx.send("🎵 **プレイリスト**\n" + "\n".join(
+            f"・`{r['name']}` ({r['count']}曲 / {r['created']})" for r in rows)
+            or "🎵 プレイリストなし。`!playlist save <名前>` で保存。")
+    if args.startswith("save "):
+        name = args[5:].strip()
+        state = MUSIC.state(gid)
+        tracks = ([state["current"]] if state.get("current") else []) + list(state.get("queue", []))
+        if not tracks:
+            return await ctx.send("⚠️ 保存する曲がありません。先に `!radio <曲名>` 再生してください。")
+        ok = PLAYLISTS.save(gid, name, tracks)
+        return await ctx.send(f"🎵 プレイリスト保存: `{name}` ({len(tracks)}曲)")
+    if args.startswith("load "):
+        name = args[5:].strip()
+        tracks = PLAYLISTS.load(gid, name)
+        if not tracks:
+            return await ctx.send(f"⚠️ プレイリスト「{name}」は未登録です。")
+        MUSIC.queues[gid] = list(tracks)
+        MUSIC.now[gid] = MUSIC.queues[gid].pop(0)
+        return await ctx.send(f"🎵 プレイリスト読み込み: `{name}` ({len(tracks)}曲)")
+    if args.startswith("del "):
+        name = args[4:].strip()
+        ok = PLAYLISTS.delete(gid, name)
+        return await ctx.send(f"🎵 削除: {'成功' if ok else '該当なし'}")
+    return await ctx.send("⚠️ `!playlist save|load|del <名前>`")
+
+
+@bot.command()
+async def nowplaying(ctx):
+    """再生中の曲とキュー。"""
+    gid = ctx.guild.id if ctx.guild else 0
+    st = MUSIC.state(gid)
+    cur = st.get("current") or {}
+    if not cur:
+        return await ctx.send("🎵 再生中の曲はありません。")
+    emb = make_embed(f"🎵 {cur.get('title', '?')}", "", 0x1DB954)
+    emb.add_field(name="アーティスト", value=cur.get("artist", "?"))
+    emb.add_field(name="アルバム", value=cur.get("album", "?"))
+    emb.add_field(name="再生位置", value=f"`{st['bar']}` {st['elapsed']}s / {st['total']}s")
+    emb.add_field(name="キュー", value=", ".join(t["title"] for t in st.get("queue", [])[:8]) or "なし")
+    emb.set_thumbnail(url=cur.get("url", ""))
+    await ctx.send(embed=emb, view=MusicControlView(gid))
+
+
+@bot.command()
+async def trend(ctx):
+    """このチャンネルの感情トレンド分析。"""
+    a = TRENDS.analyze(ctx.channel.id)
+    if not a.get("ok"):
+        return await ctx.send(f"📉 トレンド分析: データ不足({a.get('samples', 0)}件)")
+    sug = TRENDS.suggest(ctx.channel.id)
+    await ctx.send(f"📉 **感情トレンド**\n"
+                   f"・平均感情価: {a['avg']} / 直近: {a['recent']} (差 {a['delta']:+})\n"
+                   f"・方向: **{a['direction']}** / 毒性: {a['toxicity']} / 振れ幅: {a['volatility']}\n"
+                   f"・サンプル: {a['samples']}件"
+                   + (f"\n\n💡 **提案**: {sug}" if sug else ""))
 
 
 # =============================================================================
