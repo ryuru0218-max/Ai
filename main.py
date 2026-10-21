@@ -655,9 +655,10 @@ CONFIG = {
     "PORT": int(os.environ.get("PORT", "8080")),
     "DATA_DIR": os.environ.get("POCHI_DATA_DIR", os.path.join(os.getcwd(), "pochi_data")),
     "PLUGIN_DIR": os.environ.get("POCHI_PLUGIN_DIR", os.path.join(os.getcwd(), "pochi_plugins")),
-    "MODEL": os.environ.get("POCHI_MODEL", "gemini-2.5-flash-lite"),
+    "MODEL": os.environ.get("POCHI_MODEL", "gemini-3.8-flash"),
     "MODEL_FALLBACKS": [m for m in os.environ.get(
-        "POCHI_MODEL_FALLBACKS", "gemini-2.5-flash,gemini-2.0-flash").split(",") if m],
+        "POCHI_MODEL_FALLBACKS",
+        "gemini-3.8-flash-lite,gemini-3.5-flash-lite,gemini-2.5-flash").split(",") if m],
     "MAX_CONCURRENCY": int(os.environ.get("POCHI_MAX_CONCURRENCY", "6")),
     "AUTO_AMBIENT": os.environ.get("POCHI_AUTO_AMBIENT", "1") not in ("0", "false", "False"),
     "SHELL_ALLOW": ["echo", "ls", "cat", "head", "tail", "wc", "grep", "find", "date",
@@ -2053,7 +2054,7 @@ BASE_MODES = {
     "trader": "トレーダー(経済)", "game_master": "ゲームマスター",
 }
 AI_ENGINE_MODES = {
-    "gemini": "Gemini 2.5 Flash-Lite (高速)", "gemini_flash": "Gemini 2.5 Flash (高精度)",
+    "gemini": "Gemini 3.8 Flash (高速)", "gemini_flash": "Gemini 3.8 Flash Pro (高精度)",
     "groq": "Groq Llama 3.3 70B (超爆速)", "openrouter": "OpenRouter Llama 3.3 (無料枠)",
     "openrouter_r1": "OpenRouter DeepSeek R1 (推論)", "local": "ローカルエンジン(APIキー不要)",
 }
@@ -2207,7 +2208,7 @@ def call_ai(state: dict, payload, is_bot_opponent: bool = False,
         attempts.append(("local", "heuristic", lambda k: ""))
 
     if engine in ("gemini", "gemini_flash") or not attempts:
-        pref = "gemini-2.5-flash" if engine == "gemini_flash" else CONFIG["MODEL"]
+        pref = "gemini-3.8-flash-pro" if engine == "gemini_flash" else CONFIG["MODEL"]
         for m in [pref] + [x for x in CONFIG["MODEL_FALLBACKS"] if x != pref]:
             attempts.append(("gemini", m, (lambda mm: lambda k: _gemini_call(mm, k, system, user_text, hist, has_image))(m)))
         if engine == "groq" and GROQ_POOL.available():
