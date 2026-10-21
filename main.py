@@ -7749,7 +7749,7 @@ async def chat(ctx, *, name: str = ""):
     emb = make_embed("💬 AIチャット 部屋を作りました", "", 0x5B8CFF)
     emb.add_field(name="部屋名", value=room["name"])
     emb.add_field(name="招待コード", value=f"`{room['code']}`", inline=True)
-    emb.add_field(name="会話URL", value=room["url"], inline=False)
+    emb.add_field(name="会話URL", value=f"[🔗 {room['url']}]({room['url']})", inline=False)
     emb.add_field(name="使い方", value="上のリンクを友達に送る → 友達が同じ部屋に参加して会話できます。\n"
                                      f"Discordから送る場合: `!chatsend {room['code']} メッセージ`")
     emb.set_footer(text="POCHI CHAT — 友達と共有できるAIチャット")
@@ -7770,7 +7770,7 @@ async def chatjoin(ctx, *, code: str = ""):
     emb = make_embed("💬 AIチャット に参加します", "", 0x00D4A0)
     emb.add_field(name="部屋名", value=room["name"])
     emb.add_field(name="招待コード", value=f"`{room['code']}`", inline=True)
-    emb.add_field(name="会話URL", value=room["url"], inline=False)
+    emb.add_field(name="会話URL", value=f"[🔗 {room['url']}]({room['url']})", inline=False)
     emb.add_field(name="最新の発言", value=(CHAT.messages(room["id"], 0, 3)[-1]["text"][:200]
                                         if CHAT.messages(room["id"], 0, 3) else "まだ発言がありません"))
     await ctx.send(embed=emb)
@@ -9668,11 +9668,17 @@ async def _chat_reply(room_id: str, text: str, author: str, mode: str, persona: 
         if len(reply) > 3800:
             reply = reply[:3800] + "…"
         # ストリーミング配信(トーストが気持ちよくなる)
+        # 分割数を先に求め、全体のストリーミング時間を一定に保つ
+        # (長い応答で数秒も待たされるのを防ぐ)
         sid = uuid.uuid4().hex[:8]
+        chunks = _stream_chunks(reply)
         CHAT.publish(room_id, {"type": "stream_start", "sid": sid, "author": "POCHI"})
-        for chunk in _stream_chunks(reply):
-            CHAT.publish(room_id, {"type": "delta", "sid": sid, "text": chunk})
-            await asyncio.sleep(0.035)
+        if chunks:
+            delay = min(0.035, max(0.004, 1.2 / len(chunks)))
+            for chunk in chunks:
+                CHAT.publish(room_id, {"type": "delta", "sid": sid, "text": chunk})
+                if delay > 0:
+                    await asyncio.sleep(delay)
         CHAT.add_message(room_id, "ai", "POCHI", reply,
                          {"mode": mode, "persona": persona, "style": style,
                           "engine": engine, "latency_ms": latency})
