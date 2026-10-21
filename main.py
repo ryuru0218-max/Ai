@@ -8749,6 +8749,13 @@ class ChatStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT, role TEXT, author TEXT,
                 text TEXT, ts REAL, meta TEXT
             );
+            CREATE TABLE IF NOT EXISTS chat_reactions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT, msg INTEGER,
+                emoji TEXT, who TEXT, ts REAL
+            );
+            CREATE TABLE IF NOT EXISTS chat_typing(
+                room TEXT, who TEXT, ts REAL, PRIMARY KEY(room, who)
+            );
             CREATE INDEX IF NOT EXISTS idx_chat_room ON chat_messages(room, id);
             """)
             self.conn.commit()
@@ -8828,7 +8835,8 @@ class ChatStore:
             self.conn.commit()
             mid = cur.lastrowid
         return {"id": mid, "room": room_id, "role": role, "author": author or "POCHI",
-                "text": text, "ts": time.time(), "kind": "message"}
+                "text": text, "ts": time.time(), "kind": "message",
+                "quote": (meta or {}).get("quote")}
 
     def messages(self, room_id: str, after: int = 0, limit: int = 200) -> list[dict]:
         with self.lock:
@@ -8842,7 +8850,8 @@ class ChatStore:
             except Exception:  # noqa: BLE001
                 meta = {}
             out.append({"id": r["id"], "role": r["role"], "author": r["author"],
-                        "text": r["text"], "ts": r["ts"], "kind": "message", "meta": meta})
+                        "text": r["text"], "ts": r["ts"], "kind": "message",
+                        "meta": meta, "quote": meta.get("quote")})
         return out
 
     def participants(self, room_id: str) -> list[dict]:
@@ -8880,6 +8889,90 @@ class ChatStore:
             who = "POCHI" if m["role"] == "ai" else m["author"]
             lines.append(f"**{who}** ({datetime.fromtimestamp(m['ts'], JST):%H:%M})  \n{m['text']}\n")
         return "\n".join(lines)
+
+    def add_reaction(self, room_id: str, msg_id: int, emoji: str, who: str = "") -> dict:
+        """メッセージへのリアクションをトグルする。"""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT id FROM chat_reactions WHERE room=? AND msg=? AND emoji=? AND who=?",
+                (room_id, msg_id, emoji, who)).fetchone()
+            if row:
+                self.conn.execute("DELETE FROM chat_reactions WHERE id=?", (row["id"],))
+                on = False
+            else:
+                self.conn.execute(
+                    "INSERT INTO chat_reactions(room, msg, emoji, who, ts) VALUES(?,?,?,?,?)",
+                    (room_id, msg_id, emoji, who, time.time()))
+                on = True
+            self.conn.commit()
+            rows = self.conn.execute(
+                "SELECT emoji, COUNT(*) c FROM chat_reactions WHERE room=? AND msg=? GROUP BY emoji",
+                (room_id, msg_id)).fetchall()
+        return {"msg_id": msg_id, "on": on,
+                "reactions": [{"emoji": r["emoji"], "count": r["c"]} for r in rows]}
+
+    def reactions_of(self, room_id: str) -> dict:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT msg, emoji, COUNT(*) c FROM chat_reactions WHERE room=? GROUP BY msg, emoji",
+                (room_id,)).fetchall()
+        out: dict = {}
+        for r in rows:
+            out.setdefault(r["msg"], []).append({"emoji": r["emoji"], "count": r["c"]})
+        return out
+
+    def edit_message(self, room_id: str, msg_id: int, text: str, who: str) -> bool:
+        with self.lock:
+            cur = self.conn.execute(
+                "UPDATE chat_messages SET text=? WHERE id=? AND room=? AND author=?",
+                (text, msg_id, room_id, who))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def delete_message(self, room_id: str, msg_id: int, who: str) -> bool:
+        with self.lock:
+            cur = self.conn.execute(
+                "DELETE FROM chat_messages WHERE id=? AND room=? AND (author=? OR ?='POCHI')",
+                (msg_id, room_id, who, who))
+            self.conn.execute("DELETE FROM chat_reactions WHERE room=? AND msg=?", (room_id, msg_id))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def search(self, room_id: str, q: str, limit: int = 20) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM chat_messages WHERE room=? AND text LIKE ? ORDER BY id DESC LIMIT ?",
+                (room_id, f"%{q}%", limit)).fetchall()
+        return [{"id": r["id"], "author": r["author"], "text": r["text"][:200],
+                 "ts": r["ts"]} for r in rows]
+
+    def last_ai_message(self, room_id: str) -> dict | None:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM chat_messages WHERE room=? AND role='ai' ORDER BY id DESC LIMIT 1",
+                (room_id,)).fetchone()
+        if not row:
+            return None
+        return {"id": row["id"], "text": row["text"], "author": row["author"]}
+
+    def typing(self, room_id: str) -> list[str]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT who FROM chat_typing WHERE room=? AND ts > ?",
+                (room_id, time.time() - 8)).fetchall()
+        return [r["who"] for r in rows]
+
+    def set_typing(self, room_id: str, who: str) -> None:
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO chat_typing(room, who, ts) VALUES(?,?,?)",
+                (room_id, who, time.time()))
+            self.conn.commit()
+
+    def clear_typing(self, room_id: str, who: str) -> None:
+        with self.lock:
+            self.conn.execute("DELETE FROM chat_typing WHERE room=? AND who=?", (room_id, who))
+            self.conn.commit()
 
     # ---- リアルタイム通知(thread-safe / ループ非依存) ----------------------
     def subscribe(self, room_id: str) -> "queue.Queue":
@@ -9332,8 +9425,110 @@ def _r_chat_messages(params, query, body, headers):
     if member:
         CHAT.touch(room["id"], member)
     return 200, {"room": room, "messages": CHAT.messages(room["id"], after),
+                 "reactions": CHAT.reactions_of(room["id"]),
+                 "typing": CHAT.typing(room["id"]),
                  "participants": CHAT.participants(room["id"]),
-                 "modes": BASE_MODES, "personas": RP_MODES, "styles": CHAT_STYLES}
+                 "modes": BASE_MODES, "personas": RP_MODES, "styles": CHAT_STYLES,
+                 "ai": {"model": CONFIG["MODEL"],
+                         "live": bool(CONFIG["GEMINI_KEYS"] or CONFIG["GROQ_KEYS"]
+                                      or CONFIG["OPENROUTER_KEYS"])}}
+
+
+@WEB.route("POST", "/api/chat/rooms/{rid}/react", public=True)
+def _r_chat_react(params, query, body, headers):
+    room = CHAT.get_room(params["rid"])
+    if room is None:
+        return 404, {"error": "部屋が見つかりません"}
+    try:
+        msg_id = int((body or {}).get("msg", 0))
+    except (TypeError, ValueError):
+        msg_id = 0
+    emoji = str((body or {}).get("emoji", "👍"))[:8]
+    who = str((body or {}).get("who", ""))[:24]
+    res = CHAT.add_reaction(room["id"], msg_id, emoji, who)
+    CHAT.publish(room["id"], {"type": "reactions", "msg_id": msg_id,
+                              "reactions": res["reactions"]})
+    return 200, res
+
+
+@WEB.route("POST", "/api/chat/rooms/{rid}/edit", public=True)
+def _r_chat_edit(params, query, body, headers):
+    room = CHAT.get_room(params["rid"])
+    if room is None:
+        return 404, {"error": "部屋が見つかりません"}
+    try:
+        msg_id = int((body or {}).get("msg", 0))
+    except (TypeError, ValueError):
+        msg_id = 0
+    text = str((body or {}).get("text", ""))[:4000]
+    who = str((body or {}).get("who", ""))[:24]
+    ok = CHAT.edit_message(room["id"], msg_id, text, who)
+    if ok:
+        CHAT.publish(room["id"], {"type": "message"})
+    return 200, {"ok": ok}
+
+
+@WEB.route("POST", "/api/chat/rooms/{rid}/delete", public=True)
+def _r_chat_delete(params, query, body, headers):
+    room = CHAT.get_room(params["rid"])
+    if room is None:
+        return 404, {"error": "部屋が見つかりません"}
+    try:
+        msg_id = int((body or {}).get("msg", 0))
+    except (TypeError, ValueError):
+        msg_id = 0
+    who = str((body or {}).get("who", ""))[:24]
+    ok = CHAT.delete_message(room["id"], msg_id, who)
+    if ok:
+        CHAT.publish(room["id"], {"type": "message"})
+    return 200, {"ok": ok}
+
+
+@WEB.route("POST", "/api/chat/rooms/{rid}/typing", public=True)
+def _r_chat_typing(params, query, body, headers):
+    room = CHAT.get_room(params["rid"])
+    if room is None:
+        return 404, {"error": "部屋が見つかりません"}
+    who = str((body or {}).get("who", ""))[:24]
+    if (body or {}).get("on"):
+        CHAT.set_typing(room["id"], who)
+    else:
+        CHAT.clear_typing(room["id"], who)
+    CHAT.publish(room["id"], {"type": "typing", "who": who,
+                              "on": bool((body or {}).get("on"))})
+    return 200, {"ok": True}
+
+
+@WEB.route("POST", "/api/chat/rooms/{rid}/regenerate", public=True)
+def _r_chat_regen(params, query, body, headers):
+    """直前のAI応答を作り直す(再生成)。"""
+    room = CHAT.get_room(params["rid"])
+    if room is None:
+        return 404, {"error": "部屋が見つかりません"}
+    msgs = CHAT.messages(room["id"], 0, 60)
+    last_user = None
+    for m in reversed(msgs):
+        if m["role"] == "user":
+            last_user = m
+            break
+    if last_user is None:
+        return 400, {"error": "再生成するメッセージがありません"}
+    who = str((body or {}).get("who", ""))[:24]
+    if who:
+        with contextlib.suppress(Exception):
+            CHAT.delete_message(room["id"], last_user.get("id", 0), "POCHI")
+    _schedule_chat_reply(room["id"], last_user["text"], last_user["author"],
+                         room["mode"], room["persona"], room["style"])
+    return 200, {"ok": True}
+
+
+@WEB.route("GET", "/api/chat/rooms/{rid}/search", public=True)
+def _r_chat_search(params, query, body, headers):
+    room = CHAT.get_room(params["rid"])
+    if room is None:
+        return 404, {"error": "部屋が見つかりません"}
+    q = str((query.get("q") or [""])[0])
+    return 200, {"results": CHAT.search(room["id"], q, 30) if q else []}
 
 
 @WEB.route("POST", "/api/chat/rooms/{rid}/messages", public=True)
@@ -9349,14 +9544,26 @@ def _r_chat_post(params, query, body, headers):
     mode = str((body or {}).get("mode", room["mode"]))[:32]
     persona = str((body or {}).get("persona", room["persona"]))[:32]
     style = str((body or {}).get("style", room["style"]))[:32]
+    quote = (body or {}).get("quote")
+    if isinstance(quote, dict):
+        quote = {"id": quote.get("id"), "author": str(quote.get("author", ""))[:24],
+                 "text": str(quote.get("text", ""))[:200]}
+    else:
+        quote = None
     CHAT.set_settings(room["id"], mode, persona, style)
     CHAT.touch(room["id"], author)
-    CHAT.add_message(room["id"], "user", author, text)
+    CHAT.add_message(room["id"], "user", author, text, {"quote": quote} if quote else None)
     CHAT.publish(room["id"], {"type": "message"})
-    CHAT.publish(room["id"], {"type": "typing", "on": True})
+    CHAT.publish(room["id"], {"type": "typing", "on": True, "who": "POCHI"})
     # 応答生成はバックグラウンドで(リクエストを待たせない)
     # イベントループが無くても動くよう、スレッドでも起動できるようにする
-    _schedule_chat_reply(room["id"], text, author, mode, persona, style)
+    try:
+        _schedule_chat_reply(room["id"], text, author, mode, persona, style)
+    except Exception as exc:  # noqa: BLE001
+        LOG.error(f"chat reply scheduling failed: {exc}")
+        # 最後の砧: 同期実行で確実に応答を残す
+        with contextlib.suppress(Exception):
+            asyncio.run(_chat_reply(room["id"], text, author, mode, persona, style))
     return 200, {"ok": True, "room": CHAT.get_room(room["id"])}
 
 
