@@ -1,0 +1,40 @@
+09:12:15 [INFO   ] KeepAliveサーバーを port=8080 で起動
+09:12:15 [ERROR  ] KeepAliveサーバー起動失敗: [Errno 98] Address already in use
+09:12:37 [INFO   ] Pocket[selftest] メモリ展開完了 (関数: ['run'])
+09:12:37 [INFO   ] KeepAliveサーバーを port=8082 で起動
+09:13:19 [INFO   ] Pocket[selftest] メモリ展開完了 (関数: ['run'])
+09:13:19 [INFO   ] KeepAliveサーバーを port=8082 で起動
+09:13:37 [INFO   ] Pocket[selftest] メモリ展開完了 (関数: ['run'])
+09:13:37 [INFO   ] KeepAliveサーバーを port=8082 で起動
+09:14:10 [INFO   ] Pocket[t_dice] メモリ展開完了 (関数: ['run'])
+09:14:23 [INFO   ] Pocket[t_dice] メモリ展開完了 (関数: ['run'])
+09:14:23 [INFO   ] Pocket[hotplug] メモリ展開完了 (関数: ['run'])
+09:14:52 [INFO   ] Pocket[dice] メモリ展開完了 (関数: ['run'])
+09:14:52 [INFO   ] Pocket[t_dice] メモリ展開完了 (関数: ['run'])
+09:14:52 [INFO   ] Pocket[hotplug] メモリ展開完了 (関数: ['run'])
+09:15:02 [INFO   ] Pocket[dice] メモリ展開完了 (関数: ['run'])
+09:15:02 [INFO   ] Pocket[t_dice] メモリ展開完了 (関数: ['run'])
+09:15:02 [INFO   ] Pocket[hotplug] メモリ展開完了 (関数: ['run'])
+09:15:36 [INFO   ] Pocket[selftest] メモリ展開完了 (関数: ['run'])
+09:15:36 [INFO   ] KeepAliveサーバーを port=8082 で起動
+09:17:01 [ERROR  ] execute_modal_action(judge_resba) 失敗: '_Ch' object has no attribute 'history'
+09:17:01 [ERROR  ] execute_modal_action(mass_nick) 失敗: '<' not supported between instances of 'NoneType' and 'R'
+09:17:01 [ERROR  ] execute_modal_action(create_stage) 失敗: '_G' object has no attribute 'create_stage_channel'
+09:17:01 [ERROR  ] execute_modal_action(create_forum) 失敗: '_G' object has no attribute 'create_forum'
+09:17:01 [ERROR  ] execute_direct_action(act_nsfw) 失敗: '_Ch' object has no attribute 'nsfw'
+09:17:01 [WARN   ] Cloud Restore スキップ: 'Bot' object has no attribute 'guilds'
+09:17:51 [ERROR  ] execute_modal_action(judge_resba) 失敗: '_Ch' object has no attribute 'history'
+09:17:52 [ERROR  ] execute_modal_action(mass_nick) 失敗: '<' not supported between instances of 'NoneType' and 'R'
+09:17:52 [ERROR  ] execute_modal_action(create_stage) 失敗: '_G' object has no attribute 'create_stage_channel'
+09:17:52 [ERROR  ] execute_modal_action(create_forum) 失敗: '_G' object has no attribute 'create_forum'
+09:17:52 [ERROR  ] execute_modal_action(set_perm) 失敗: module 'discord' has no attribute 'Permissions'
+09:17:52 [WARN   ] Cloud Restore スキップ: 'Bot' object has no attribute 'guilds'
+09:19:18 [ERROR  ] execute_modal_action(mass_nick) 失敗: '<' not supported between instances of 'R' and 'R'
+09:19:18 [WARN   ] Cloud Restore スキップ: 'Bot' object has no attribute 'guilds'
+09:19:55 [WARN   ] Cloud Restore スキップ: 'Bot' object has no attribute 'guilds'
+09:20:03 [WARN   ] Cloud Restore スキップ: 'Bot' object has no attribute 'guilds'
+09:20:06 [INFO   ] Pocket[selftest] メモリ展開完了 (関数: ['run'])
+09:20:06 [INFO   ] KeepAliveサーバーを port=8082 で起動
+09:20:07 [INFO   ] Pocket[dice] メモリ展開完了 (関数: ['run'])
+09:20:07 [INFO   ] Pocket[t_dice] メモリ展開完了 (関数: ['run'])
+09:20:07 [INFO   ] Pocket[hotplug] メモリ展開完了 (関数: ['run'])
