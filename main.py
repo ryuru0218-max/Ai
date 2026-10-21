@@ -482,6 +482,26 @@ def _install_discord_stub():
         async def __call__(self, ctx, *args, **kwargs):
             return await self.func(ctx, *args, **kwargs)
 
+    class _CommandTree:
+        """ discord.py の bot.tree を模した SlashCommand 登録先。 """
+
+        def __init__(self):
+            self.commands: dict = {}
+
+        def add_command(self, cmd, **kw):
+            name = getattr(cmd, "name", None) or getattr(cmd, "__name__", "cmd")
+            self.commands[name] = cmd
+            return cmd
+
+        def remove_command(self, name, *a):
+            return self.commands.pop(name, None)
+
+        def sync(self, *a, **kw):
+            return []
+
+        def get_command(self, name, *a, **kw):
+            return self.commands.get(name)
+
     class _Bot:
         def __init__(self, command_prefix=None, intents=None, **kw):
             self.command_prefix = command_prefix
@@ -492,6 +512,7 @@ def _install_discord_stub():
             self.user = _User(id=1, name="pochi", bot=True)
             self.latency = 0.0
             self.loop = asyncio.get_event_loop_policy().new_event_loop()
+            self.tree = _CommandTree()
 
         def event(self, fn):
             self.events[fn.__name__] = fn
@@ -599,6 +620,49 @@ def _install_discord_stub():
     ext.commands = commands
     ext.tasks = tasks
     d.ext = ext
+    app_commands = types.ModuleType("discord.app_commands")
+
+    class _AppCommand:
+        def __init__(self, name=None, description="", **kw):
+            self.name = name
+            self.description = description
+            self.kw = kw
+            self.callback = None
+            self.__discord_app_commands_group__ = None
+
+        def command(self, *a, **kw):
+            def deco(fn):
+                fn.__slash_name__ = kw.get("name") or fn.__name__
+                fn.__slash_description__ = kw.get("description", "")
+                self.__dict__.setdefault("_subs", {})[fn.__slash_name__] = fn
+                return fn
+            return deco
+
+        def add_command(self, cmd, **kw):
+            return cmd
+
+    class _Group(_AppCommand):
+        pass
+
+    def _group(**kw):
+        def deco(obj):
+            return obj
+        if "name" in kw:
+            return _Group(**kw)
+        return deco
+
+    def _describe(**kw):
+        def deco(fn):
+            fn.__slash_describe__ = kw
+            return fn
+        return deco
+
+    app_commands.Group = _group
+    app_commands.describe = _describe
+    app_commands.command = lambda *a, **kw: (lambda fn: fn)
+    app_commands.Context = object
+    sys.modules["discord.app_commands"] = app_commands
+    setattr(d, "app_commands", app_commands)
     sys.modules["discord"] = d
     sys.modules["discord.ui"] = ui
     sys.modules["discord.ext"] = ext
@@ -7463,6 +7527,12 @@ async def on_message(message):
     emo = sentiment_score(raw)
     profile.observe(raw, emo)
 
+    # --- 新機能の統合(レベル/索引/マクロ/ダイス) ---
+    if not message.author.bot and raw:
+        with contextlib.suppress(Exception):
+            if await handle_integrations(message, raw, st):
+                return
+
     # --- AutoMod 判定(自作ルール) ---
     if raw and not message.author.bot:
         gid = message.guild.id if hasattr(message, "guild") and message.guild else 0
@@ -7536,6 +7606,8 @@ async def on_message(message):
                                               message.author.bot, clone_prompt, council)
                 bot_stats["calls"] += 1
                 bot_stats["replies"] += 1
+                with contextlib.suppress(Exception):
+                    COSTS.record("gemini-flash", len(str(payload)) // 4)
                 if res.latency_ms:
                     bot_stats["latencies"].append(res.latency_ms)
 
@@ -10764,6 +10836,500 @@ async def apis(ctx):
         lines.append(f"・`{name}` — {spec[0]}")
     total = len(FREE_APIS) + len(EXTENDED_APIS) + len(EXTRA_APIS)
     await ctx.send(f"🌐 **外部API 一覧 ({total}種 / すべてキー不要)**\n" + "\n".join(lines))
+
+
+# =============================================================================
+#  SECTION 18 -  統合(新機能を実運用へ) / 内部強化 / その他
+# =============================================================================
+
+# =============================================================================
+#  SECTION 18 -  統合(新機能を実運用へ) / 内部強化 / その他
+# =============================================================================
+class FeatureFlags:
+    """機能フラグ(実行時に有効/無効を切り替え)。"""
+
+    DEFAULTS = {
+        "ambient_autonomy": True, "automod": True, "level_xp": True, "message_index": True,
+        "macros": True, "reaction_roles": True, "memory_recall": True, "auto_ai": True,
+        "web_dashboard": True, "voice_playback": True, "cloud_backup": True, "dice_roller": True,
+    }
+
+    def __init__(self):
+        self.flags = dict(self.DEFAULTS)
+        self.lock = threading.RLock()
+        self.history: deque = deque(maxlen=40)
+
+    def get(self, name: str) -> bool:
+        with self.lock:
+            return bool(self.flags.get(name, False))
+
+    def set(self, name: str, value: bool) -> bool:
+        with self.lock:
+            if name not in self.flags:
+                return False
+            old = self.flags[name]
+            self.flags[name] = bool(value)
+            self.history.append({"flag": name, "from": old, "to": bool(value), "ts": jst_stamp()})
+            return True
+
+    def toggle(self, name: str):
+        with self.lock:
+            if name not in self.flags:
+                return None
+            self.flags[name] = not self.flags[name]
+            self.history.append({"flag": name, "to": self.flags[name], "ts": jst_stamp()})
+            return self.flags[name]
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return dict(self.flags)
+
+
+FLAGS = FeatureFlags()
+
+
+class AuditTrail:
+    """重要操作の監査ログ(SQLite 永続化)。"""
+
+    def __init__(self, path: str = DB_PATH):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
+        with self.lock:
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, actor INTEGER, guild INTEGER,
+                action TEXT, detail TEXT
+            )""")
+            self.conn.commit()
+
+    def record(self, actor: int, action: str, detail: str = "", guild: int = 0) -> None:
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO audit(ts, actor, guild, action, detail) VALUES(?,?,?,?,?)",
+                (time.time(), actor, guild, action, detail[:500]))
+            self.conn.commit()
+
+    def recent(self, limit: int = 50) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [{"ts": datetime.fromtimestamp(r["ts"], JST).strftime("%m-%d %H:%M"),
+                 "actor": r["actor"], "action": r["action"], "detail": r["detail"]} for r in rows]
+
+    def count(self) -> int:
+        with self.lock:
+            return self.conn.execute("SELECT COUNT(*) c FROM audit").fetchone()["c"]
+
+
+AUDIT = AuditTrail()
+
+
+class CostTracker:
+    """API利用量・コストの概算トラッキング。"""
+
+    PRICES = {"gemini-flash": 0.00000015, "gemini-pro": 0.00000125, "local": 0.0}
+
+    def __init__(self):
+        self.usage: dict[str, dict] = defaultdict(lambda: {"calls": 0, "tokens": 0, "usd": 0.0})
+        self.lock = threading.RLock()
+
+    def record(self, provider: str, tokens: int = 0) -> dict:
+        price = self.PRICES.get(provider, 0.0000002)
+        with self.lock:
+            u = self.usage[provider]
+            u["calls"] += 1
+            u["tokens"] += tokens
+            u["usd"] += tokens * price
+        return dict(u)
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {k: dict(v) for k, v in self.usage.items()}
+
+    def total_usd(self) -> float:
+        with self.lock:
+            return round(sum(v["usd"] for v in self.usage.values()), 6)
+
+
+COSTS = CostTracker()
+
+
+
+class BackupManager:
+    """ローカルバックアップ(状態・記憶・経済・設定)と復元。"""
+
+    def __init__(self, data_dir: str | None = None):
+        self.dir = os.path.join(data_dir or CONFIG["DATA_DIR"], "backups")
+        os.makedirs(self.dir, exist_ok=True)
+        self.history: deque = deque(maxlen=30)
+
+    def snapshot(self) -> dict:
+        return {
+            "states": {str(cid): {k: st.get(k) for k in
+                                  ("base_mode", "rp_mode", "ai_engine", "stress", "affection",
+                                   "count", "learned_facts", "todos", "vocab")}
+                       for cid, st in channels_state.items()},
+            "profiles": {str(uid): p.snapshot() for uid, p in PROFILES.items()},
+            "memory": [n.to_dict() for n in MEMORY.nodes[-500:]],
+            "wallets": [{"uid": r["uid"], "coins": r.get("coins", 0),
+                         "total": r.get("total", 0)} for r in ECON.leaderboard(0, 500)],
+            "flags": FLAGS.snapshot(),
+            "created": time.time(),
+        }
+
+    def create(self) -> dict:
+        data = self.snapshot()
+        raw = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+        name = f"pochi_backup_{now_jst().strftime('%Y%m%d_%H%M%S')}.json.gz"
+        path = os.path.join(self.dir, name)
+        with gzip.open(path, "wb") as fh:
+            fh.write(raw)
+        with open(path + ".sha256", "w", encoding="utf-8") as fh:
+            fh.write(hashlib.sha256(raw).hexdigest())
+        self.history.append({"name": name, "size": len(raw), "ts": jst_stamp()})
+        return {"ok": True, "file": name, "path": path, "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest()[:16]}
+
+    def list(self) -> list[dict]:
+        rows = []
+        for fn in sorted(os.listdir(self.dir), reverse=True)[:30]:
+            if not fn.endswith(".json.gz"):
+                continue
+            p = os.path.join(self.dir, fn)
+            rows.append({"name": fn, "size": os.path.getsize(p),
+                         "mtime": datetime.fromtimestamp(os.path.getmtime(p), JST).strftime("%m-%d %H:%M")})
+        return rows
+
+    def restore(self, name: str) -> dict:
+        path = os.path.join(self.dir, name)
+        if not os.path.exists(path):
+            return {"ok": False, "error": "ファイルが見つかりません"}
+        try:
+            with gzip.open(path, "rb") as fh:
+                data = json.loads(fh.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"復元に失敗: {exc}"}
+        for cid_s, st in (data.get("states") or {}).items():
+            get_state(int(cid_s)).update(st)
+        for pid, prof in (data.get("profiles") or {}).items():
+            p = get_profile(int(pid))
+            p.affection = prof.get("affection", 50)
+            p.trust = prof.get("trust", 50)
+        for k, v in (data.get("flags") or {}).items():
+            FLAGS.set(k, v)
+        return {"ok": True, "states": len(data.get("states") or {}),
+                "profiles": len(data.get("profiles") or {})}
+
+    def prune(self, keep: int = 10) -> int:
+        files = [f for f in sorted(os.listdir(self.dir)) if f.endswith(".json.gz")]
+        removed = 0
+        for fn in (files[:-keep] if len(files) > keep else []):
+            with contextlib.suppress(Exception):
+                os.remove(os.path.join(self.dir, fn))
+                removed += 1
+        return removed
+
+
+BACKUPS = BackupManager()
+
+
+class SelfUpdater:
+    """GitHub の生ファイルから自身を更新する(構文検証付き)。"""
+
+    def __init__(self, repo: str = "ryuru0218-max/Ai", branch: str = "main"):
+        self.repo = repo
+        self.branch = branch
+        self.last_check: float = 0.0
+        self.current_sha = ""
+
+    def remote_url(self) -> str:
+        return f"https://raw.githubusercontent.com/{self.repo}/{self.branch}/main.py"
+
+    async def check(self) -> dict:
+        self.last_check = time.time()
+        data = await FastHTTP.get_json(
+            f"https://api.github.com/repos/{self.repo}/commits/{self.branch}", ttl=300,
+            headers={"Accept": "application/vnd.github+json"})
+        if not data or "sha" not in data:
+            return {"ok": False, "error": "GitHub から情報を取得できません"}
+        self.current_sha = data["sha"][:12]
+        local = "?"
+        try:
+            with open(os.path.abspath(__file__), "rb") as fh:
+                local = hashlib.sha256(fh.read()).hexdigest()[:12]
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True, "remote_sha": self.current_sha, "local_sha": local,
+                "message": data.get("commit", {}).get("message", "")[:120],
+                "date": data.get("commit", {}).get("author", {}).get("date", "")}
+
+    async def apply(self, backup_first: bool = True) -> dict:
+        """自己更新。バックアップ->取得->構文検証->置換 の順で安全に実施。"""
+        if backup_first:
+            with contextlib.suppress(Exception):
+                BACKUPS.create()
+        blob = await FastHTTP.get_bytes(self.remote_url(), timeout_sec=30.0)
+        if not blob:
+            return {"ok": False, "error": "更新ファイルを取得できません"}
+        source = blob.decode("utf-8", "replace")
+        try:
+            compile(source, "main.py", "exec")
+        except SyntaxError as exc:
+            return {"ok": False, "error": f"更新版が構文エラー: {exc}"}
+        path = os.path.abspath(__file__)
+        try:
+            with open(path, "wb") as fh:
+                fh.write(blob)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"書き込みに失敗: {exc}"}
+        return {"ok": True, "bytes": len(blob), "path": path,
+                "note": "反映には再起動が必要です"}
+
+
+UPDATER = SelfUpdater()
+
+
+
+# --- 新機能の統合(メッセージパイプライン) ----------------------------------
+DICE_PATTERN = re.compile(r"(\d*)d(\d+)([+-]\d+)?", re.IGNORECASE)
+
+
+async def handle_integrations(message, raw: str, state: dict):
+    """メッセージ受信時に新機能を統合実行する(フラグで個別無効化)。"""
+    uid = message.author.id
+    gid = message.guild.id if hasattr(message, "guild") and message.guild else 0
+    cid = message.channel.id
+    # 1) 発言インデックス
+    if FLAGS.get("message_index") and raw and not message.author.bot:
+        with contextlib.suppress(Exception):
+            MSGINDEX.add(cid, uid, raw, gid)
+    # 2) レベル/XP
+    if FLAGS.get("level_xp") and not message.author.bot:
+        with contextlib.suppress(Exception):
+            lv = LEVELS.add_xp(uid, gid, 5 + min(10, len(raw) // 40), 1)
+            if lv["level"] > 0 and lv["level"] % 5 == 0:
+                await message.channel.send(
+                    f"⭐ **レベルアップ!** {message.author.display_name} は Lv.{lv['level']} "
+                    f"({lv['rank']}) に到達しました。")
+    # 3) カスタムマクロ
+    if FLAGS.get("macros") and raw:
+        with contextlib.suppress(Exception):
+            resp = MACROS.get(gid, raw.strip().lower())
+            if resp:
+                MACROS.hit(gid, raw.strip().lower())
+                await message.channel.send(resp[:1900])
+                return True
+    # 4) ダイスロール(1d100 形式)
+    if FLAGS.get("dice_roller") and raw:
+        m = DICE_PATTERN.fullmatch(raw.strip())
+        if m and m.group(2):
+            count = max(1, min(50, int(m.group(1) or 1)))
+            sides = max(2, min(1000, int(m.group(2))))
+            rolls = [random.randint(1, sides) for _ in range(count)]
+            bonus = int(m.group(3) or 0)
+            total = sum(rolls) + bonus
+            await message.channel.send(
+                f"🎲 **{raw.strip()}** → `{rolls}` = **{total}**"
+                + (f" ({bonus:+d})" if bonus else ""))
+            return True
+    return False
+
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    """リアクショRole(絵文字->ロール)を自動付与する。"""
+    if not FLAGS.get("reaction_roles"):
+        return
+    try:
+        gid = payload.guild_id
+        if not gid:
+            return
+        mapping = REACTION_ROLES.get(gid) or {}
+        emoji = str(payload.emoji)
+        role_name = mapping.get(emoji)
+        if not role_name:
+            return
+        guild = bot.get_guild(gid)
+        if guild is None:
+            return
+        role = next((r for r in guild.roles if r.name == role_name), None)
+        member = guild.get_member(payload.user_id)
+        if role is not None and member is not None:
+            with contextlib.suppress(Exception):
+                await member.add_roles(role)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"reaction role error: {exc}")
+
+
+# --- スラッシュコマンド(app_commands) ---------------------------------------
+try:
+    import discord.app_commands as app_commands
+
+    slash_group = app_commands.Group(name="pochi", description="POCHI ULTIMATE スラッシュコマンド")
+
+    @slash_group.command(name="status", description="内部ステータスを表示")
+    async def _slash_status(interaction):
+        snap = GOV.snapshot()
+        await interaction.response.send_message(
+            f"📊 CPU {snap['cpu']}% / MEM {snap['mem_pct']}% / モード `{snap['mode']}`\n"
+            f"稼働 {int(time.time() - bot_stats['start_time'])}s / モデル `{CONFIG['MODEL']}`",
+            ephemeral=True)
+
+    @slash_group.command(name="search", description="このサーバーの発言を検索")
+    @app_commands.describe(query="検索キーワード")
+    async def _slash_search(interaction, query: str):
+        hits = MSGINDEX.search(query, interaction.channel_id, 8) or MSGINDEX.search(query, 0, 8)
+        if not hits:
+            await interaction.response.send_message(f"🔍 『{query}』は未検出", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                f"🔍 {len(hits)}件\n" + "\n".join(f"・{h['content'][:90]}" for h in hits),
+                ephemeral=True)
+
+    @slash_group.command(name="level", description="レベルを確認")
+    async def _slash_level(interaction):
+        data = LEVELS.get(interaction.user.id, interaction.guild_id if interaction.guild else 0)
+        await interaction.response.send_message(
+            f"⭐ Lv.{data['level']} ({data['rank']}) / XP {data['xp']} / 連続 {data['streak']}日",
+            ephemeral=True)
+
+    bot.tree.add_command(slash_group)
+    SLASH_ENABLED = True
+except Exception as _slash_exc:  # noqa: BLE001
+    SLASH_ENABLED = False
+    LOG.warn(f"スラッシュコマンドは初期化できません: {_slash_exc}")
+
+
+
+@bot.command()
+async def flag(ctx, *, name: str = "", value: str = ""):
+    """機能フラグの確認と切り替え。"""
+    if not name:
+        return await ctx.send("🚩 **機能フラグ**\n" + "\n".join(
+            f"・`{k}` = {'ON' if v else 'OFF'}" for k, v in FLAGS.snapshot().items()) +
+            "\n変更: `!flag <名前> on|off`")
+    if value:
+        ok = FLAGS.set(name, value.lower() in ("1", "true", "on", "yes"))
+        if not ok:
+            return await ctx.send(f"⚠️ 未知のフラグ: `{name}`")
+        AUDIT.record(ctx.author.id, "flag.set", f"{name}={value}")
+        return await ctx.send(f"🚩 `{name}` = **{value}** に更新しました")
+    cur = FLAGS.get(name)
+    if cur is None:
+        return await ctx.send(f"⚠️ 未知のフラグ: `{name}`")
+    new = FLAGS.toggle(name)
+    AUDIT.record(ctx.author.id, "flag.toggle", f"{name}->{new}")
+    await ctx.send(f"🚩 `{name}` = **{'ON' if new else 'OFF'}**")
+
+
+@bot.command()
+async def backup(ctx, *, name: str = ""):
+    """ローカルバックアップの作成と復元。"""
+    if not name:
+        rows = BACKUPS.list()
+        return await ctx.send("💾 **バックアップ**\n" + "\n".join(
+            f"・`{r['name']}` ({r['size']:,}B / {r['mtime']})" for r in rows)
+            or "💾 バックアップはまだありません。`!backup create` で作成。")
+    if name in ("create", "作成"):
+        res = BACKUPS.create()
+        AUDIT.record(ctx.author.id, "backup.create", res.get("file", ""))
+        return await ctx.send(f"💾 バックアップ作成: `{res['file']}` ({res['size']:,}B)")
+    if name in ("restore", "復元"):
+        rows = BACKUPS.list()
+        if not rows:
+            return await ctx.send("⚠️ 復元対象のバックアップがありません。")
+        res = BACKUPS.restore(rows[0]["name"])
+        AUDIT.record(ctx.author.id, "backup.restore", rows[0]["name"])
+        return await ctx.send(f"💾 復元: {res}")
+    return await ctx.send("⚠️ `!backup create` / `!backup restore`")
+
+
+@bot.command()
+async def update(ctx, *, apply: str = ""):
+    """GitHub から最新版を確認(apply 指定で自己更新)。"""
+    res = await UPDATER.check()
+    if not res.get("ok"):
+        return await ctx.send(f"⚠️ 確認失敗: {res.get('error')}")
+    msg = (f"🔄 **更新確認**\n・リモート: `{res['remote_sha']}`\n・ローカル: `{res['local_sha']}`\n"
+           f"・{res.get('date','')}\n・{res.get('message','')}")
+    if apply.lower() in ("apply", "適用"):
+        r2 = await UPDATER.apply()
+        AUDIT.record(ctx.author.id, "self_update", str(r2))
+        return await ctx.send(msg + f"\n\n・更新結果: {r2}")
+    await ctx.send(msg)
+
+
+@bot.command()
+async def audit(ctx):
+    """監査ログ(重要操作の履歴)。"""
+    rows = AUDIT.recent(20)
+    await ctx.send("🧾 **監査ログ**\n" + "\n".join(
+        f"・{r['ts']} `{r['action']}` {r['detail'][:50]}" for r in rows)
+        or "🧾 記録はまだありません。")
+
+
+@bot.command()
+async def cost(ctx):
+    """API利用量とコストの概算。"""
+    snap = COSTS.snapshot()
+    lines = [f"・{k}: 呼び出し {v['calls']} / トークン {v['tokens']:,} / ${v['usd']:.6f}"
+             for k, v in snap.items()]
+    await ctx.send(f"💰 **API利用状況** (合計 ${COSTS.total_usd():.6f})\n"
+                   + ("\n".join(lines) or "利用実績なし"))
+
+
+@bot.command()
+async def rr(ctx, *, args: str = ""):
+    """リアクショRole(絵文字->ロール)の設定。"""
+    gid = ctx.guild.id if ctx.guild else 0
+    if not args:
+        mapping = REACTION_ROLES.get(gid) or {}
+        return await ctx.send("🔘 **リアクショRole**\n" + "\n".join(
+            f"・`{e}` → {r}" for e, r in mapping.items())
+            or "🔘 未設定です。`!rr set <絵文字> <ロール名>` で追加。")
+    if args.startswith("set "):
+        body = args[4:].strip()
+        parts = body.split(" ", 1)
+        if len(parts) < 2:
+            return await ctx.send("⚠️ `!rr set <絵文字> <ロール名>`")
+        REACTION_ROLES[gid][parts[0].strip()] = parts[1].strip()
+        AUDIT.record(ctx.author.id, "rr.set", body)
+        return await ctx.send(f"🔘 リアクショRoleを追加: `{parts[0]}` → {parts[1]}")
+    if args.startswith("del "):
+        key = args[4:].strip()
+        REACTION_ROLES.get(gid, {}).pop(key, None)
+        return await ctx.send(f"🔘 削除: `{key}`")
+    return await ctx.send("⚠️ `!rr set <絵文字> <ロール>` / `!rr del <絵文字>`")
+
+
+@bot.command()
+async def privacy(ctx):
+    """隐私/データ管理(エクスポートと削除)。"""
+    uid = ctx.author.id
+    data = {
+        "user_id": uid,
+        "profile": get_profile(uid).snapshot(),
+        "levels": LEVELS.get(uid, ctx.guild.id if ctx.guild else 0),
+        "settings": get_user_settings(uid),
+        "memories": [{"text": n.text, "created": datetime.fromtimestamp(n.created, JST).isoformat()}
+                     for n in MEMORY.recall_for_user(uid, 50)],
+        "audit": AUDIT.recent(200)[:20],
+    }
+    await ctx.send("🔐 **あなたのデータ**\n```json\n"
+                   + json.dumps(data, ensure_ascii=False, indent=2, default=str)[:1700]
+                   + "\n```")
+
+
+@bot.command()
+async def leaderboard(ctx):
+    """経済リーダーボード。"""
+    rows = ECON.leaderboard(ctx.guild.id if ctx.guild else 0, 10)
+    lv = LEVELS.leaderboard(ctx.guild.id if ctx.guild else 0, 10)
+    await ctx.send("🏆 **リーダーボード**\n💰経済:\n" + "\n".join(
+        f"・{i+1}. `{r['uid']}` — {r['total']:,.0f}" for i, r in enumerate(rows))
+        + "\n⭐レベル:\n" + "\n".join(
+        f"・{i+1}. `{r['uid']}` — Lv.{r['level']}" for i, r in enumerate(lv)))
 
 
 # =============================================================================
