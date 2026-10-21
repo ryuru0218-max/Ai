@@ -4645,6 +4645,42 @@ UI_CONFIG = {
         "mod_voice_play": ["🎼 ボイス再生(生成音源)", ["曲名"]],
         "mod_voice_stop": ["⏹️ ボイス停止", []],
     },
+    "TOOL3": {
+        "mod_tz": ["🕒 タイムゾーン", ["都市名"]],
+        "mod_unit": ["📐 単位変換", ["数値", "元単位", "先単位"]],
+        "mod_ascii": ["🔠 ASCIIアート", ["テキスト"]],
+        "mod_md": ["📝 Markdown変換", ["Markdown"]],
+        "mod_palette": ["🎨 カラーパレット", ["テーマ"]],
+        "mod_dns": ["🔎 DNS解決", ["ホスト名"]],
+        "mod_textstat": ["📊 テキスト統計", ["テキスト"]],
+    },
+    "MOD_PACK4": {
+        "mod_steam": ["🎮 Steam情報", ["ゲーム名"]],
+        "mod_steam_free": ["🎁 Steamセール", []],
+        "mod_rss": ["📰 RSSフィード", ["URL"]],
+        "mod_lobsters": ["🦞 Lobsters", ["タグ"]],
+        "mod_bluesky": ["🦋 Bluesky", ["ユーザー"]],
+        "mod_gh_releases": ["📦 GitHubリリース", ["owner/repo"]],
+        "mod_dockerhub": ["🐳 Docker Hub", ["イメージ"]],
+        "mod_wiki_images": ["🖼️ Commons画像", ["検索語"]],
+        "mod_translate": ["🌐 翻訳", ["テキスト", "元言語", "先言語"]],
+        "mod_wttr": ["🌤️ 詳細天気", ["都市名"]],
+        "mod_iss_detail": ["🛰️ ISS詳細", []],
+        "mod_fx_ecb": ["💱 精密為替", ["金額", "元通貨", "先通貨"]],
+    },
+    "GAME2": {
+        "mod_mines": ["💣 マインスイーパー", ["操作(start/open x y/flag x y)"]],
+        "mod_2048": ["🔢 2048", ["方向(left/right/up/down)"]],
+        "mod_poker": ["🃏 ポーカー評価", ["カード5枚"]],
+    },
+    "SERVER2": {
+        "mod_level": ["⭐ レベル確認", ["ユーザー(空可)"]],
+        "mod_note": ["📔 ノート", ["操作/キー"]],
+        "mod_habit": ["✅ 習慣", ["習慣名(空可)"]],
+        "mod_pomodoro": ["⏱️ ポモドーロ", ["分/ラベル"]],
+        "mod_macro": ["🔧 マクロ", ["操作/語"]],
+        "mod_search": ["🔍 発言検索", ["キーワード"]],
+    },
     "MOD_PACK2": {
         "mod_visual_dungeon": ["🗺️ 視覚ダンジョン", []],
         "mod_blackjack": ["🃏 ブラックジャック", []],
@@ -5979,6 +6015,16 @@ async def execute_direct_action(ch, guild, ctx_mock, action: str):
                     await ch.send(await spec[2]())
                 except Exception as exc:  # noqa: BLE001
                     await ch.send(f"⚠️ 実行エラー: {exc}")
+        elif action in ("mod_steam_free", "mod_iss_detail"):
+            key = action[4:]
+            spec = EXTRA_APIS.get(key)
+            if spec is None or spec[2] is None:
+                await ch.send(f"⚠️ 未対応のAPI: `{key}`")
+            else:
+                try:
+                    await ch.send(await spec[2]())
+                except Exception as exc:  # noqa: BLE001
+                    await ch.send(f"⚠️ 実行エラー: {exc}")
         elif action == "mod_voice_join":
             voice_ch = getattr(getattr(ctx_mock.author, "voice", None), "channel", None)
             if voice_ch is None:
@@ -6251,6 +6297,117 @@ async def execute_modal_action(ch, guild, ctx_mock, action: str, vals: list[str]
         elif action == "mod_pypi_uninstall":
             ok = MODS.uninstall(v0)
             await interaction.followup.send(f"🗑️ 『{v0}』をアンインストール: {'成功' if ok else '未インストール'}")
+        # --- SECTION17: ローカル完結ユーティリティ ---
+        elif action == "mod_tz":
+            await interaction.followup.send(api_timezone(v0))
+        elif action == "mod_unit":
+            try:
+                num = float(v0)
+            except ValueError:
+                num = 0.0
+            await interaction.followup.send(api_unit(num, v[1] or "m", v[2] or "km"))
+        elif action == "mod_ascii":
+            await interaction.followup.send("```\n" + ascii_art(v0) + "\n```")
+        elif action == "mod_md":
+            await interaction.followup.send(markdown_to_discord(v0))
+        elif action == "mod_palette":
+            pal = palette_from_seed(v0)
+            await interaction.followup.send("🎨 **パレット**\n" + "\n".join(
+                f"・**{k}** `{v['hex']}`" for k, v in pal.items()))
+        elif action == "mod_dns":
+            await interaction.followup.send(api_dns(v0))
+        elif action == "mod_textstat":
+            await interaction.followup.send(api_textstat(v0))
+        # --- SECTION17: 新ゲーム ---
+        elif action == "mod_mines":
+            parts_m = v0.split()
+            cid = ch.id
+            if not parts_m or parts_m[0] in ("start", "新規"):
+                s = MINES.start(cid)
+                await interaction.followup.send(
+                    f"💣 **マインスイーパー**\n```\n{MINES.render(s)}\n```")
+            else:
+                try:
+                    x, y = int(parts_m[1]), int(parts_m[2])
+                except (IndexError, ValueError):
+                    await interaction.followup.send("⚠️ `open <x> <y>` 形式で行ってください")
+                    return
+                s = MINES.get(cid)
+                if parts_m[0] in ("open", "開"):
+                    s, msg = MINES.reveal(cid, x, y)
+                else:
+                    s, msg = MINES.flag(cid, x, y)
+                await interaction.followup.send(f"💣 {msg}\n```\n{MINES.render(s)}\n```")
+        elif action == "mod_2048":
+            s, msg = GAME2048.move(ch.id, (v0 or "left").lower())
+            await interaction.followup.send(
+                f"🔢 **2048**\n```\n{GAME2048.render(s)}\n```\n{msg}")
+        elif action == "mod_poker":
+            cs = [c for c in re.split(r"[\s,]+", v0.upper()) if c]
+            if len(cs) != 5:
+                await interaction.followup.send("⚠️ カードを5枚指定してください")
+            else:
+                rank, name, _tb = evaluate_poker_hand(cs)
+                await interaction.followup.send(f"🃏 **{' '.join(cs)}**\nハンド: **{name}**")
+        # --- SECTION17: サーバーシステム ---
+        elif action == "mod_level":
+            data = LEVELS.get(getattr(ctx_mock.author, "id", 0), guild.id if guild else 0)
+            await interaction.followup.send(
+                f"⭐ レベル **{data['level']}** ({data['rank']}) / XP {data['xp']} / "
+                f"発言 {data['msgs']} / 連続 {data['streak']}日")
+        elif action == "mod_note":
+            gid = guild.id if guild else 0
+            if v0.startswith("set ") and "=" in v0:
+                k, val = v0[4:].split("=", 1)
+                NOTES.set(gid, k.strip(), val.strip(), getattr(ctx_mock.author, "id", 0))
+                await interaction.followup.send(f"📔 ノート保存: `{k.strip()}`")
+            else:
+                val = NOTES.get(gid, v0) or "ノート未登録"
+                await interaction.followup.send(f"📔 **{v0}**\n{val[:1500]}")
+        elif action == "mod_habit":
+            uid = getattr(ctx_mock.author, "id", 0)
+            if not v0:
+                rows = HABITS.list_today(uid)
+                await interaction.followup.send("✅ **習慣**\n" + "\n".join(
+                    f"・{'✔' if r['done'] else '·'} {r['name']} (連続{r['streak']}日)" for r in rows))
+            else:
+                on = HABITS.toggle(uid, v0)
+                await interaction.followup.send(
+                    f"{'✅ 達成' if on else '↩️ 取り消し'} `{v0}` "
+                    f"(連続 {HABITS.streak(uid, v0)}日)")
+        elif action == "mod_pomodoro":
+            if not v0:
+                st = POMODORO.status(ch.id)
+                await interaction.followup.send(
+                    f"⏱️ 残り **{st['remain']}秒**" if st else "⏱️ タイマー未起動")
+            elif v0.strip() in ("stop", "やめる"):
+                POMODORO.stop(ch.id)
+                await interaction.followup.send("⏹️ 停止しました")
+            else:
+                try:
+                    mins = int(v0.split()[0])
+                except (ValueError, IndexError):
+                    mins = 25
+                POMODORO.start(ch.id, max(1, min(180, mins)),
+                               v0.split()[1] if len(v0.split()) > 1 else "集中")
+                await interaction.followup.send(f"⏱️ {mins}分の集中タイマーを開始")
+        elif action == "mod_macro":
+            gid = guild.id if guild else 0
+            if v0.startswith("set ") and "=" in v0:
+                t, r = v0[4:].split("=", 1)
+                MACROS.set(gid, t.strip(), r.strip(), getattr(ctx_mock.author, "id", 0))
+                await interaction.followup.send(f"🔧 マクロ保存: `{t.strip()}`")
+            else:
+                rows = MACROS.list(gid)
+                await interaction.followup.send("🔧 **マクロ**\n" + "\n".join(
+                    f"・`{r['trigger']}` → {r['response'][:70]}" for r in rows))
+        elif action == "mod_search":
+            hits = MSGINDEX.search(v0, ch.id, 10) or MSGINDEX.search(v0, 0, 10)
+            if not hits:
+                await interaction.followup.send(f"🔍 『{v0}』に一致する発言はありません。")
+            else:
+                await interaction.followup.send(f"🔍 **検索結果 ({len(hits)}件)**\n" + "\n".join(
+                    f"・{h['content'][:100]} ({h['ts']})" for h in hits))
         # --- 拡張外部API ---
         elif action.startswith("mod_ext_"):
             key = action[len("mod_ext_"):]
@@ -6260,7 +6417,6 @@ async def execute_modal_action(ch, guild, ctx_mock, action: str, vals: list[str]
                 for k2, sp in EXTENDED_APIS.items():
                     if k2.startswith(key) or key.startswith(k2):
                         key, spec = k2, sp
-                        break
             if spec is None:
                 await interaction.followup.send(f"⚠️ 未対応のAPI: `{key}`")
             else:
@@ -6268,6 +6424,31 @@ async def execute_modal_action(ch, guild, ctx_mock, action: str, vals: list[str]
                 args = [v0] if v0 else []
                 if key == "holidays" and len(args) == 1:
                     args = [args[0], 0]
+                try:
+                    res = await fn(*args)
+                except Exception as exc:  # noqa: BLE001
+                    res = f"⚠️ 実行エラー: {exc}"
+                await interaction.followup.send(res)
+        # --- SECTION17: 追加API(Steam/RSS/翻訳など) ---
+        elif action in ("mod_steam", "mod_steam_free", "mod_rss", "mod_lobsters", "mod_bluesky",
+                        "mod_gh_releases", "mod_dockerhub", "mod_wiki_images", "mod_translate",
+                        "mod_wttr", "mod_iss_detail", "mod_fx_ecb"):
+            key = {"mod_gh_releases": "github_releases", "mod_fx_ecb": "fx_frankfurter"}.get(
+                action, action[4:])
+            spec = EXTRA_APIS.get(key)
+            if spec is None or spec[2] is None:
+                await interaction.followup.send(f"⚠️ 未対応のAPI: `{key}`")
+            else:
+                fn = spec[2]
+                args = [v0] if v0 else []
+                if key == "translate":
+                    args = [v0, v[1] or "auto", v[2] or "ja"]
+                elif key == "fx_frankfurter":
+                    try:
+                        amt = float(v0)
+                    except ValueError:
+                        amt = 1.0
+                    args = [amt, v[1] or "USD", v[2] or "JPY"]
                 try:
                     res = await fn(*args)
                 except Exception as exc:  # noqa: BLE001
@@ -9143,6 +9324,1446 @@ def _make_favicon() -> bytes:
 
 
 _FAVICON_PNG = _make_favicon()
+
+
+# =============================================================================
+#  SECTION 17 -  新機能拡張(ローカル完結ユーティリティ / 新API / 新ゲーム /
+#                 サーバーシステム / 使いやすさ)
+# =============================================================================
+# =============================================================================
+#  SECTION 17 -  新機能拡張(ローカル完結ユーティリティ / 新API / 新ゲーム /
+#                 サーバーシステム / 使いやすさ)
+# =============================================================================
+# --- タイムゾーン変換(標準ライブラリ zoneinfo のみ) --------------------------
+def api_timezone(place: str, tz: str = "") -> str:
+    """地名 or IANAタイムゾーン名から現在時刻と主要都市の時刻を返す。"""
+    try:
+        from zoneinfo import ZoneInfo, available_timezones
+    except Exception:  # noqa: BLE001
+        return "⚠️ zoneinfo が利用できません"
+    target = tz.strip() or place.strip()
+    if not target:
+        return "⚠️ 都市名またはタイムゾーンを指定してください (例: Tokyo / Asia/Tokyo)"
+    if "/" not in target:
+        geo = None
+        try:
+            geo = _sync_get_json(
+                f"https://geocoding-api.open-meteo.com/v1/search?name={quote(target)}&count=1&language=ja")
+        except Exception:  # noqa: BLE001
+            geo = None
+        if geo and geo.get("results"):
+            loc = geo["results"][0]
+            target = loc.get("timezone", "UTC")
+            label = loc.get("name", place)
+        else:
+            label = target
+    else:
+        label = target
+    try:
+        zi = ZoneInfo(target)
+    except Exception:  # noqa: BLE001
+        return f"⚠️ タイムゾーン「{target}」を解釈できません"
+    now = datetime.now(zi)
+    lines = [f"🕒 **{label}** (`{target}`)",
+             f"現在: **{now.strftime('%Y-%m-%d %H:%M:%S')}** ({now.strftime('%Z')})",
+             f"曜日: {now.strftime('%A')} / 年内 {now.timetuple().tm_yday}日目"]
+    others = ["Asia/Tokyo", "America/New_York", "Europe/London", "Europe/Paris",
+              "America/Los_Angeles", "Asia/Shanghai", "UTC"]
+    with contextlib.suppress(Exception):
+        avail = available_timezones()
+        for o in others:
+            if o == target or o not in avail:
+                continue
+            t = datetime.now(ZoneInfo(o))
+            lines.append(f"・{o}: {t.strftime('%H:%M')}")
+    return "\n".join(lines)
+
+
+# --- 単位変換(完全版) --------------------------------------------------------
+UNIT_TABLE: dict[str, dict[str, float]] = {
+    "length": {"m": 1.0, "km": 1000.0, "cm": 0.01, "mm": 0.001, "mi": 1609.344,
+               "yd": 0.9144, "ft": 0.3048, "in": 0.0254, "nmi": 1852.0, "光年": 9.461e15},
+    "weight": {"kg": 1.0, "g": 0.001, "mg": 1e-6, "t": 1000.0, "lb": 0.45359237,
+               "oz": 0.0283495, "貫": 3.75},
+    "area": {"m2": 1.0, "km2": 1e6, "cm2": 1e-4, "ha": 1e4, "acre": 4046.86,
+             "坪": 3.30578, "ft2": 0.092903},
+    "volume": {"L": 1.0, "mL": 0.001, "m3": 1000.0, "gal": 3.78541, "cup": 0.236588,
+               "合": 0.18, "勺": 0.015},
+    "time": {"s": 1.0, "ms": 0.001, "min": 60.0, "h": 3600.0, "day": 86400.0,
+             "week": 604800.0, "year": 31557600.0},
+    "speed": {"m/s": 1.0, "km/h": 0.277778, "mph": 0.44704, "kn": 0.514444,
+              "mach": 340.29},
+    "data": {"B": 1.0, "KB": 1024.0, "MB": 1048576.0, "GB": 1073741824.0,
+             "TB": 1099511627776.0, "bit": 0.125},
+    "energy": {"J": 1.0, "kJ": 1000.0, "cal": 4.184, "kcal": 4184.0, "kWh": 3.6e6},
+    "pressure": {"Pa": 1.0, "kPa": 1000.0, "bar": 1e5, "atm": 101325.0, "mmHg": 133.322},
+    "power": {"W": 1.0, "kW": 1000.0, "MW": 1e6, "hp": 745.7},
+}
+
+
+def api_unit(value: float, frm: str, to: str) -> str:
+    """単位変換 (例: 100 km/h -> m/s)。"""
+    frm, to = frm.strip(), to.strip()
+    for cat, table in UNIT_TABLE.items():
+        if frm in table and to in table:
+            result = value * table[frm] / table[to]
+            pretty = f"{result:,.6g} {to}"
+            extra = ""
+            if cat == "length":
+                extra = f"\n・{result/1000:,.4f} km / {result*100:,.1f} cm"
+            elif cat == "weight":
+                extra = f"\n・{result*1000:,.1f} g"
+            elif cat == "data":
+                extra = f"\n・{result/1024:,.2f} KiB / {result/1048576:,.2f} MiB"
+            return f"📐 **{value:,.6g} {frm}** = **{pretty}** ({cat}){extra}"
+    cats = ", ".join(f"{c}({','.join(list(t)[:5])}...)" for c, t in list(UNIT_TABLE.items())[:4])
+    return (f"⚠️ 変換できません: '{frm}' -> '{to}'\n対応例: {cats} ...")
+
+
+
+# --- 3x5 ASCII フォント -----------------------------------------------------
+_ASCII_FONT = {
+    "A": ("111", "101", "111", "101", "101"), "B": ("110", "101", "110", "101", "110"),
+    "C": ("011", "100", "100", "100", "011"), "D": ("110", "101", "101", "101", "110"),
+    "E": ("111", "100", "110", "100", "111"), "F": ("111", "100", "110", "100", "100"),
+    "G": ("011", "100", "101", "101", "011"), "H": ("101", "101", "111", "101", "101"),
+    "I": ("111", "010", "010", "010", "111"), "J": ("001", "001", "001", "101", "010"),
+    "K": ("101", "101", "110", "101", "101"), "L": ("100", "100", "100", "100", "111"),
+    "M": ("101", "111", "111", "101", "101"), "N": ("101", "111", "111", "111", "101"),
+    "O": ("010", "101", "101", "101", "010"), "P": ("110", "101", "110", "100", "100"),
+    "Q": ("010", "101", "101", "111", "011"), "R": ("110", "101", "110", "101", "101"),
+    "S": ("011", "100", "010", "001", "110"), "T": ("111", "010", "010", "010", "010"),
+    "U": ("101", "101", "101", "101", "111"), "V": ("101", "101", "101", "010", "010"),
+    "W": ("101", "101", "111", "111", "101"), "X": ("101", "010", "010", "010", "101"),
+    "Y": ("101", "010", "010", "010", "010"), "Z": ("111", "001", "010", "100", "111"),
+    "0": ("111", "101", "101", "101", "111"), "1": ("010", "110", "010", "010", "111"),
+    "2": ("110", "001", "010", "100", "111"), "3": ("110", "001", "010", "001", "110"),
+    "4": ("101", "101", "111", "001", "001"), "5": ("111", "100", "110", "001", "110"),
+    "6": ("011", "100", "110", "101", "010"), "7": ("111", "001", "010", "010", "010"),
+    "8": ("010", "101", "010", "101", "010"), "9": ("010", "101", "011", "001", "110"),
+    " ": ("000", "000", "000", "000", "000"), "!": ("010", "010", "010", "000", "010"),
+    "?": ("110", "001", "010", "000", "010"), ".": ("000", "000", "000", "000", "010"),
+    ",": ("000", "000", "000", "010", "100"), "-": ("000", "000", "111", "000", "000"),
+    "_": ("000", "000", "000", "000", "111"), ":": ("000", "010", "000", "010", "000"),
+    "/": ("001", "001", "010", "100", "100"), "+": ("000", "010", "111", "010", "000"),
+    "=": ("000", "111", "000", "111", "000"), "'": ("010", "010", "000", "000", "000"),
+    "*": ("101", "010", "111", "010", "101"), "#": ("101", "111", "101", "111", "101"),
+    "<": ("001", "010", "100", "010", "001"), ">": ("100", "010", "001", "010", "100"),
+    "(": ("001", "010", "010", "010", "001"), ")": ("100", "010", "010", "010", "100"),
+}
+
+
+def ascii_art(text: str) -> str:
+    """3x5ブロックフォントによるASCIIアート生成(依存ゼロ)。"""
+    rows = ["", "", "", "", ""]
+    for ch in (text or " ")[:40]:
+        glyph = _ASCII_FONT.get(ch.upper(), _ASCII_FONT["?"])
+        for i in range(5):
+            rows[i] += glyph[i] + " "
+    return "\n".join(r.rstrip() for r in rows)
+
+
+
+# --- マークダウン -> Discord 変換 -------------------------------------------
+def markdown_to_discord(md: str) -> str:
+    """MarkdownをDiscordの記法(太字/斜体/コード/引用/見出し)へ変換する。"""
+    out = md or ""
+    out = re.sub(r"^#{1,6}\s*(.+)$", r"**\1**", out, flags=re.M)
+    out = re.sub(r"^>\s?(.*)$", r"> \1", out, flags=re.M)
+    out = re.sub(r"^[-*]\s+", "・ ", out, flags=re.M)
+    out = re.sub(r"\[(.+?)\]\((.+?)\)", r"[\1](\2)", out)
+    return out.strip()[:1900]
+
+
+# --- カラーパレット生成 ------------------------------------------------------
+def _hsl_to_rgb(h: float, s: float, ll: float) -> tuple[int, int, int]:
+    def hue2rgb(p, q, t):
+        if t < 0:
+            t += 1
+        if t > 1:
+            t -= 1
+        if t < 1 / 6:
+            return p + (q - p) * 6 * t
+        if t < 1 / 2:
+            return q
+        if t < 2 / 3:
+            return p + (q - p) * (2 / 3 - t) * 6
+        return p
+
+    if s == 0:
+        v = int(ll * 255)
+        return v, v, v
+    q = ll * (1 + s) if ll < 0.5 else ll + s - ll * s
+    p = 2 * ll - q
+    return (int(hue2rgb(p, q, h + 1 / 3) * 255),
+            int(hue2rgb(p, q, h) * 255),
+            int(hue2rgb(p, q, h - 1 / 3) * 255))
+
+
+def palette_from_seed(text: str) -> dict:
+    """文字列からHSLパレットを生成(色相をテキスト内容から決定)。"""
+    h = int(hashlib.sha256((text or "pochi").encode()).hexdigest()[:8], 16)
+    base_hue = h % 360
+    pals = {}
+    for name, (dh, s, l) in {"primary": (0, 62, 56), "secondary": (28, 58, 60),
+                             "accent": (-28, 70, 58), "muted": (8, 18, 42),
+                             "highlight": (52, 78, 64)}.items():
+        hue = (base_hue + dh) % 360
+        rgb = _hsl_to_rgb(hue / 360.0, s / 100.0, l / 100.0)
+        pals[name] = {"hsl": (hue, s, l), "hex": "#%02X%02X%02X" % rgb}
+    return pals
+
+
+# --- DNS解決 ----------------------------------------------------------------
+def api_dns(host: str) -> str:
+    """標準ライブラリのみでDNS解決・接続確認を行う。"""
+    import socket
+    host = (host or "").strip().replace("https://", "").replace("http://", "").split("/")[0]
+    if not host:
+        return "⚠️ ホスト名を指定してください"
+    try:
+        infos = socket.getaddrinfo(host, None)
+        addrs = sorted({i[4][0] for i in infos})
+    except Exception as exc:  # noqa: BLE001
+        return f"⚠️ DNS解決に失敗しました: {exc}"
+    return (f"🔎 **{host}** の解決結果\n" + "・" + "\n・".join(addrs))
+
+
+# --- テキスト統計(可読性・文字種) --------------------------------------------
+def api_textstat(text: str) -> str:
+    """文字種・可読性指標・感情語の出現統計。"""
+    t = text or ""
+    if not t:
+        return "⚠️ テキストが空です"
+    chars = len(t)
+    words = re.findall(r"[A-Za-z]+", t)
+    jp = re.findall(r"[ぁ-んァ-ヶ一-龥]", t)
+    sentences = re.findall(r"[。．.!?！？]+", t)
+    lines = ["📊 **テキスト統計**",
+             f"・総文字数: {chars} / 単語数: {len(words)} / 日本語文字: {len(jp)} / 文数: {len(sentences)}",
+             f"・平均文長: {safe_div(chars, max(1, len(sentences)), 0):.1f} 文字",
+             f"・最長単語: {max((len(w) for w in words), default=0)} 文字"]
+    if sentences:
+        avg = safe_div(chars, len(sentences), 0)
+        if jp:
+            lines.append(f"・読みやすさ: {'とても読みやすい' if avg < 25 else '読みやすい' if avg < 45 else 'やや長い' if avg < 80 else '長文'}")
+        else:
+            flesch = 206.835 - 1.015 * safe_div(len(words), len(sentences), 0) \
+                - 84.6 * safe_div(sum(1 for w in words if len(w) <= 3), len(words), 0)
+            lines.append(f"・Flesch読解度: {clamp(flesch, 0, 100):.0f} (高いほど容易)")
+    emo = sentiment_score(t)
+    lines.append(f"・感情価: {emo['valence']} / 覚醒度: {emo['arousal']} / 皮肉: {emo['irony']}")
+    return "\n".join(lines)
+
+
+
+# --- 新規外部API(すべてキー不要 / 実測到達確認済み) ---------------------------
+async def api_steam(query: str) -> str:
+    """Steam ストアのゲーム情報 (公式API / キー不要)。"""
+    key = (query or "").strip()
+    if not key:
+        return "⚠️ ゲーム名またはAppIDを指定してください"
+    appid = key if key.isdigit() else None
+    if appid is None:
+        data = await FastHTTP.get_json(
+            "https://store.steampowered.com/api/storesearch/?term=" + quote(key)
+            + "&l=jp&cc=JP", ttl=3600)
+        if not data or not data.get("items"):
+            return f"⚠️ ゲーム『{key}』が見つかりません"
+        appid = str(data["items"][0].get("id"))
+    detail = await FastHTTP.get_json(
+        f"https://store.steampowered.com/api/appdetails?appids={appid}&cc=JP&l=j", ttl=3600)
+    info = (detail or {}).get(str(appid), {}).get("data")
+    if not info:
+        return f"⚠️ ゲーム情報を取得できませんでした (AppID {appid})"
+    price = info.get("price_overview") or {}
+    plats_raw = info.get("platforms") or {}
+    if isinstance(plats_raw, dict):
+        plats = ", ".join(k.title() for k, v in plats_raw.items() if v)
+    else:
+        plats = ", ".join(str(p.get("description", "")) for p in plats_raw
+                          if isinstance(p, dict) and p.get("supported"))
+    genres = ", ".join(g.get("description", "") for g in (info.get("genres") or [])
+                      if isinstance(g, dict))
+    disc = price.get("discount_percent", 0)
+    return (f"🎮 **{info.get('name', '?')}**\n"
+            f"・AppID: `{appid}` / ジャンル: {genres or '—'}\n"
+            f"・価格: {price.get('final_formatted', '無料/未販売')}"
+            f"{f' ({disc}% OFF)' if disc else ''}\n"
+            f"・対応: {plats or '—'}\n"
+            f"・評価: {info.get('metacritic', {}).get('score', '—')} / "
+            f"リリース {info.get('release_date', {}).get('date', '—')}\n"
+            f"・{(info.get('short_description') or '')[:220]}\n"
+            f"URL: https://store.steampowered.com/app/{appid}/")
+
+
+async def api_steam_free() -> str:
+    """Steam のセール/無料专区 (公式API / キー不要)。"""
+    data = await FastHTTP.get_json(
+        "https://store.steampowered.com/api/featuredcategories?cc=JP&l=j", ttl=1800)
+    if not data:
+        return "⚠️ Steam ストア情報取得失敗"
+    specials = (data.get("specials") or {}).get("items") or []
+    lines = []
+    for it in specials[:8]:
+        price = it.get("price") or {}
+        disc = price.get("discount_percent", 0)
+        lines.append(f"・**{it.get('name', '?')}** — {price.get('final', 0)}円 ({disc}% OFF)")
+    return "🎁 **Steam セール/無料专区**\n" + ("\n".join(lines) or "データなし")
+
+
+async def api_rss(url: str) -> str:
+    """汎用 RSS/Atom リーダー (任意のフィードを解析)。"""
+    xml = await FastHTTP.get_text(url, ttl=600)
+    if not xml:
+        return "⚠️ フィードを取得できませんでした"
+    items = re.findall(r"<item[ >].*?</item>", xml, re.S)[:8]
+    if not items:
+        items = re.findall(r"<entry[ >].*?</entry>", xml, re.S)[:8]
+    if not items:
+        titles = re.findall(r"<title[^>]*>(.*?)</title>", xml, re.S)[1:6]
+        if titles:
+            return "📰 **フィード**\n" + "\n".join(f"・{strip_html(t).strip()[:150]}" for t in titles)
+        return "⚠️ フィードに記事が見つかりませんでした"
+    lines = []
+    for it in items:
+        t = re.search(r"<title[^>]*>(.*?)</title>", it, re.S)
+        link = re.search(r"<link[^>]*>(.*?)</link>", it, re.S) or \
+            re.search(r'<link[^>]+href="([^"]+)"', it)
+        d = re.search(r"<pubDate[^>]*>(.*?)</pubDate>", it, re.S) or \
+            re.search(r"<updated[^>]*>(.*?)</updated>", it, re.S)
+        title = strip_html(t.group(1)).strip()[:120] if t else "?"
+        url_txt = link.group(1).strip() if link else ""
+        date = d.group(1).strip()[:25] if d else ""
+        lines.append(f"・**{title}**\n  {date} {url_txt}")
+    return "📰 **フィード**\n" + "\n".join(lines)
+
+
+
+async def api_lobsters(tag: str = "") -> str:
+    """Lobsters (技術ニュース) の最新投稿 (公開JSON / キー不要)。"""
+    url = f"https://lobste.rs/t/{quote(tag)}.json" if tag else "https://lobste.rs/hottest.json"
+    data = await FastHTTP.get_json(url, ttl=600)
+    if not isinstance(data, list) or not data:
+        return "⚠️ Lobsters 取得失敗"
+    lines = []
+    for it in data[:8]:
+        lines.append(f"・**{it.get('title', '?')}** (▲{it.get('score', 0)} / "
+                     f"{it.get('comment_count', 0)}コメント)\n"
+                     f"  {it.get('url', '') or it.get('comments_url', '')}")
+    return "🦞 **Lobsters**" + (f" #{tag}" if tag else "") + "\n" + "\n".join(lines)
+
+
+async def api_bluesky(actor: str = "bsky.app") -> str:
+    """Bluesky の公開フィード (AT Protocol XRPC / キー不要)。"""
+    data = await FastHTTP.get_json(
+        f"https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed?actor={quote(actor)}&limit=8",
+        ttl=300)
+    feed = (data or {}).get("feed") or []
+    if not feed:
+        return "⚠️ Bluesky フィード取得失敗"
+    lines = []
+    for item in feed:
+        post = item.get("post", {})
+        text = (post.get("record") or {}).get("text", "")
+        lines.append(f"・{text[:160].replace(chr(10), ' ')}\n"
+                     f"  ♥{post.get('likeCount', 0)} / ↩{post.get('replyCount', 0)}")
+    return f"🦋 **Bluesky @{actor}**\n" + "\n".join(lines)
+
+
+async def api_github_releases(slug: str) -> str:
+    """GitHub の最新リリース (API / キー不要)。"""
+    if "/" not in slug:
+        return "⚠️ `owner/repo` 形式で指定してください"
+    data = await FastHTTP.get_json(
+        f"https://api.github.com/repos/{slug.strip('/')}/releases/latest", ttl=600,
+        headers={"Accept": "application/vnd.github+json"})
+    if not data or "tag_name" not in data:
+        return f"⚠️ リリースが見つかりません: {slug}"
+    body = re.sub(r"<[^>]+>", "", data.get("body") or "")[:400]
+    return (f"📦 **{data.get('name') or data.get('tag_name')}**\n"
+            f"・タグ: `{data.get('tag_name')}` / 公開: {data.get('published_at', '')[:10]}\n"
+            f"・アセット: {len(data.get('assets', []))}件 / URL: {data.get('html_url', '')}\n{body}")
+
+
+async def api_dockerhub(image: str) -> str:
+    """Docker Hub のタグ情報 (キー不要)。"""
+    name = (image or "").strip()
+    if "/" not in name:
+        name = f"library/{name}"
+    repo, tag = name, "latest"
+    if ":" in name:
+        repo, tag = name.rsplit(":", 1)
+    data = await FastHTTP.get_json(
+        f"https://hub.docker.com/v2/repositories/{repo}/tags/{tag}", ttl=1800)
+    if not data or "name" not in data:
+        return f"⚠️ イメージ『{image}』が見つかりません"
+    size = data.get("full_size") or 0
+    return (f"🐳 **{repo}:{tag}**\n"
+            f"・サイズ: {size/1048576:,.1f} MB / 最終更新: {data.get('last_updated', '')[:10]}\n"
+            f"・概要: {(data.get('full_description') or '')[:200] or '—'}")
+
+
+async def api_wiki_images(query: str) -> str:
+    """Wikimedia Commons の画像検索 (ファイル名とURLを返す)。"""
+    data = await FastHTTP.get_json(
+        "https://commons.wikimedia.org/w/api.php?action=query&format=json&generator=search"
+        f"&gsrsearch={quote(query)}&gsrlimit=5&gsrnamespace=6&prop=imageinfo"
+        "&iiprop=url|extmetadata&iiurlwidth=500", ttl=3600)
+    pages = ((data or {}).get("query") or {}).get("pages") or {}
+    if not pages:
+        return f"⚠️ 『{query}』の画像が見つかりません"
+    lines = []
+    for p in list(pages.values())[:5]:
+        info = (p.get("imageinfo") or [{}])[0]
+        meta = info.get("extmetadata") or {}
+        lic = (meta.get("LicenseShortName") or {}).get("value", "?")
+        lines.append(f"・**{p.get('title', '?')}** ({lic})\n"
+                     f"  {info.get('thumburl', info.get('url', ''))}")
+    return f"🖼️ **Commons 画像検索: {query}**\n" + "\n".join(lines)
+
+
+
+async def api_translate(text: str, frm: str = "auto", to: str = "ja") -> str:
+    """無料翻訳 (MyMemory / キー不要)。"""
+    if not text:
+        return "⚠️ 翻訳するテキストを入力してください"
+    src = "en" if frm in ("auto", "") else frm
+    url = (f"https://api.mymemory.translated.net/get?q={quote(text[:480])}"
+           f"&langpair={quote(src)}%7C{quote(to)}")
+    data = await FastHTTP.get_json(url, ttl=3600)
+    if not data:
+        return "⚠️ 翻訳サービスに接続できません"
+    rd = data.get("responseData") or {}
+    translated = (rd.get("translatedText") or "").strip()
+    if not translated:
+        detail = data.get("responseDetails") or "短い入力は翻訳できない場合があります"
+        return (f"⚠️ 翻訳結果が空です (status={data.get('responseStatus')})\n"
+                f"・{detail}\n・もう少し長い文で試してください")
+    out = f"🌐 **翻訳** ({src} → {to})\n{translated}"
+    if rd.get("match"):
+        out += f"\n信頼度: {float(rd['match']) * 100:.0f}%"
+    return out
+
+
+async def api_wttr(place: str) -> str:
+    """wttr.in の詳細天気(3日予報 + 気温)。"""
+    data = await FastHTTP.get_json(f"https://wttr.in/{quote(place)}?format=j1", ttl=900)
+    if not data or "current_condition" not in data:
+        return f"⚠️ 『{place}』の天気データを取得できません"
+    cur = data["current_condition"][0]
+    area = (data.get("nearest_area") or [{}])[0]
+    name = (area.get("areaName") or [{}])[0].get("value", place)
+    desc = (cur.get("weatherDesc") or [{}])[0].get("value", "?")
+    lines = [f"🌤️ **{name}**",
+             f"・現在: {desc} / {cur.get('temp_C')}°C (体感 {cur.get('FeelsLikeC')}°C)",
+             f"・湿度: {cur.get('humidity')}% / 風: {cur.get('windspeedKmph')} km/h "
+             f"({cur.get('winddir16Point')}) / 視程: {cur.get('visibility')} km",
+             f"・気圧: {cur.get('pressure')} hPa / 雲量: {cur.get('cloudcover')}%"]
+    for d in (data.get("weather") or [])[:3]:
+        hourly = d.get("hourly") or [{}]
+        mid = hourly[len(hourly) // 2] if hourly else {}
+        lines.append(f"・{d.get('date')}: {d.get('maxtempC')}~{d.get('mintempC')}°C "
+                     f"{(mid.get('weatherDesc') or [{}])[0].get('value', '')} "
+                     f"降水 {(mid.get('chanceofrain') or '?')}%")
+    return "\n".join(lines)
+
+
+async def api_iss_detail() -> str:
+    """ISS の詳細位置(高度/速度つき / wheretheiss.at)。"""
+    data = await FastHTTP.get_json("https://api.wheretheiss.at/v1/satellites/25544", ttl=30)
+    if not data or "latitude" not in data:
+        return "⚠️ ISS 情報取得失敗"
+    return (f"🛰️ **ISS 詳細**\n"
+            f"・緯度 {data.get('latitude')} / 経度 {data.get('longitude')}\n"
+            f"・高度 {data.get('altitude')} km / 速度 {data.get('velocity')} km/h\n"
+            f"・可視状態: {data.get('visibility')}")
+
+
+async def api_fx_frankfurter(amount: float, frm: str = "USD", to: str = "JPY") -> str:
+    """Frankfurter(ECB) ベースの正確な為替レート。"""
+    data = await FastHTTP.get_json(
+        f"https://api.frankfurter.app/latest?from={quote(frm.upper())}&to={quote(to.upper())}", ttl=600)
+    if not data or "rates" not in data:
+        return "⚠️ 為替レート取得失敗"
+    rate = data["rates"].get(to.upper())
+    if rate is None:
+        return f"⚠️ {to.upper()} のレートがありません"
+    return (f"💱 **{amount:,.2f} {frm.upper()}** = **{amount * rate:,.2f} {to.upper()}**\n"
+            f"・1 {frm.upper()} = {rate:,.4f} {to.upper()} (基準日 {data.get('date', '')})")
+
+
+EXTRA_APIS = {
+    "timezone": ("🕒 タイムゾーン変換", ["都市名"], api_timezone),
+    "unit": ("📐 単位変換", ["数値", "元単位", "先単位"], api_unit),
+    "ascii": ("🔠 ASCIIアート", ["テキスト"], None),
+    "markdown": ("📝 Markdown変換", ["Markdown"], None),
+    "palette": ("🎨 カラーパレット", ["テーマ文字列"], None),
+    "dns": ("🔎 DNS解決", ["ホスト名"], api_dns),
+    "textstat": ("📊 テキスト統計", ["テキスト"], api_textstat),
+    "steam": ("🎮 Steamゲーム情報", ["ゲーム名/AppID"], api_steam),
+    "steam_free": ("🎁 Steamセール", [], api_steam_free),
+    "rss": ("📰 RSSフィード", ["フィードURL"], api_rss),
+    "lobsters": ("🦞 Lobsters", ["タグ(空可)"], api_lobsters),
+    "bluesky": ("🦋 Bluesky", ["ユーザー(空可)"], api_bluesky),
+    "github_releases": ("📦 GitHubリリース", ["owner/repo"], api_github_releases),
+    "dockerhub": ("🐳 Docker Hub", ["イメージ名"], api_dockerhub),
+    "wiki_images": ("🖼️ Commons画像", ["検索語"], api_wiki_images),
+    "translate": ("🌐 翻訳", ["テキスト", "元言語", "先言語"], api_translate),
+    "wttr": ("🌤️ 詳細天気", ["都市名"], api_wttr),
+    "iss_detail": ("🛰️ ISS詳細", [], api_iss_detail),
+    "fx_frankfurter": ("💱 精密為替", ["金額", "元通貨", "先通貨"], api_fx_frankfurter),
+}
+
+
+
+# =============================================================================
+#  新ゲーム / サーバーシステム
+# =============================================================================
+class MinesweeperGame:
+    """マインスイーパー(9x9 / 地雷10個)。"""
+
+    def __init__(self):
+        self.sessions: dict[int, dict] = {}
+
+    def start(self, cid: int, size: int = 9, mines: int = 10) -> dict:
+        board = [[0] * size for _ in range(size)]
+        cells = [(x, y) for x in range(size) for y in range(size)]
+        random.shuffle(cells)
+        for x, y in cells[:mines]:
+            board[x][y] = -1
+        s = {"board": board, "size": size, "mines": mines, "revealed": set(),
+             "flagged": set(), "over": False, "won": False, "moves": 0}
+        self.sessions[cid] = s
+        return s
+
+    def get(self, cid: int) -> dict:
+        return self.sessions.get(cid) or self.start(cid)
+
+    def _count(self, s: dict, x: int, y: int) -> int:
+        n = 0
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < s["size"] and 0 <= ny < s["size"] and s["board"][nx][ny] == -1:
+                    n += 1
+        return n
+
+    def reveal(self, cid: int, x: int, y: int) -> tuple[dict, str]:
+        s = self.get(cid)
+        if s["over"]:
+            return s, "ゲームは終了しています。"
+        if (x, y) in s["flagged"] or (x, y) in s["revealed"]:
+            return s, "既に開けたマスです。"
+        s["moves"] += 1
+        stack = [(x, y)]
+        while stack:
+            cx, cy = stack.pop()
+            if (cx, cy) in s["revealed"] or (cx, cy) in s["flagged"]:
+                continue
+            if not (0 <= cx < s["size"] and 0 <= cy < s["size"]):
+                continue
+            s["revealed"].add((cx, cy))
+            if s["board"][cx][cy] == 0:
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        if dx or dy:
+                            stack.append((cx + dx, cy + dy))
+        if s["board"][x][y] == -1:
+            s["over"] = True
+            return s, "💥 **地雷を踏みました!** ゲームオーバー。"
+        if len(s["revealed"]) == s["size"] * s["size"] - s["mines"]:
+            s["over"] = True
+            s["won"] = True
+            return s, "🎉 **全マスを開けました!** 勝利!"
+        n = self._count(s, x, y)
+        return s, (f"🔢 周囲の数字: **{n}**" if n else "⭕ なにもありません。")
+
+    def flag(self, cid: int, x: int, y: int) -> tuple[dict, str]:
+        s = self.get(cid)
+        if s["over"] or (x, y) in s["revealed"]:
+            return s, "操作できません。"
+        if (x, y) in s["flagged"]:
+            s["flagged"].discard((x, y))
+            return s, "🚩 旗を外しました。"
+        s["flagged"].add((x, y))
+        return s, "🚩 旗を立てました。"
+
+    def render(self, s: dict) -> str:
+        rows = []
+        for x in range(s["size"]):
+            line = []
+            for y in range(s["size"]):
+                if (x, y) in s["flagged"]:
+                    line.append("🚩")
+                elif (x, y) in s["revealed"]:
+                    v = s["board"][x][y]
+                    line.append("💥" if v == -1 else (str(v) if v else "⬜"))
+                else:
+                    line.append("▫️")
+            rows.append("".join(line))
+        return "\n".join(rows)
+
+
+MINES = MinesweeperGame()
+
+
+
+class Game2048:
+    """2048 (4x4 / タイルマージ)。"""
+
+    def __init__(self):
+        self.sessions: dict[int, dict] = {}
+
+    def start(self, cid: int) -> dict:
+        s = {"grid": [[0] * 4 for _ in range(4)], "score": 0, "over": False, "won": False}
+        self.sessions[cid] = s
+        self._spawn(s)
+        self._spawn(s)
+        return s
+
+    def get(self, cid: int) -> dict:
+        return self.sessions.get(cid) or self.start(cid)
+
+    def _spawn(self, s: dict):
+        empty = [(x, y) for x in range(4) for y in range(4) if s["grid"][x][y] == 0]
+        if empty:
+            x, y = random.choice(empty)
+            s["grid"][x][y] = random.choice([2, 2, 2, 4])
+
+    def move(self, cid: int, direction: str) -> tuple[dict, str]:
+        s = self.get(cid)
+        if s["over"]:
+            return s, "ゲームオーバーです。"
+        before = [row[:] for row in s["grid"]]
+        g = s["grid"]
+        if direction in ("up", "down"):
+            for x in range(4):
+                col = [g[x][y] for y in range(4)]
+                col = (col + [0])[-4:] if direction == "up" else ([0] + col)[:4]
+                merged, gained, i = [], 0, 0
+                while i < 4:
+                    if col[i] and col[i] == col[i + 1]:
+                        merged.append(col[i] * 2)
+                        gained += col[i] * 2
+                        i += 2
+                    else:
+                        merged.append(col[i])
+                        i += 1
+                merged += [0] * (4 - len(merged))
+                for y in range(4):
+                    g[x][y] = merged[y]
+                s["score"] += gained
+        else:
+            for y in range(4):
+                row = [g[x][y] for x in range(4)]
+                row = (row + [0])[-4:] if direction == "left" else ([0] + row)[:4]
+                merged, gained, i = [], 0, 0
+                while i < 4:
+                    if row[i] and row[i] == row[i + 1]:
+                        merged.append(row[i] * 2)
+                        gained += row[i] * 2
+                        i += 2
+                    else:
+                        merged.append(row[i])
+                        i += 1
+                merged += [0] * (4 - len(merged))
+                for x in range(4):
+                    g[x][y] = merged[x]
+                s["score"] += gained
+        moved = before != g
+        if moved:
+            self._spawn(s)
+        if 2048 in [v for row in g for v in row]:
+            s["won"] = True
+        if not moved and not self._can_move(s):
+            s["over"] = True
+            return s, f"💀 **ゲームオーバー** (スコア {s['score']})"
+        if s["won"]:
+            return s, f"🏆 **2048 達成!** スコア {s['score']}"
+        return s, f"↔️ スコア **{s['score']}**"
+
+    @staticmethod
+    def _can_move(s: dict) -> bool:
+        g = s["grid"]
+        for x in range(4):
+            for y in range(4):
+                if g[x][y] == 0:
+                    return True
+                for dx, dy in ((1, 0), (0, 1)):
+                    nx, ny = x + dx, y + dy
+                    if nx < 4 and ny < 4 and g[nx][ny] != g[x][y]:
+                        return True
+        return False
+
+    def render(self, s: dict) -> str:
+        return "\n".join(
+            " | ".join(f"{s['grid'][x][y]:>4}" if s['grid'][x][y] else "   ." for y in range(4))
+            for x in range(4))
+
+
+GAME2048 = Game2048()
+
+
+POKER_RANKS = {"A": 14, "K": 13, "Q": 12, "J": 11, "10": 10, "9": 9, "8": 8,
+               "7": 7, "6": 6, "5": 5, "4": 4, "3": 3, "2": 2}
+POKER_NAMES = {14: "Royal Flush", 13: "Straight Flush", 12: "Four of a Kind",
+               11: "Full House", 10: "Flush", 9: "Straight", 8: "Three of a Kind",
+               7: "Two Pair", 6: "One Pair", 5: "High Card"}
+
+
+def evaluate_poker_hand(cards: list[str]) -> tuple[int, str, list]:
+    """ポーカー5枚を評価し (ランク, 名称, タイブレーク値) を返す。"""
+    vals, suits = [], []
+    for c in cards:
+        c = c.strip().upper()
+        suit = c[-1] if c[-1] in "SHDC" else "?"
+        rank = c[:-1] if len(c) > 1 else c
+        if rank == "T":
+            rank = "10"
+        vals.append(POKER_RANKS.get(rank, 7))
+        suits.append(suit)
+    counts: dict[int, int] = defaultdict(int)
+    for v in vals:
+        counts[v] += 1
+    flush = len(set(suits)) == 1 and "?" not in suits
+    uniq = sorted(set(vals), reverse=True)
+    straight = False
+    if len(uniq) == 5:
+        straight = uniq[0] - uniq[4] == 4
+        if uniq == [14, 5, 4, 3, 2]:
+            straight = True
+            uniq = [5, 4, 3, 2, 1]
+    groups = sorted(counts.items(), key=lambda kv: (-kv[1], -kv[0]))
+    if flush and straight and uniq[0] == 14:
+        return 14, POKER_NAMES[14], uniq
+    if flush and straight:
+        return 13, POKER_NAMES[13], uniq
+    if groups[0][1] == 4:
+        return 12, POKER_NAMES[12], [groups[0][0]] + [v for v in uniq if v != groups[0][0]]
+    if groups[0][1] == 3 and groups[1][1] == 2:
+        return 11, POKER_NAMES[11], [groups[0][0], groups[1][0]]
+    if flush:
+        return 10, POKER_NAMES[10], uniq
+    if straight:
+        return 9, POKER_NAMES[9], uniq
+    if groups[0][1] == 3:
+        return 8, POKER_NAMES[8], [groups[0][0]] + [v for v in uniq if v != groups[0][0]]
+    if groups[0][1] == 2 and groups[1][1] == 2:
+        return 7, POKER_NAMES[7], [groups[0][0], groups[1][0]]
+    if groups[0][1] == 2:
+        return 6, POKER_NAMES[6], [groups[0][0]] + [v for v in uniq if v != groups[0][0]]
+    return 5, POKER_NAMES[5], uniq
+
+
+
+# =============================================================================
+#  サーバーシステム(レベル/ノート/習慣/ポモドーロ/検索/リアクショRole/マクロ)
+# =============================================================================
+class LevelSystem:
+    """発言XP・レベル・ストリーク。"""
+
+    RANKS = [(0, "新人"), (5, "見習い"), (10, "常連"), (20, "古参"), (35, "熟達者"),
+             (55, "賢者"), (80, "伝説")]
+
+    def __init__(self, path: str = DB_PATH):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
+        with self.lock:
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS levels(
+                uid INTEGER PRIMARY KEY, guild INTEGER, xp INTEGER DEFAULT 0,
+                msgs INTEGER DEFAULT 0, streak INTEGER DEFAULT 0, last_day TEXT,
+                best_streak INTEGER DEFAULT 0
+            )""")
+            self.conn.commit()
+
+    def _xp_for(self, level: int) -> int:
+        return int(50 * (level ** 1.6)) + 50
+
+    def level_of(self, xp: int) -> int:
+        lvl = 0
+        while xp >= self._xp_for(lvl):
+            xp -= self._xp_for(lvl)
+            lvl += 1
+        return lvl
+
+    def add_xp(self, uid: int, guild: int, amount: int, msgs: int = 1) -> dict:
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO levels(uid, guild) VALUES(?,?)", (uid, guild))
+            row = self.conn.execute("SELECT * FROM levels WHERE uid=?", (uid,)).fetchone()
+            xp = row["xp"] + amount
+            today = now_jst().strftime("%Y-%m-%d")
+            streak = row["streak"]
+            if row["last_day"] != today:
+                yesterday = (now_jst() - timedelta(days=1)).strftime("%Y-%m-%d")
+                streak = streak + 1 if row["last_day"] == yesterday else 1
+            best = max(streak, row["best_streak"])
+            self.conn.execute(
+                "UPDATE levels SET xp=?, msgs=msgs+?, streak=?, last_day=?, best_streak=? WHERE uid=?",
+                (xp, msgs, streak, today, best, uid))
+            self.conn.commit()
+        lv = self.level_of(xp)
+        rank = "無名"
+        for threshold, name in self.RANKS:
+            if lv >= threshold:
+                rank = name
+        return {"level": lv, "xp": xp, "rank": rank, "streak": streak, "best_streak": best,
+                "msgs": row["msgs"] + msgs}
+
+    def get(self, uid: int, guild: int = 0) -> dict:
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM levels WHERE uid=?", (uid,)).fetchone()
+        if not row:
+            return {"level": 0, "xp": 0, "rank": "無名", "streak": 0, "best_streak": 0, "msgs": 0}
+        lv = self.level_of(row["xp"])
+        rank = "無名"
+        for threshold, name in self.RANKS:
+            if lv >= threshold:
+                rank = name
+        return {"level": lv, "xp": row["xp"], "rank": rank, "streak": row["streak"],
+                "best_streak": row["best_streak"], "msgs": row["msgs"]}
+
+    def leaderboard(self, guild: int = 0, limit: int = 10) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM levels WHERE guild=? ORDER BY xp DESC LIMIT ?", (guild, limit)).fetchall()
+        return [{"uid": r["uid"], "level": self.level_of(r["xp"]), "xp": r["xp"],
+                 "msgs": r["msgs"]} for r in rows]
+
+
+LEVELS = LevelSystem()
+
+
+class NotesStore:
+    """サーバーWiki / ノート(キーで検索・編集)。"""
+
+    def __init__(self, path: str = DB_PATH):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
+        with self.lock:
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS notes(
+                guild INTEGER, key TEXT, value TEXT, author INTEGER, updated REAL,
+                PRIMARY KEY(guild, key)
+            )""")
+            self.conn.commit()
+
+    def set(self, guild: int, key: str, value: str, author: int = 0) -> None:
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO notes(guild, key, value, author, updated) VALUES(?,?,?,?,?)",
+                (guild, key.strip().lower(), value, author, time.time()))
+            self.conn.commit()
+
+    def get(self, guild: int, key: str) -> str | None:
+        with self.lock:
+            row = self.conn.execute("SELECT value FROM notes WHERE guild=? AND key=?",
+                                    (guild, key.strip().lower())).fetchone()
+        return row["value"] if row else None
+
+    def list(self, guild: int, limit: int = 30) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT key, value, author, updated FROM notes WHERE guild=? "
+                "ORDER BY updated DESC LIMIT ?", (guild, limit)).fetchall()
+        return [{"key": r["key"], "value": r["value"][:200], "author": r["author"],
+                 "updated": datetime.fromtimestamp(r["updated"], JST).strftime("%m-%d %H:%M")}
+                for r in rows]
+
+    def delete(self, guild: int, key: str) -> bool:
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM notes WHERE guild=? AND key=?",
+                                    (guild, key.strip().lower()))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+
+NOTES = NotesStore()
+
+
+
+class HabitTracker:
+    """習慣トラッカー(連続記録)。"""
+
+    def __init__(self, path: str = DB_PATH):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
+        with self.lock:
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS habits(
+                uid INTEGER, name TEXT, day TEXT, done INTEGER DEFAULT 1,
+                PRIMARY KEY(uid, name, day)
+            )""")
+            self.conn.commit()
+
+    def check(self, uid: int, name: str) -> bool:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT done FROM habits WHERE uid=? AND name=? AND day=?",
+                (uid, name.strip().lower(), now_jst().strftime("%Y-%m-%d"))).fetchone()
+        return bool(row and row["done"])
+
+    def toggle(self, uid: int, name: str) -> bool:
+        day = now_jst().strftime("%Y-%m-%d")
+        with self.lock:
+            if self.check(uid, name):
+                self.conn.execute("DELETE FROM habits WHERE uid=? AND name=? AND day=?",
+                                 (uid, name.strip().lower(), day))
+                self.conn.commit()
+                return False
+            self.conn.execute("INSERT OR REPLACE INTO habits(uid, name, day) VALUES(?,?,?)",
+                              (uid, name.strip().lower(), day))
+            self.conn.commit()
+            return True
+
+    def streak(self, uid: int, name: str) -> int:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT day FROM habits WHERE uid=? AND name=? ORDER BY day DESC LIMIT 400",
+                (uid, name.strip().lower())).fetchall()
+        days = {r["day"] for r in rows}
+        streak = 0
+        d = now_jst()
+        while d.strftime("%Y-%m-%d") in days:
+            streak += 1
+            d -= timedelta(days=1)
+        return streak
+
+    def list_today(self, uid: int) -> list[dict]:
+        day = now_jst().strftime("%Y-%m-%d")
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT name FROM habits WHERE uid=? AND day=? ORDER BY name", (uid, day)).fetchall()
+            all_rows = self.conn.execute(
+                "SELECT DISTINCT name FROM habits WHERE uid=? ORDER BY name", (uid,)).fetchall()
+        done = {r["name"] for r in rows}
+        return [{"name": r["name"], "done": r["name"] in done,
+                 "streak": self.streak(uid, r["name"])} for r in all_rows]
+
+
+HABITS = HabitTracker()
+
+
+class MessageIndex:
+    """メッセージのローカル検索インデックス(LIKE + ベクトル併用)。"""
+
+    def __init__(self, path: str = DB_PATH):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
+        with self.lock:
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS msg_index(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, channel INTEGER, author INTEGER,
+                content TEXT, ts REAL, guild INTEGER
+            )""")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_channel ON msg_index(channel)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_ts ON msg_index(ts)")
+            self.conn.commit()
+
+    def add(self, channel: int, author: int, content: str, guild: int = 0) -> None:
+        if not content or len(content) < 2:
+            return
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO msg_index(channel, author, content, ts, guild) VALUES(?,?,?,?,?)",
+                (channel, author, content[:1000], time.time(), guild))
+            self.conn.commit()
+
+    def search(self, query: str, channel: int = 0, limit: int = 20) -> list[dict]:
+        q = (query or "").strip()
+        if not q:
+            return []
+        like = f"%{q}%"
+        with self.lock:
+            if channel:
+                rows = self.conn.execute(
+                    "SELECT * FROM msg_index WHERE channel=? AND content LIKE ? "
+                    "ORDER BY ts DESC LIMIT ?", (channel, like, limit)).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM msg_index WHERE content LIKE ? ORDER BY ts DESC LIMIT ?",
+                    (like, limit)).fetchall()
+        return [{"author": r["author"], "content": r["content"][:200],
+                 "channel": r["channel"],
+                 "ts": datetime.fromtimestamp(r["ts"], JST).strftime("%m-%d %H:%M")}
+                for r in rows]
+
+    def stats(self) -> dict:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) c, COUNT(DISTINCT channel) ch FROM msg_index").fetchone()
+        return {"messages": row["c"], "channels": row["ch"]}
+
+    def prune(self, keep_days: int = 30) -> int:
+        cutoff = time.time() - keep_days * 86400
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM msg_index WHERE ts < ?", (cutoff,))
+            self.conn.commit()
+            return cur.rowcount
+
+
+MSGINDEX = MessageIndex()
+
+
+
+class MacroStore:
+    """カスタムマクロ(トリガー->応答)。"""
+
+    def __init__(self, path: str = DB_PATH):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
+        with self.lock:
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS macros(
+                guild INTEGER, trigger TEXT, response TEXT, author INTEGER,
+                hits INTEGER DEFAULT 0, PRIMARY KEY(guild, trigger)
+            )""")
+            self.conn.commit()
+
+    def set(self, guild: int, trigger: str, response: str, author: int = 0) -> None:
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO macros(guild, trigger, response, author) VALUES(?,?,?,?)",
+                (guild, trigger.strip().lower(), response, author))
+            self.conn.commit()
+
+    def get(self, guild: int, trigger: str) -> str | None:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT response FROM macros WHERE guild=? AND trigger=?",
+                (guild, trigger.strip().lower())).fetchone()
+        return row["response"] if row else None
+
+    def hit(self, guild: int, trigger: str) -> None:
+        with self.lock:
+            self.conn.execute(
+                "UPDATE macros SET hits=hits+1 WHERE guild=? AND trigger=?",
+                (guild, trigger.strip().lower()))
+            self.conn.commit()
+
+    def delete(self, guild: int, trigger: str) -> bool:
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM macros WHERE guild=? AND trigger=?",
+                                    (guild, trigger.strip().lower()))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def list(self, guild: int) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM macros WHERE guild=? ORDER BY hits DESC", (guild,)).fetchall()
+        return [{"trigger": r["trigger"], "response": r["response"][:120], "hits": r["hits"]}
+                for r in rows]
+
+
+MACROS = MacroStore()
+
+
+class Pomodoro:
+    """ポモドーロタイマー(25分集中 / 5分休憩)。"""
+
+    def __init__(self):
+        self.sessions: dict[int, dict] = {}
+
+    def start(self, cid: int, minutes: int = 25, label: str = "集中") -> dict:
+        self.sessions[cid] = {"minutes": minutes, "label": label, "started": time.time(),
+                              "phase": "focus"}
+        return self.sessions[cid]
+
+    def status(self, cid: int) -> dict | None:
+        s = self.sessions.get(cid)
+        if not s:
+            return None
+        elapsed = time.time() - s["started"]
+        remain = max(0, s["minutes"] * 60 - elapsed)
+        return {**s, "elapsed": int(elapsed), "remain": int(remain),
+                "progress": clamp(elapsed / max(1, s["minutes"] * 60), 0, 1)}
+
+    def stop(self, cid: int) -> bool:
+        return self.sessions.pop(cid, None) is not None
+
+
+POMODORO = Pomodoro()
+
+REACTION_ROLES: dict[int, dict[str, str]] = defaultdict(dict)
+
+
+class RateLimiter:
+    """ユーザー単位のレートリミッタ(スレッドセーフ)。"""
+
+    def __init__(self, limit: int = 20, window: float = 10.0):
+        self.limit = limit
+        self.window = window
+        self.buckets: dict[tuple[str, int], deque] = defaultdict(deque)
+        self.lock = threading.RLock()
+
+    def allow(self, scope: str, uid: int) -> bool:
+        key = (scope, uid)
+        now = time.time()
+        with self.lock:
+            q = self.buckets[key]
+            while q and now - q[0] > self.window:
+                q.popleft()
+            if len(q) >= self.limit:
+                return False
+            q.append(now)
+            return True
+
+    def retry_after(self, scope: str, uid: int) -> float:
+        key = (scope, uid)
+        with self.lock:
+            q = self.buckets.get(key) or deque()
+            if not q:
+                return 0.0
+            return max(0.0, self.window - (time.time() - q[0]))
+
+
+LIMITER = RateLimiter()
+
+
+
+# =============================================================================
+#  使いやすさ(ヘルプ/設定) と 新コマンド
+# =============================================================================
+HELP_CATEGORIES = {
+    "会話": ["menu", "mode", "persona", "engine", "profile", "recall", "remember", "status"],
+    "知識・検索": ["wiki", "search", "apis", "modsearch"],
+    "変換・計算": ["calc", "unit", "tzone", "ascii", "markdown", "textstat", "palette", "dns"],
+    "外部API": ["weather", "wikiimages", "steam", "rss", "translate", "qr", "mod"],
+    "経済": ["balance", "shop", "work", "daily", "pay", "leaderboard", "market", "gamble"],
+    "ゲーム": ["dungeon", "blackjack", "ttt", "g2048", "mines", "poker", "dice", "gacha"],
+    "モデレーション": ["timeout", "kick", "ban", "purge", "automod", "slowmode", "raidmode"],
+    "サーバー管理": ["announce", "poll", "level", "note", "habit", "pomodoro", "macro"],
+    "拡張・保守": ["modinstall", "modrun", "pocket", "repair", "diag", "save", "restore", "code"],
+    "その他": ["ping", "ambient", "digest", "radio", "analyze", "help"],
+}
+
+USER_SETTINGS: dict[int, dict] = {}
+
+
+def get_user_settings(uid: int) -> dict:
+    s = USER_SETTINGS.setdefault(uid, {
+        "language": "ja", "notify_ambient": False, "auto_translate": False,
+        "target_lang": "ja", "reply_style": "normal", "dm_summary": True})
+    return s
+
+
+@bot.command()
+async def help(ctx, *, category: str = ""):
+    """カテゴリ別にコマンド一覧を表示。"""
+    if category:
+        key = None
+        for c in HELP_CATEGORIES:
+            if c.lower() in category.lower() or category.lower() in c:
+                key = c
+                break
+        if key is None:
+            return await ctx.send(f"⚠️ カテゴリ「{category}」がありません。利用可能: "
+                                  + ", ".join(HELP_CATEGORIES.keys()))
+        lines = []
+        for name in HELP_CATEGORIES[key]:
+            fn = bot.commands.get(name)
+            if fn is None:
+                continue
+            doc = (fn.__doc__ or "").strip().splitlines()
+            lines.append(f"・`!{name}` — {doc[0] if doc else ''}")
+        return await ctx.send(f"📖 **{key}**\n" + "\n".join(lines))
+    parts = []
+    for c, names in HELP_CATEGORIES.items():
+        avail = [n for n in names if bot.commands.get(n)]
+        if avail:
+            parts.append(f"**{c}**: " + " ".join(f"`!{n}`" for n in avail))
+    await ctx.send(f"📖 **POCHI ULTIMATE ヘルプ** (全{len(bot.commands)}コマンド)\n"
+                   + "\n".join(parts) + "\n\n詳細は `!help <カテゴリ>` で。例: `!help 経済`")
+
+
+@bot.command()
+async def settings(ctx, *, key: str = "", value: str = ""):
+    """ユーザー設定の表示と変更。"""
+    s = get_user_settings(ctx.author.id)
+    if not key:
+        return await ctx.send("⚙️ **設定**\n" + "\n".join(
+            f"・`{k}` = `{v}`" for k, v in s.items()) +
+            "\n変更例: `!settings notify_ambient true`")
+    if key not in s:
+        return await ctx.send(f"⚠️ 未知の設定キー: `{key}`\n" +
+                              "\n".join(f"・{k}" for k in s.keys()))
+    if not value:
+        return await ctx.send(f"⚙️ `{key}` = `{s[key]}`")
+    s[key] = value.lower() in ("1", "true", "yes", "on") if isinstance(s[key], bool) else value
+    await ctx.send(f"✅ 設定を更新: `{key}` = `{s[key]}`")
+
+
+@bot.command()
+async def tzone(ctx, *, place: str = "Tokyo"):
+    """タイムゾーン変換。"""
+    await ctx.send(f"🕒 {place}\n" + api_timezone(place))
+
+
+@bot.command()
+async def unit(ctx, *, expr: str = ""):
+    """単位変換 (例: unit 100 km/h m/s)。"""
+    parts = expr.split()
+    if len(parts) < 3:
+        return await ctx.send("⚠️ 使い方: `!unit 100 km/h m/s`")
+    try:
+        val = float(parts[0])
+    except ValueError:
+        return await ctx.send("⚠️ 数値が不正です")
+    await ctx.send(api_unit(val, parts[1], parts[2]))
+
+
+@bot.command()
+async def ascii(ctx, *, text: str = "POCHI"):
+    """ASCIIアート生成。"""
+    await ctx.send("```\n" + ascii_art(text) + "\n```")
+
+
+@bot.command()
+async def markdown(ctx, *, text: str = ""):
+    """Markdown を Discord 記法へ変換。"""
+    if not text:
+        return await ctx.send("⚠️ `!markdown <テキスト>`")
+    await ctx.send(markdown_to_discord(text))
+
+
+@bot.command()
+async def textstat(ctx, *, text: str = ""):
+    """テキスト統計と可読性。"""
+    if not text:
+        return await ctx.send("⚠️ `!textstat <テキスト>`")
+    await ctx.send(api_textstat(text))
+
+
+@bot.command()
+async def palette(ctx, *, theme: str = "pochi"):
+    """テーマからカラーパレットを生成。"""
+    p = palette_from_seed(theme)
+    lines = [f"・**{k}** `{v['hex']}` (HSL {v['hsl'][0]},{v['hsl'][1]}%,{v['hsl'][2]}%)"
+             for k, v in p.items()]
+    await ctx.send(f"🎨 **パレット: {theme}**\n" + "\n".join(lines))
+
+
+@bot.command()
+async def dns(ctx, *, host: str = ""):
+    """DNS解決。"""
+    if not host:
+        return await ctx.send("⚠️ `!dns <ホスト名>`")
+    await ctx.send(api_dns(host))
+
+
+
+@bot.command()
+async def translate(ctx, *, text: str = "", frm: str = "auto", to: str = "ja"):
+    """無料翻訳。"""
+    if not text:
+        return await ctx.send("⚠️ `!translate <テキスト> [元言語] [先言語]`")
+    await ctx.send(await api_translate(text, frm, to))
+
+
+@bot.command()
+async def steam(ctx, *, game: str = ""):
+    """Steam ゲーム情報。"""
+    if not game:
+        return await ctx.send("⚠️ `!steam <ゲーム名>`")
+    await ctx.send(await api_steam(game))
+
+
+@bot.command()
+async def rss(ctx, *, url: str = ""):
+    """RSS フィードを読む。"""
+    if not url:
+        return await ctx.send("⚠️ `!rss <フィードURL>`")
+    await ctx.send(await api_rss(url))
+
+
+@bot.command()
+async def wikiimages(ctx, *, query: str = ""):
+    """Commons の画像検索。"""
+    if not query:
+        return await ctx.send("⚠️ `!wikiimages <検索語>`")
+    await ctx.send(await api_wiki_images(query))
+
+
+@bot.command()
+async def level(ctx, *, member: str = ""):
+    """レベル・XP・ストリークの確認。"""
+    target = ctx.author
+    if member:
+        found = find_member(ctx.guild, member)
+        if found:
+            target = found
+    data = LEVELS.get(target.id, ctx.guild.id if ctx.guild else 0)
+    await ctx.send(f"⭐ **{getattr(target, 'display_name', target.id)}**\n"
+                   f"・レベル: **{data['level']}** ({data['rank']})\n"
+                   f"・XP: {data['xp']} / 発言: {data['msgs']}\n"
+                   f"・連続日数: {data['streak']}日 (最高 {data['best_streak']}日)")
+
+
+@bot.command()
+async def note(ctx, *, args: str = ""):
+    """サーバーWiki ノートの閲覧・追加。"""
+    gid = ctx.guild.id if ctx.guild else 0
+    if not args:
+        rows = NOTES.list(gid)
+        listing = "\n".join(f"・`{r['key']}` — {r['value'][:80]} ({r['updated']})" for r in rows)
+        return await ctx.send("📔 **ノート**\n" + (listing or
+                                       "📔 ノートはまだありません。`!note set <キー> = <内容>` で追加。"))
+    if args.startswith("set "):
+        body = args[4:].strip()
+        if "=" not in body:
+            return await ctx.send("⚠️ `!note set <キー> = <内容>`")
+        key, val = body.split("=", 1)
+        NOTES.set(gid, key.strip(), val.strip(), ctx.author.id)
+        return await ctx.send(f"📔 ノートを保存: `{key.strip()}`")
+    if args.startswith("del "):
+        key = args[4:].strip()
+        ok = NOTES.delete(gid, key)
+        return await ctx.send(f"📔 ノート削除: {'成功' if ok else '該当なし'}")
+    val = NOTES.get(gid, args.strip())
+    if val is None:
+        return await ctx.send(f"📔 ノート「{args.strip()}」は未登録です。")
+    await ctx.send(f"📔 **{args.strip()}**\n{val[:1800]}")
+
+
+@bot.command()
+async def habit(ctx, *, name: str = ""):
+    """習慣トラッカー。"""
+    if not name:
+        rows = HABITS.list_today(ctx.author.id)
+        listing = "\n".join(f"・{'✔' if r['done'] else '·'} `{r['name']}` (連続{r['streak']}日)"
+                           for r in rows)
+        return await ctx.send("✅ **習慣**\n" + (listing or
+                                       "✅ 習慣が未登録です。`!habit <名前>` で登録。"))
+    on = HABITS.toggle(ctx.author.id, name)
+    st = HABITS.streak(ctx.author.id, name)
+    await ctx.send(f"{'✅ 達成しました!' if on else '↩️ 取り消しました'} "
+                   f"`{name}` (連続 {st}日)")
+
+
+@bot.command()
+async def pomodoro(ctx, *, args: str = ""):
+    """ポモドーロタイマー。"""
+    cid = ctx.channel.id
+    if not args:
+        st = POMODORO.status(cid)
+        if not st:
+            return await ctx.send("⏱️ タイマー未起動。`!pomodoro 25 作業` で開始。")
+        filled = int(st["progress"] * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        return await ctx.send(f"⏱️ **{st['label']}**\n`{bar}`\n"
+                              f"残り **{st['remain']//60}分{st['remain']%60}秒** "
+                              f"(経過 {st['elapsed']}秒)")
+    if args.strip() in ("stop", "やめる", "終了"):
+        ok = POMODORO.stop(cid)
+        return await ctx.send("⏹️ タイマーを止めました。" if ok else "ℹ️ タイマーは動いていません。")
+    parts = args.split()
+    try:
+        mins = int(parts[0])
+    except (ValueError, IndexError):
+        mins = 25
+    label = parts[1] if len(parts) > 1 else "集中"
+    POMODORO.start(cid, max(1, min(180, mins)), label)
+    await ctx.send(f"⏱️ **{mins}分**の集中タイマーを開始しました。完了したら `!pomodoro stop`。")
+
+
+
+@bot.command()
+async def macro(ctx, *, args: str = ""):
+    """カスタムマクロの管理。"""
+    gid = ctx.guild.id if ctx.guild else 0
+    if not args:
+        rows = MACROS.list(gid)
+        listing = "\n".join(f"・`{r['trigger']}` → {r['response'][:60]} (使用{r['hits']}回)"
+                           for r in rows)
+        return await ctx.send("🔧 **マクロ**\n" + (listing or
+                                       "🔧 マクロなし。`!macro set <語> = <応答>` で追加。"))
+    if args.startswith("set "):
+        body = args[4:].strip()
+        if "=" not in body:
+            return await ctx.send("⚠️ `!macro set <語> = <応答>`")
+        trig, resp = body.split("=", 1)
+        MACROS.set(gid, trig.strip(), resp.strip(), ctx.author.id)
+        return await ctx.send(f"🔧 マクロを保存: `{trig.strip()}`")
+    if args.startswith("del "):
+        ok = MACROS.delete(gid, args[4:].strip())
+        return await ctx.send(f"🔧 マクロ削除: {'成功' if ok else '該当なし'}")
+    rows = MACROS.list(gid)
+    await ctx.send("🔧 **マクロ**\n" + "\n".join(
+        f"・`{r['trigger']}` → {r['response'][:80]}" for r in rows))
+
+
+@bot.command()
+async def search(ctx, *, query: str = ""):
+    """このサーバーの発言を検索(ローカルインデックス)。"""
+    if not query:
+        return await ctx.send("⚠️ `!search <キーワード>`")
+    hits = MSGINDEX.search(query, ctx.channel.id, 15) or MSGINDEX.search(query, 0, 15)
+    if not hits:
+        return await ctx.send(f"🔍 『{query}』に一致する発言はありません。")
+    lines = [f"・<@{h['author']}> {h['content'][:120]} ({h['ts']})" for h in hits]
+    await ctx.send(f"🔍 **検索結果: {query}** ({len(hits)}件)\n" + "\n".join(lines))
+
+
+@bot.command()
+async def g2048(ctx, *, direction: str = "left"):
+    """2048 ゲーム。"""
+    cid = ctx.channel.id
+    s, msg = GAME2048.move(cid, direction.lower())
+    await ctx.send(f"🔢 **2048**\n```\n{GAME2048.render(s)}\n```\n{msg}")
+
+
+@bot.command()
+async def mines(ctx, *, action: str = "start"):
+    """マインスイーパー。"""
+    cid = ctx.channel.id
+    if action in ("start", "新規"):
+        s = MINES.start(cid)
+        return await ctx.send(f"💣 **マインスイーパー** (9x9 / 地雷{s['mines']}個)\n"
+                              f"```\n{MINES.render(s)}\n```\n"
+                              f"`!mines open <x> <y>` / `!mines flag <x> <y>`")
+    parts = action.split()
+    if len(parts) < 3:
+        return await ctx.send("⚠️ `!mines open <x> <y>`")
+    try:
+        x, y = int(parts[1]), int(parts[2])
+    except ValueError:
+        return await ctx.send("⚠️ 座標は数値で指定してください")
+    s = MINES.get(cid)
+    if parts[0] in ("open", "開"):
+        s, msg = MINES.reveal(cid, x, y)
+    elif parts[0] in ("flag", "旗"):
+        s, msg = MINES.flag(cid, x, y)
+    else:
+        return await ctx.send("⚠️ 操作は `open` か `flag`")
+    await ctx.send(f"💣 {msg}\n```\n{MINES.render(s)}\n```")
+
+
+@bot.command()
+async def poker(ctx, *, cards: str = ""):
+    """ポーカー5枚を評価。例: !poker AS KH QD JC 9D"""
+    cs = [c for c in re.split(r"[\s,]+", cards.upper()) if c]
+    if len(cs) != 5:
+        return await ctx.send("⚠️ カードを5枚指定してください (例: `!poker AS KH QD JC 9D`)")
+    rank, name, _tb = evaluate_poker_hand(cs)
+    await ctx.send(f"🃏 **{' '.join(cs)}**\nハンド: **{name}** (ランク {rank})")
+
+
+@bot.command()
+async def apis(ctx):
+    """利用可能な外部API一覧。"""
+    lines = []
+    for name, spec in list(FREE_APIS.items()) + list(EXTENDED_APIS.items()) + list(EXTRA_APIS.items()):
+        lines.append(f"・`{name}` — {spec[0]}")
+    total = len(FREE_APIS) + len(EXTENDED_APIS) + len(EXTRA_APIS)
+    await ctx.send(f"🌐 **外部API 一覧 ({total}種 / すべてキー不要)**\n" + "\n".join(lines))
 
 
 # =============================================================================
