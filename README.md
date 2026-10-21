@@ -31,6 +31,17 @@ GET  /api/chat/rooms/{id}/export         Markdown書き出し
 ### 監視ダッシュボード
 `/dashboard` で内部状態（CPU/メモリ/AI/記憶/市場/ログ/コンソール）を確認できます。
 
+### Discord から招待リンクを張る
+
+| コマンド | 動作 |
+|---|---|
+| `!chat [部屋名]` | 部屋を作り、**招待リンク**とコードをDiscordに貼る |
+| `!chatjoin <コード>` | コードから参加（リンクを再表示） |
+| `!chatsend <コード> <本文>` | DiscordからWebチャットへ送信（AI応答はWebに届く） |
+| `!chatlog <コード> [件数]` | Webチャットの会話をDiscordに貼り出す |
+| `!chatlist` | 自分が作った部屋の一覧 |
+| `/pochi chat` | スラッシュコマンド版（自分だけに見えるリンク） |
+
 ---
 
 ## 🌐 ライブサイト

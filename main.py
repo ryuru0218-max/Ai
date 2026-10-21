@@ -7339,6 +7339,105 @@ async def apis(ctx):
 
 
 @bot.command()
+async def chat(ctx, *, name: str = ""):
+    """AIチャットサイトの部屋を作り、友達に共有できる招待リンクを発行する。"""
+    owner = ctx.author.display_name
+    room = CHAT.create_room(name=name.strip()[:40] or f"{owner}の部屋", owner=owner)
+    CHAT.add_message(room["id"], "system", owner,
+                     f"**{owner}** が部屋「{room['name']}」を作りました。\n"
+                     f"招待コード: `{room['code']}` — 友達に共有リンクを送ってください。")
+    CHAT.publish(room["id"], {"type": "message"})
+    emb = make_embed("💬 AIチャット 部屋を作りました", "", 0x5B8CFF)
+    emb.add_field(name="部屋名", value=room["name"])
+    emb.add_field(name="招待コード", value=f"`{room['code']}`", inline=True)
+    emb.add_field(name="会話URL", value=room["url"], inline=False)
+    emb.add_field(name="使い方", value="上のリンクを友達に送る → 友達が同じ部屋に参加して会話できます。\n"
+                                     f"Discordから送る場合: `!chatsend {room['code']} メッセージ`")
+    emb.set_footer(text="POCHI CHAT — 友達と共有できるAIチャット")
+    await ctx.send(embed=emb)
+    await ctx.send(f"🔗 **招待リンク**\n{room['url']}\n"
+                   f"招待コード: `{room['code']}`")
+
+
+@bot.command()
+async def chatjoin(ctx, *, code: str = ""):
+    """招待コードからAIチャットサイトに参加する(リンクを表示)。"""
+    if not code:
+        return await ctx.send("⚠️ `!chatjoin <招待コード>`")
+    room = CHAT.get_room_by_code(code)
+    if room is None:
+        return await ctx.send(f"⚠️ 招待コード `{code}` の部屋が見つかりません。")
+    CHAT.touch(room["id"], ctx.author.display_name)
+    emb = make_embed("💬 AIチャット に参加します", "", 0x00D4A0)
+    emb.add_field(name="部屋名", value=room["name"])
+    emb.add_field(name="招待コード", value=f"`{room['code']}`", inline=True)
+    emb.add_field(name="会話URL", value=room["url"], inline=False)
+    emb.add_field(name="最新の発言", value=(CHAT.messages(room["id"], 0, 3)[-1]["text"][:200]
+                                        if CHAT.messages(room["id"], 0, 3) else "まだ発言がありません"))
+    await ctx.send(embed=emb)
+    await ctx.send(f"🔗 **招待リンク**\n{room['url']}\n"
+                   f"招待コード: `{room['code']}`")
+
+
+@bot.command()
+async def chatsend(ctx, *, args: str = ""):
+    """DiscordからAIチャットの部屋へメッセージを送る。"""
+    parts = args.split(" ", 1)
+    if len(parts) < 2:
+        return await ctx.send("⚠️ `!chatsend <招待コード> <メッセージ>`")
+    code, text = parts[0].strip().upper(), parts[1].strip()
+    room = CHAT.get_room_by_code(code)
+    if room is None:
+        return await ctx.send(f"⚠️ 招待コード `{code}` の部屋が見つかりません。")
+    CHAT.add_message(room["id"], "user", ctx.author.display_name, text)
+    CHAT.publish(room["id"], {"type": "message"})
+    CHAT.publish(room["id"], {"type": "typing", "on": True})
+    loop = MAIN_LOOP
+    if loop is not None:
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(
+                _chat_reply(room["id"], text, ctx.author.display_name,
+                            room["mode"], room["persona"], room["style"]), loop)
+    await ctx.send(f"✅ `{code}` に送信しました（POCHIの応答はWebチャット部屋に届きます）。")
+
+
+@bot.command()
+async def chatlog(ctx, *, args: str = ""):
+    """AIチャットの会話をDiscordに貼り出す(共有・要約)。"""
+    parts = args.split()
+    code = parts[0].strip().upper() if parts else ""
+    limit = 10
+    if len(parts) > 1 and parts[1].isdigit():
+        limit = max(1, min(50, int(parts[1])))
+    if not code:
+        return await ctx.send("⚠️ `!chatlog <招待コード> [件数]`")
+    room = CHAT.get_room_by_code(code)
+    if room is None:
+        return await ctx.send(f"⚠️ 招待コード `{code}` の部屋が見つかりません。")
+    msgs = CHAT.messages(room["id"], 0, 200)[-limit:]
+    if not msgs:
+        return await ctx.send("📭 この部屋にはまだ発言がありません。")
+    emb = make_embed(f"💬 {room['name']} の会話ログ", room["url"], 0x5B8CFF)
+    body = []
+    for m in msgs:
+        who = "POCHI" if m["role"] == "ai" else m["author"]
+        body.append(f"**{who}**: {m['text'][:200]}")
+    emb.add_field(name=f"最新{len(msgs)}件", value=truncate("\n".join(body), 1000) or "なし")
+    emb.set_footer(text=f"招待コード {room['code']}")
+    await ctx.send(embed=emb)
+
+
+@bot.command()
+async def chatlist(ctx):
+    """自分が作ったAIチャット部屋の一覧。"""
+    rows = CHAT.rooms_for(ctx.author.display_name)
+    if not rows:
+        return await ctx.send(f"💬 まだ部屋がありません。`!chat` で作成できます。")
+    lines = [f"・`{r['code']}` **{r['name']}** — {r['messages']}件\n  {r['url']}" for r in rows]
+    await ctx.send("💬 **あなたのAIチャット部屋**\n" + "\n".join(lines))
+
+
+@bot.command()
 async def digest(ctx):
     """自動通知ダイジェストの手動表示。"""
     cid = ctx.channel.id
@@ -8801,6 +8900,14 @@ class ChatStore:
                 q.put_nowait(payload)
             except Exception:  # noqa: BLE001
                 pass
+
+    def rooms_for(self, owner: str, limit: int = 20) -> list[dict]:
+        """作成者が作った部屋の一覧。"""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM rooms WHERE owner=? ORDER BY created DESC LIMIT ?",
+                (owner, limit)).fetchall()
+        return [self._room_dict(r) for r in rows]
 
     def stats(self) -> dict:
         with self.lock:
@@ -11049,6 +11156,7 @@ LIMITER = RateLimiter()
 # =============================================================================
 HELP_CATEGORIES = {
     "会話": ["menu", "mode", "persona", "engine", "profile", "recall", "remember", "status"],
+    "AIチャット": ["chat", "chatjoin", "chatsend", "chatlog", "chatlist"],
     "知識・検索": ["wiki", "search", "apis", "modsearch"],
     "変換・計算": ["calc", "unit", "tzone", "ascii", "markdown", "textstat", "palette", "dns"],
     "外部API": ["weather", "wikiimages", "steam", "rss", "translate", "qr", "mod"],
@@ -11709,6 +11817,17 @@ try:
     import discord.app_commands as app_commands
 
     slash_group = app_commands.Group(name="pochi", description="POCHI ULTIMATE スラッシュコマンド")
+
+    @slash_group.command(name="chat", description="AIチャットサイトの招待リンクを発行")
+    async def _slash_chat(interaction):
+        owner = interaction.user.display_name
+        room = CHAT.create_room(name=f"{owner}の部屋", owner=owner)
+        CHAT.add_message(room["id"], "system", owner,
+                         f"**{owner}** が部屋「{room['name']}」を作りました。\n"
+                         f"招待コード: `{room['code']}`")
+        await interaction.response.send_message(
+            f"🔗 **AIチャット 招待リンク**\n{room['url']}\n招待コード: `{room['code']}`",
+            ephemeral=True)
 
     @slash_group.command(name="status", description="内部ステータスを表示")
     async def _slash_status(interaction):
