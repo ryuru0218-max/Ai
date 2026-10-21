@@ -9,11 +9,19 @@ Discord Bot（**1ファイル / 11,900行**）と、実装済みの公式Webダ�
 
 | 用途 | リンク |
 |---|---|
+| **公式サイト（GitHub Pages）** | **https://ryuru0218-max.github.io/Ai/** ← すぐに開けます |
 | **ダッシュボード** | **https://pochi-ai.onrender.com/** |
 | 生存確認 | https://pochi-ai.onrender.com/healthz |
 | メトリクス (Prometheus) | https://pochi-ai.onrender.com/metrics |
 | 状態 JSON | https://pochi-ai.onrender.com/api/status |
 | リアルタイム (SSE) | https://pochi-ai.onrender.com/api/stream |
+
+> ⚠️ `pochi-ai` は Render 上の**サービス名が `pochi-ai` の場合**のURLです。
+> まだデプロイしていない場合（`Not Found` になる場合）は
+> 下の **「1クリックデプロイ」** を押してください。サービス名が固定されるため、
+> デプロイ後は必ず `https://pochi-ai.onrender.com/` で開けます。
+> 既に別名で作っている場合は Render ダッシュボードの「Public URL」を
+> `POCHI_PUBLIC_URL` 環境変数に入れてください（ログとダッシュボードに反映されます）。
 
 > トークンを設定した場合：`https://pochi-ai.onrender.com/?token=<POCHI_WEB_TOKEN>` でログインできます
 > （ブラウザが localStorage に保存し、以後は Bearer ヘッダで自動認証されます）

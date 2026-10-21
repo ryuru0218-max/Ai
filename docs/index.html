@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>POCHI ULTIMATE — 自律Discordエージェント</title>
+<meta name="description" content="自律Discordエージェント & 公式ダッシュボード。外部API57種・実Modインストーラ・自己修復ループ・空気感オートノミー。">
+<style>
+:root{--bg:#0b0d12;--bg2:#12151d;--panel:#161a24;--panel2:#1c2130;--line:#262c3a;
+--fg:#e6e9f0;--mut:#8b93a7;--acc:#5b8cff;--acc2:#00d4a0;--err:#ff5c6c;--r:16px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(1100px 620px at 10% -12%,#1b2540 0%,transparent 60%),
+radial-gradient(900px 560px at 104% 0%,#0f2e2a 0%,transparent 55%),var(--bg);
+color:var(--fg);font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hiragino Sans","Noto Sans JP",sans-serif;
+min-height:100vh}
+.wrap{max-width:1080px;margin:0 auto;padding:56px 22px 80px}
+header{display:flex;align-items:center;gap:13px;margin-bottom:34px}
+.logo{width:46px;height:46px;border-radius:13px;background:linear-gradient(135deg,var(--acc),var(--acc2));
+display:grid;place-items:center;font-weight:800;color:#08111f;font-size:20px}
+header h1{font-size:19px;letter-spacing:.3px}
+header small{display:block;color:var(--mut);font-size:12px}
+.hero{text-align:center;margin-bottom:38px}
+.hero h2{font-size:clamp(28px,5.4vw,46px);font-weight:800;letter-spacing:-1.2px;line-height:1.25}
+.hero h2 span{background:linear-gradient(90deg,var(--acc),var(--acc2));
+-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p{color:var(--mut);max-width:660px;margin:16px auto 0;font-size:15.5px}
+.cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:28px}
+a.btn{display:inline-block;text-decoration:none;padding:13px 24px;border-radius:11px;
+font-weight:700;font-size:14.5px;border:1px solid transparent}
+.btn.p{background:linear-gradient(135deg,var(--acc),#7aa2ff);color:#07101f}
+.btn.g{background:var(--panel2);border-color:var(--line);color:var(--fg)}
+.btn.g:hover{border-color:var(--acc)}
+.card{background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--line);
+border-radius:var(--r);padding:22px 24px}
+.status{display:flex;align-items:center;gap:12px;margin-bottom:26px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--mut)}
+.dot.on{background:var(--acc2);box-shadow:0 0 10px var(--acc2)}
+.dot.off{background:var(--err)}
+.status b{font-size:15px}
+.status span{color:var(--mut);font-size:13px}
+.grid{display:grid;gap:15px;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));margin-bottom:30px}
+.f{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:17px 19px}
+.f h3{font-size:12px;color:var(--mut);letter-spacing:.9px;text-transform:uppercase;margin-bottom:9px}
+.f p{font-size:14px;color:#cfd5e3}
+.f p b{color:var(--fg)}
+pre{background:#0a0c11;border:1px solid var(--line);border-radius:12px;padding:15px;overflow:auto;
+font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+a{color:var(--acc)}
+.note{color:var(--mut);font-size:13px;margin-top:14px}
+.kv{font-size:13.5px;color:var(--mut)}
+.kv b{color:var(--fg)}
+@media(max-width:640px){.wrap{padding:34px 16px 60px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">P</div>
+    <div><h1>POCHI UULTIMATE</h1><small>Autonomous Discord Agent &amp; Dashboard</small></div>
+  </header>
+
+  <div class="hero">
+    <h2>自律するDiscordエージェントと<br><span>公式ダッシュボード</span></h2>
+    <p>1ファイル11,900行。外部API 57種・実PyPI Modインストーラ・AST自己修復ループ・
+       空気感オートノミー・音楽/経済/ゲーム/モデレーションを全実装。</p>
+    <div class="cta">
+      <a class="btn p" id="dash" href="https://pochi-ai.onrender.com/" target="_blank" rel="noopener">ダッシュボードを開く</a>
+      <a class="btn g" href="https://render.com/deploy?repo=https://github.com/ryuru0218-max/Ai" target="_blank" rel="noopener">Renderでデプロイ</a>
+      <a class="btn g" href="https://github.com/ryuru0218-max/Ai" target="_blank" rel="noopener">ソース</a>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:30px">
+    <div class="status">
+      <i class="dot" id="dot"></i>
+      <div><b id="st">ステータス確認中…</b><br><span id="stx">Render 上のサービスに接続しています</span></div>
+    </div>
+    <div class="kv" id="kvs"></div>
+  </div>
+
+  <div class="grid">
+    <div class="f"><h3>認知・対話</h3><p><b>多重思考エンジン</b>（6系統council合議）／会話モード26種／人格RP 35種／
+      話者プロファイリング＋深層記憶（ベクター近傍・木構造・自動統合）</p></div>
+    <div class="f"><h3>機能</h3><p><b>UIアクション248種</b>・コマンド65個。音楽（実WAV合成）／経済（市場・株取引）／
+      ゲーム（ダンジョン・BJ・2048・マインスイーパー）／モデレーション／サーバー管理</p></div>
+    <div class="f"><h3>内部・OS層</h3><p>asyncio+Thread+Process並列／動的スロットリング／<b>AST自己修復ループ</b>／
+      タスク自動再投入／機能フラグ・監査・バックアップ・自己更新</p></div>
+    <div class="f"><h3>外部・Mod</h3><p>キー不要API <b>57種</b>／DuckDuckGo実検索／<b>実PyPI Modインストーラ</b>／
+      四次元ポケット（生成→検証→即時メモリ展開→動的コマンド登録）</p></div>
+    <div class="f"><h3>裏（自律）</h3><p>空気感検知→先回りアクション／市場シミュレーション／
+      リアクショRole／隠しコマンド／監査付き深層シェル</p></div>
+    <div class="f"><h3>サイト</h3><p>11タブのダッシュボード／REST API 12本／<b>SSEリアルタイム</b>／
+      Prometheusメトリクス／Bearerトークン認証</p></div>
+  </div>
+
+  <div class="card">
+    <h3 style="font-size:12px;color:var(--mut);letter-spacing:.9px;text-transform:uppercase;margin-bottom:12px">
+      主なエンドポイント</h3>
+<pre><code>GET  /                      ダッシュボード(SPA)
+GET  /healthz               生存確認
+GET  /metrics               Prometheus メトリクス
+GET  /api/status            状態JSON
+GET  /api/stream            SSE リアルタイム指標
+GET  /api/memory /profiles /plugins /commands /economy /ambient /logs
+POST /api/console           管理コンソール
+POST /api/mods/install      外部Modインストール</code></pre>
+    <p class="note">トークンを設定した場合は <code>/?token=…</code> でログインできます（ブラウザに保存され以降は Bearer 認証）。</p>
+  </div>
+</div>
+<script>
+const API='https://pochi-ai.onrender.com';
+async function ping(){
+  const dot=document.getElementById('dot'),st=document.getElementById('st'),stx=document.getElementById('stx');
+  try{
+    const c=new AbortController(); setTimeout(()=>c.abort(),6000);
+    const r=await fetch(API+'/api/status',{signal:c.signal});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    dot.className='dot on';
+    st.textContent='オンライン';
+    stx.textContent='稼働 '+Math.floor(d.uptime_sec/60)+'分 / CPU '+d.resources.cpu+'% / MEM '+d.resources.mem_pct+'% / コマンド '+(d.discord?d.discord.commands:'-')+'個';
+    document.getElementById('kvs').innerHTML=
+      '<b>モデル</b> '+(d.ai?d.ai.model:'-')+' / <b>AI呼び出し</b> '+(d.ai?d.ai.calls:0)+
+      ' / <b>メモリノード</b> '+(d.memory?d.memory.nodes:0)+' / <b>外部API</b> '+(d.features?d.features.external_apis:0)+
+      '種 / <b>UIアクション</b> '+(d.features?d.features.ui_actions:0)+' / <b>Discordサーバー</b> '+(d.discord?d.discord.guilds:0);
+  }catch(e){
+    dot.className='dot off';
+    st.textContent='オフライン（未デプロイ or 別サービス名）';
+    stx.textContent='Render ダッシュボードで Public URL を確認し、リンクを差し替えてください';
+  }
+}
+ping(); setInterval(ping,30000);
+</script>
+</body>
+</html>
