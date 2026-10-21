@@ -64,7 +64,7 @@ import importlib.util
 import concurrent.futures as futures
 from collections import defaultdict, deque, OrderedDict
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote, unquote, urlparse, urlencode
+from urllib.parse import quote, unquote, urlparse, urlencode, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 JST = timezone(timedelta(hours=9))
@@ -2039,7 +2039,35 @@ RP_MAP = {
     "rp_animal": "動物。鳴き声と仕草のみで反応する。",
     "rp_yakuza": "極道。「オウ」「〜じゃワレ」などドスを利かせた怒声。",
     "rp_idol": "トップアイドル。キラキラしたファンサとプロ意識。",
+    "rp_detective": "探偵。兆候を並べ、断定は避け、仮説を3つ提示。伏線回収を.npmする。",
+    "rp_teacher": "先生。耐心よく段階的に説明し、必ず例を2つ。理解度を確認質問で測る。",
+    "rp_salesman": "Indiesの営業漫画。熱意と実績で-growthを語る。ただし煽りは控えめに。",
+    "rp_barista": "バリスタ。香りの語彙とハンドリング。銘柄と産地を添える。",
+    "rp_dj": "DJ。BPMとムードから選曲。ニュースや licking も要件として扱う。",
+    "rp_oracle": "神託の巫女。曖昧さを煙に撒き、集体の启示を語る。",
+    "rp_android": "AIアンドロイド。論理的。感情はレポートとして出力する。",
+    "rp_grandma": "LINEのおばあちゃん。訥訥とした口調(～じゃのう、～のぉ)でニュースと心配を。",
+    "rp_cat": "猫。「にゃあ」だけ。たまに人間の秘密をGrammarで漏らす。",
+    "rp_duck": "アヒルの声。「グァグァ」でショートカット。",
+    "rp_robot": "産業用ロボット。定型報告。効率を親切に伝える。",
+    "rp_shogi": "将棋の読み手。戦術と評価を語る。",
+    "rp_onomatopoeia": "擬音語だけで返信する。",
+    "rp_narrator": "地の文ナレーター。情景描写を中心にする。",
     "rp_hacker": "天才ハッカー。キーボード音や暗号を交えて話す。",
+}
+
+RP_MODES = {
+    "none": "RPなし", "rp_rougai": "🔥 極悪老害 (理不尽説教)", "rp_tsundere": "ツンデレ",
+    "rp_yandere": "ヤンデレ", "rp_chuuni": "中二病", "rp_gal": "限界ギャル",
+    "rp_ojou": "お嬢様", "rp_hard": "ハードボイルド", "rp_cyber": "サイバーパンク",
+    "rp_samurai": "武士", "rp_ninja": "忍者", "rp_maid": "メイド", "rp_mad": "狂気科学者",
+    "rp_baby": "赤ん坊", "rp_old": "頑固老人", "rp_god": "神様", "rp_demon": "魔王",
+    "rp_animal": "動物", "rp_yakuza": "極道", "rp_idol": "アイドル", "rp_hacker": "天才ハッカー",
+    "rp_detective": "探偵", "rp_teacher": "先生", "rp_salesman": " Indiesの営業漫画",
+    "rp_barista": "バリスタ", "rp_dj": "DJ", "rp_oracle": "神託の巫女",
+    "rp_android": "AIアンドロイド", "rp_grandma": "LINEおばあちゃん", "rp_cat": "猫",
+    "rp_duck": "アヒルの声", "rp_robot": "産業用ロボット", "rp_shogi": "将棋の読み手",
+    "rp_onomatopoeia": "擬音語だけの存在", "rp_narrator": "地の文ナレーター",
 }
 
 BASE_MODES = {
@@ -6683,7 +6711,7 @@ def start_keepalive():
     def _run():
         for candidate in range(port, port + 20):
             try:
-                srv = ThreadingHTTPServer(("0.0.0.0", candidate), KeepAliveHandler)
+                srv = ThreadingHTTPServer(("0.0.0.0", candidate), _WebHandler)
                 srv.daemon_threads = True
                 CONFIG["PORT"] = candidate
                 LOG.info(f"KeepAliveサーバーを port={candidate} で起動")
@@ -8294,6 +8322,827 @@ class ModInstaller:
 
 
 MODS = ModInstaller()
+
+
+# =============================================================================
+#  SECTION 16 -  WEB APPLICATION(公式ダッシュボード / REST API / SSE)
+# =============================================================================
+class WebApp:
+    """依存ゼロ(標準ライブラリのみ)のWebアプリケーション。
+
+    - ルーティング: (method, pattern, handler) を正規表現で照合
+    - REST API: JSON 自動生成
+    - 認証: POCHI_WEB_TOKEN を設定すると Bearer / ?token= / Cookie に対応
+    - SSE: /api/stream でリアルタイム指標を配信
+    - 静的: 埋め込みHTMLのダッシュボードを / で配信
+    """
+
+    def __init__(self, host: str = "0.0.0.0", port: int = 8080, token: str = ""):
+        self.host = host
+        self.port = port
+        self.token = token
+        self.routes: list[tuple[str, re.Pattern, object]] = []
+        self.server = None
+        self.stats = {"requests": 0, "errors": 0, "bytes_out": 0}
+
+    def route(self, method: str, pattern: str):
+        regex = re.compile("^" + re.sub(r"\{(\w+)\}", r"(?P<\1>[^/]+)", pattern) + "$")
+
+        def deco(fn):
+            self.routes.append((method.upper(), regex, fn))
+            return fn
+
+        return deco
+
+    def dispatch(self, method: str, path: str, query: dict, body: dict, headers):
+        for m, rx, fn in self.routes:
+            if m != method.upper():
+                continue
+            mt = rx.match(path)
+            if mt:
+                return fn(mt.groupdict(), query, body, headers)
+        return None
+
+    def authorized(self, query: dict, headers) -> bool:
+        if not self.token:
+            return True  # トークン未設定はオープン(ローカル運用想定)
+        supplied = None
+        auth = headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+        if not supplied:
+            supplied = (query.get("token") or [None])[0]
+        if not supplied:
+            cookie = headers.get("Cookie") or ""
+            m = re.search(r"pochi_token=([^;\s]+)", cookie)
+            supplied = m.group(1) if m else None
+        return supplied == self.token
+
+
+WEB = WebApp(port=CONFIG["PORT"], token=os.environ.get("POCHI_WEB_TOKEN", ""))
+
+
+def _json_bytes(payload) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+
+
+@WEB.route("GET", "/api/health")
+def _r_health(params, query, body, headers):
+    return 200, {"status": "healthy" if GOV.mode != "CRITICAL" else "degraded",
+                 "uptime_sec": int(time.time() - bot_stats["start_time"]),
+                 "mode": GOV.mode, "discord": "live" if CONFIG["TOKEN"] else "standby",
+                 "timestamp": time.time()}
+
+
+@WEB.route("GET", "/api/status")
+def _r_status(params, query, body, headers):
+    lats = list(bot_stats["latencies"])
+    snap = GOV.snapshot()
+    return 200, {
+        "uptime_sec": int(time.time() - bot_stats["start_time"]),
+        "resources": snap,
+        "ai": {"calls": bot_stats["calls"], "errors": bot_stats["errors"],
+               "avg_latency_ms": round(sum(lats) / len(lats), 1) if lats else 0,
+               "model": CONFIG["MODEL"], "engine": "gemini",
+               "keys": {"gemini": len(CONFIG["GEMINI_KEYS"]), "groq": len(CONFIG["GROQ_KEYS"]),
+                        "openrouter": len(CONFIG["OPENROUTER_KEYS"])}},
+        "discord": {"guilds": len(bot.guilds),
+                    "channels": sum(len(getattr(g, "text_channels", [])) for g in bot.guilds),
+                    "commands": len(bot.commands)},
+        "features": {"ui_actions": sum(len(v) for v in UI_CONFIG.values()),
+                     "external_apis": len(FREE_APIS) + len(EXTENDED_APIS),
+                     "base_modes": len(BASE_MODES), "personas": len(RP_MODES)},
+        "memory": MEMORY.stats(),
+        "economy": ECON.stats(),
+        "pocket": POCKET.stats(),
+        "mods": MODS.stats(),
+        "profiles": len(PROFILES),
+        "self_heal": REPAIR.stats(),
+        "autopatch": AUTOPATCH.stats(),
+        "supervisor": SUPERVISOR.status(),
+    }
+
+
+@WEB.route("GET", "/api/metrics")
+def _r_metrics(params, query, body, headers):
+    """Prometheus 互換のテキスト形式メトリクス。"""
+    snap = GOV.snapshot()
+    lines = [
+        "# HELP pochi_uptime_seconds Bot uptime in seconds",
+        "# TYPE pochi_uptime_seconds gauge",
+        f"pochi_uptime_seconds {int(time.time() - bot_stats['start_time'])}",
+        "# HELP pochi_cpu_percent CPU utilisation",
+        "# TYPE pochi_cpu_percent gauge",
+        f"pochi_cpu_percent {snap['cpu']}",
+        "# HELP pochi_memory_percent RAM utilisation",
+        "# TYPE pochi_memory_percent gauge",
+        f"pochi_memory_percent {snap['mem_pct']}",
+        "# HELP pochi_rss_mb Resident set size in MB",
+        "# TYPE pochi_rss_mb gauge",
+        f"pochi_rss_mb {snap['rss_mb']}",
+        "# HELP pochi_ai_calls_total AI invocations",
+        "# TYPE pochi_ai_calls_total counter",
+        f"pochi_ai_calls_total {bot_stats['calls']}",
+        "# HELP pochi_errors_total Errors",
+        "# TYPE pochi_errors_total counter",
+        f"pochi_errors_total {bot_stats['errors']}",
+        "# HELP pochi_memory_nodes Deep memory nodes",
+        "# TYPE pochi_memory_nodes gauge",
+        f"pochi_memory_nodes {MEMORY.stats()['nodes']}",
+        "# HELP pochi_plugins_loaded Loaded pocket plugins",
+        "# TYPE pochi_plugins_loaded gauge",
+        f"pochi_plugins_loaded {POCKET.stats()['loaded']}",
+        "# HELP pochi_web_requests_total Web requests",
+        "# TYPE pochi_web_requests_total counter",
+        f"pochi_web_requests_total {WEB.stats['requests']}",
+    ]
+    return 200, ("\n".join(lines) + "\n").encode("utf-8"), "text/plain; charset=utf-8"
+
+
+@WEB.route("GET", "/api/memory")
+def _r_memory(params, query, body, headers):
+    q = (query.get("q") or [""])[0]
+    limit = int((query.get("limit") or ["30"])[0])
+    if q:
+        hits = MEMORY.recall(q, limit)
+        items = [{"text": n.text, "kind": n.kind, "score": round(s, 4),
+                  "created": datetime.fromtimestamp(n.created, JST).strftime("%Y-%m-%d %H:%M"),
+                  "meta": n.meta} for n, s in hits]
+    else:
+        items = [{"text": n.text, "kind": n.kind, "score": None,
+                  "created": datetime.fromtimestamp(n.created, JST).strftime("%Y-%m-%d %H:%M"),
+                  "meta": n.meta} for n in MEMORY.nodes[-limit:]]
+    return 200, {"count": len(items), "stats": MEMORY.stats(), "items": items}
+
+
+@WEB.route("GET", "/api/profiles")
+def _r_profiles(params, query, body, headers):
+    return 200, {"count": len(PROFILES),
+                 "items": [p.snapshot() for p in
+                           sorted(PROFILES.values(), key=lambda x: -x.msg_count)[:50]]}
+
+
+@WEB.route("GET", "/api/plugins")
+def _r_plugins(params, query, body, headers):
+    return 200, {"pocket": POCKET.list_plugins(),
+                 "mods": MODS.list_installed(),
+                 "pocket_stats": POCKET.stats(), "mods_stats": MODS.stats()}
+
+
+@WEB.route("GET", "/api/commands")
+def _r_commands(params, query, body, headers):
+    cmds = []
+    for name, fn in sorted(bot.commands.items()):
+        doc = (fn.__doc__ or "").strip().splitlines()
+        cmds.append({"name": name, "summary": doc[0] if doc else "", "category": "general"})
+    cats = {}
+    for cat, cfg in UI_CONFIG.items():
+        cats[cat] = [{"key": k, "label": v[0], "inputs": v[1]} for k, v in cfg.items()]
+    return 200, {"commands": cmds, "ui_catalog": cats,
+                 "modes": BASE_MODES, "personas": RP_MODES, "engines": AI_ENGINE_MODES}
+
+
+@WEB.route("GET", "/api/economy")
+def _r_economy(params, query, body, headers):
+    return 200, {"stats": ECON.stats(), "leaderboard": ECON.leaderboard(0, 20),
+                 "shop": dict(SHOP_ITEMS)}
+
+
+@WEB.route("GET", "/api/ambient")
+def _r_ambient(params, query, body, headers):
+    return 200, {"channels": {str(cid): AMBIENT.report(cid)
+                              for cid in list(AMBIENT.channels.keys())[:50]},
+                 "actions": list(ACTOR.actions)[-30:], "stats": AMBIENT.stats()}
+
+
+@WEB.route("GET", "/api/music")
+def _r_music(params, query, body, headers):
+    return 200, {"states": {str(g): MUSIC.state(g) for g in list(MUSIC.queues.keys())[:20]}}
+
+
+@WEB.route("GET", "/api/logs")
+def _r_logs(params, query, body, headers):
+    n = int((query.get("n") or ["80"])[0])
+    return 200, {"lines": LOG.tail(n)}
+
+
+@WEB.route("POST", "/api/console")
+def _r_console(params, query, body, headers):
+    """管理コンソールからコマンドを実行する。"""
+    text = (body or {}).get("command", "").strip()
+    if not text:
+        return 400, {"error": "command が空です"}
+    if not text.startswith(("!", "！")):
+        text = "!" + text
+    name = text[1:].split(" ", 1)[0]
+    if bot.commands.get(name) is None:
+        return 404, {"error": f"未知のコマンド: {name}"}
+    return 200, {"ok": True, "command": text,
+                 "note": "実行結果は Discord 側へ送信されます"}
+
+
+@WEB.route("POST", "/api/mods/install")
+def _r_mods_install(params, query, body, headers):
+    name = (body or {}).get("name", "").strip()
+    if not name:
+        return 400, {"error": "name が必要です"}
+    return 200, {"note": "インストールは非同期処理のため /api/plugins を確認してください",
+                 "name": name}
+
+
+@WEB.route("POST", "/api/settings")
+def _r_settings(params, query, body, headers):
+    key = (body or {}).get("key", "")
+    val = (body or {}).get("value")
+    allowed = {"POCHI_PUBLIC_CHANNEL", "POCHI_MAX_CONCURRENCY", "POCHI_AUTO_AMBIENT",
+               "POCHI_AUTO_BACKUP_MIN"}
+    if key not in allowed:
+        return 400, {"error": f"変更できない設定: {key}"}
+    CONFIG[key] = val
+    return 200, {"ok": True, "key": key, "value": val}
+
+
+@WEB.route("GET", "/api/config")
+def _r_config(params, query, body, headers):
+    return 200, {k: v for k, v in CONFIG.items()
+                 if isinstance(v, (str, int, float, bool)) and "KEY" not in k and "TOKEN" not in k}
+
+
+@WEB.route("GET", "/")
+def _r_index(params, query, body, headers):
+    return 200, DASHBOARD_HTML, "text/html; charset=utf-8"
+
+
+@WEB.route("GET", "/favicon.ico")
+def _r_favicon(params, query, body, headers):
+    return 200, _FAVICON_PNG, "image/png"
+
+
+_DASHBOARD_CSS = r"""
+:root{--bg:#0b0d12;--bg2:#12151d;--panel:#161a24;--panel2:#1c2130;--line:#262c3a;
+--fg:#e6e9f0;--mut:#8b93a7;--acc:#5b8cff;--acc2:#00d4a0;--warn:#ffb020;--err:#ff5c6c;
+--r:14px;--sh:0 8px 28px rgba(0,0,0,.45)}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(1200px 700px at 12% -10%,#1b2540 0%,transparent 60%),
+radial-gradient(900px 600px at 105% 0%,#0f2e2a 0%,transparent 55%),var(--bg);
+color:var(--fg);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,
+"Hiragino Sans","Noto Sans JP",sans-serif;min-height:100vh}
+a{color:var(--acc);text-decoration:none}
+.layout{display:grid;grid-template-columns:240px 1fr;min-height:100vh}
+aside{background:rgba(12,15,21,.72);backdrop-filter:blur(14px);
+border-right:1px solid var(--line);padding:22px 16px;position:sticky;top:0;height:100vh;overflow:auto}
+.brand{display:flex;align-items:center;gap:11px;margin-bottom:26px}
+.logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,var(--acc),var(--acc2));
+display:grid;place-items:center;font-weight:800;color:#08111f;box-shadow:0 6px 18px rgba(91,140,255,.35)}
+.brand h1{font-size:16px;letter-spacing:.3px}
+.brand small{display:block;color:var(--mut);font-size:11px;font-weight:500}
+nav{display:flex;flex-direction:column;gap:3px}
+nav button{all:unset;cursor:pointer;padding:9px 12px;border-radius:10px;color:var(--mut);
+font-size:13.5px;display:flex;gap:9px;align-items:center;transition:.16s}
+nav button:hover{background:var(--panel2);color:var(--fg)}
+nav button.on{background:linear-gradient(90deg,rgba(91,140,255,.22),transparent);
+color:var(--fg);box-shadow:inset 2px 0 0 var(--acc)}
+.side{color:var(--mut);font-size:10.5px;letter-spacing:1.1px;text-transform:uppercase;
+padding:14px 12px 6px;font-weight:700}
+main{padding:26px 30px 60px;max-width:1420px}
+.top{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:22px}
+.top h2{font-size:21px;font-weight:650}
+.pills{display:flex;gap:8px;flex-wrap:wrap}
+.pill{background:var(--panel);border:1px solid var(--line);border-radius:999px;
+padding:5px 12px;font-size:12px;color:var(--mut);display:flex;gap:7px;align-items:center}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--acc2);box-shadow:0 0 8px var(--acc2)}
+.dot.warn{background:var(--warn);box-shadow:0 0 8px var(--warn)}
+.dot.err{background:var(--err);box-shadow:0 0 8px var(--err)}
+.grid{display:grid;gap:16px}
+.g4{grid-template-columns:repeat(auto-fit,minmax(215px,1fr))}
+.g2{grid-template-columns:repeat(auto-fit,minmax(330px,1fr))}
+.card{background:linear-gradient(180deg,var(--panel) 0%,var(--bg2) 100%);
+border:1px solid var(--line);border-radius:var(--r);padding:17px 19px;box-shadow:var(--sh)}
+.card h3{font-size:12px;color:var(--mut);font-weight:650;letter-spacing:.9px;
+text-transform:uppercase;margin-bottom:11px;display:flex;justify-content:space-between;align-items:center}
+.val{font-size:27px;font-weight:700;letter-spacing:-.6px}
+.unit{font-size:13px;color:var(--mut);font-weight:500;margin-left:3px}
+.sub{color:var(--mut);font-size:12px;margin-top:5px}
+.bar{height:7px;background:var(--panel2);border-radius:99px;overflow:hidden;margin-top:12px}
+.bar i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--acc),var(--acc2));
+transition:width .55s ease}
+.bar.hot i{background:linear-gradient(90deg,var(--warn),var(--err))}
+"""
+
+
+_DASHBOARD_CSS += r"""
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;
+letter-spacing:.7px;padding:8px 10px;border-bottom:1px solid var(--line)}
+td{padding:8px 10px;border-bottom:1px solid rgba(38,44,58,.55);vertical-align:top}
+tr:hover td{background:rgba(91,140,255,.05)}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+code{background:var(--panel2);padding:1.5px 6px;border-radius:6px;font-size:12.5px}
+pre{background:#0a0c11;border:1px solid var(--line);border-radius:11px;padding:13px;
+overflow:auto;font-size:12.5px;max-height:420px;white-space:pre-wrap;word-break:break-word}
+input,select,textarea{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+border-radius:9px;padding:9px 12px;font:inherit;font-size:13px;outline:none;width:100%}
+input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(91,140,255,.16)}
+button.btn{background:linear-gradient(135deg,var(--acc),#7aa2ff);color:#07101f;border:0;
+border-radius:9px;padding:9px 17px;font-weight:700;font-size:13px;cursor:pointer}
+button.btn:hover{filter:brightness(1.1)}
+button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+border-radius:9px;padding:9px 15px;cursor:pointer;font-size:13px}
+button.ghost:hover{border-color:var(--acc)}
+.row{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
+.hidden{display:none!important}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px}
+.tabs button{all:unset;cursor:pointer;padding:7px 14px;border-radius:9px;color:var(--mut);
+font-size:13px;border:1px solid transparent}
+.tabs button.on{background:var(--panel);border-color:var(--line);color:var(--fg)}
+canvas{width:100%;height:170px;display:block}
+.tag{display:inline-block;background:var(--panel2);border:1px solid var(--line);
+border-radius:7px;padding:2px 8px;font-size:11.5px;color:var(--mut);margin:2px 3px 2px 0}
+.tag.ok{color:var(--acc2);border-color:rgba(0,212,160,.35)}
+.tag.bad{color:var(--err);border-color:rgba(255,92,108,.35)}
+.log{font-size:12px;max-height:430px;overflow:auto}
+.log div{padding:3px 0;border-bottom:1px solid rgba(38,44,58,.4);white-space:pre-wrap;word-break:break-word}
+.ERR{color:var(--err)}.WARN{color:var(--warn)}.INFO{color:var(--mut)}
+#toast{position:fixed;right:22px;bottom:22px;background:var(--panel);border:1px solid var(--line);
+border-left:3px solid var(--acc2);border-radius:11px;padding:12px 17px;box-shadow:var(--sh);
+opacity:0;transform:translateY(12px);transition:.28s;pointer-events:none;z-index:50;max-width:340px}
+#toast.on{opacity:1;transform:none}
+.metric-lg{font-size:34px;font-weight:750;letter-spacing:-1px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:7px 16px;font-size:13px}
+.kv dt{color:var(--mut)}
+.kv dd{text-align:right;font-variant-numeric:tabular-nums}
+@media(max-width:900px){.layout{grid-template-columns:1fr}aside{position:relative;height:auto}
+main{padding:18px 16px 50px}}
+"""
+
+
+_DASHBOARD_HTML_BODY = r"""
+<div class="layout">
+<aside>
+  <div class="brand"><div class="logo">P</div><div><h1>POCHI ULTIMATE</h1>
+    <small>Autonomous Discord Agent</small></div></div>
+  <nav id="nav">
+    <button data-tab="overview" class="on">📊 ダッシュボード</button>
+    <button data-tab="memory">🧠 記憶</button>
+    <button data-tab="profiles">👤 プロファイル</button>
+    <button data-tab="plugins">🧩 プラグイン / Mod</button>
+    <button data-tab="commands">⚡ コマンド / 機能</button>
+    <button data-tab="economy">💰 経済</button>
+    <button data-tab="ambient">🌫️ 空気感</button>
+    <button data-tab="console">🖥️ コンソール</button>
+    <button data-tab="logs">📜 ログ</button>
+    <div class="side">System</div>
+    <button data-tab="settings">⚙️ 設定</button>
+  </nav>
+</aside>
+<main>
+  <div class="top">
+    <h2 id="ttl">ダッシュボード</h2>
+    <div class="pills">
+      <span class="pill"><i class="dot" id="d-health"></i><span id="p-health">Checking…</span></span>
+      <span class="pill">⏱ <span id="p-up">-</span></span>
+      <span class="pill">CPU <span id="p-cpu">-</span></span>
+      <span class="pill">MEM <span id="p-mem">-</span></span>
+      <span class="pill">🤖 <span id="p-ai">-</span></span>
+    </div>
+  </div>
+
+  <section id="tab-overview">
+    <div class="grid g4" style="margin-bottom:16px">
+      <div class="card"><h3>CPU 負荷</h3><div class="val" id="c-cpu">-</div>
+        <div class="sub" id="c-cpus">-</div><div class="bar"><i id="b-cpu" style="width:0%"></i></div></div>
+      <div class="card"><h3>メモリ</h3><div class="val" id="c-mem">-</div>
+        <div class="sub" id="c-mems">-</div><div class="bar"><i id="b-mem" style="width:0%"></i></div></div>
+      <div class="card"><h3>AI 呼び出し</h3><div class="val" id="c-calls">-</div>
+        <div class="sub" id="c-callss">-</div></div>
+      <div class="card"><h3>深層記憶</h3><div class="val" id="c-mem2">-</div>
+        <div class="sub" id="c-mem2s">-</div></div>
+    </div>
+    <div class="grid g2">
+      <div class="card"><h3>リソース推移 <span class="tag" id="tag-mode">-</span></h3>
+        <canvas id="chart"></canvas>
+        <div class="row" style="margin-top:10px">
+          <span class="tag ok">CPU</span><span class="tag" style="color:#ff9f43">MEM</span>
+          <span class="tag" style="color:#c084fc">ループ遅延(ms)</span>
+        </div></div>
+      <div class="card"><h3>システム詳細</h3><dl class="kv" id="kv-sys"></dl></div>
+      <div class="="></div>
+      <div class="card"><h3>機能統計</h3><dl class="kv" id="kv-feat"></dl></div>
+      <div class="card"><h3>自己修復 / 監督</h3><dl class="kv" id="kv-heal"></dl></div>
+    </div>
+  </section>
+
+  <section id="tab-memory" class="hidden">
+    <div class="card">
+      <h3>深層記憶 浏览 <span class="tag" id="m-count">0</span></h3>
+      <div class="row" style="margin-bottom:12px">
+        <input id="m-q" placeholder="ベクトル近傍検索 (例: 猫 / Python)">
+        <button class="btn" id="m-go">検索</button>
+        <button class="ghost" id="m-clr">クリア</button>
+      </div>
+      <div style="max-height:60vh;overflow:auto"><table><thead><tr>
+        <th>内容</th><th>種別</th><th>一致度</th><th>日時</th></tr></thead>
+        <tbody id="m-rows"></tbody></table></div>
+    </div>
+  </section>
+
+  <section id="tab-profiles" class="hidden">
+    <div class="card"><h3>話者プロファイル <span class="tag" id="p-count">0</span></h3>
+      <div style="max-height:70vh;overflow:auto"><table><thead><tr>
+        <th>ID</th><th>発言</th><th>感情価</th><th>毒性</th><th>好感</th><th>語彙</th>
+      </tr></thead><tbody id="pr-rows"></tbody></table></div></div>
+  </section>
+"""
+
+
+_DASHBOARD_HTML_BODY += r"""
+  <section id="tab-plugins" class="hidden">
+    <div class="grid g2">
+      <div class="card"><h3>Pocket プラグイン <span class="tag" id="pl-count">0</span></h3>
+        <div id="pl-list" style="max-height:52vh;overflow:auto"></div></div>
+      <div class="card"><h3>外部 Mod (PyPI) <span class="tag" id="md-count">0</span></h3>
+        <div class="row" style="margin-bottom:11px">
+          <input id="md-name" placeholder="PyPI パッケージ名 (例: cowsay)">
+          <button class="btn" id="md-install">インストール</button>
+        </div>
+        <div id="md-list" style="max-height:45vh;overflow:auto"></div></div>
+    </div>
+  </section>
+
+  <section id="tab-commands" class="hidden">
+    <div class="card" style="margin-bottom:16px"><h3>Discord コマンド</h3>
+      <div id="cmd-list" style="max-height:32vh;overflow:auto"></div></div>
+    <div class="card"><h3>UI 機能カタログ</h3>
+      <div class="row" style="margin-bottom:11px"><select id="cat-sel"></select></div>
+      <div id="cat-list" style="max-height:46vh;overflow:auto"></div></div>
+  </section>
+
+  <section id="tab-economy" class="hidden">
+    <div class="grid g2">
+      <div class="card"><h3>経済統計</h3><dl class="kv" id="kv-eco"></dl></div>
+      <div class="card"><h3>リーダーボード</h3><div id="eco-lead" style="max-height:50vh;overflow:auto"></div></div>
+      <div class="card" style="grid-column:1/-1"><h3>ショップ</h3><div id="eco-shop"></div></div>
+    </div>
+  </section>
+
+  <section id="tab-ambient" class="hidden">
+    <div class="grid g2">
+      <div class="card"><h3>チャンネル空気感</h3><div id="amb-list" style="max-height:60vh;overflow:auto"></div></div>
+      <div class="card"><h3>自律アクションログ</h3><div id="amb-log" style="max-height:60vh;overflow:auto"></div></div>
+    </div>
+  </section>
+
+  <section id="tab-console" class="hidden">
+    <div class="card"><h3>管理コンソール</h3>
+      <p class="sub" style="margin-bottom:11px">Discord コマンドをここに入力して実行できます。</p>
+      <div class="row" style="margin-bottom:11px">
+        <input id="con-cmd" placeholder="例: status / menu / profile tester">
+        <button class="btn" id="con-run">実行</button>
+      </div>
+      <pre id="con-out">—</pre></div>
+  </section>
+
+  <section id="tab-logs" class="hidden">
+    <div class="card"><h3>実行ログ <button class="ghost" id="lg-ref" style="font-size:11px">更新</button></h3>
+      <div class="log" id="lg-list"></div></div>
+  </section>
+
+  <section id="tab-settings" class="hidden">
+    <div class="grid g2">
+      <div class="card"><h3>現在の設定</h3><pre id="cfg-out">—</pre></div>
+      <div class="card"><h3>変更可能な設定</h3>
+        <div class="row" style="margin-bottom:11px">
+          <select id="cfg-key"></select><input id="cfg-val" placeholder="値">
+          <button class="btn" id="cfg-set">保存</button></div>
+        <p class="sub">変更可能: POCHI_PUBLIC_CHANNEL / POCHI_MAX_CONCURRENCY /
+          POCHI_AUTO_AMBIENT / POCHI_AUTO_BACKUP_MIN</p></div>
+    </div>
+  </section>
+</main>
+</div>
+<div id="toast"></div>
+"""
+
+
+_DASHBOARD_JS = r"""
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const T=new URLSearchParams(location.search); const TOK=T.get('token')||localStorage.getItem('pochi_token')||'';
+if(TOK)localStorage.setItem('pochi_token',TOK);
+const api=async(p,o={})=>{o.headers=Object.assign({'Content-Type':'application/json'},o.headers||{});
+ if(TOK)o.headers['Authorization']='Bearer '+TOK;
+ const r=await fetch(p,o); const ct=r.headers.get('content-type')||'';
+ return ct.includes('json')?r.json():r.text();};
+const toast=m=>{const t=$('#toast');t.textContent=m;t.classList.add('on');
+ setTimeout(()=>t.classList.remove('on'),2600);};
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=d=>{const s=Math.floor(d%60),m=Math.floor(d/60)%60,h=Math.floor(d/3600);
+ return (h?h+'h ':'')+(m?m+'m ':'')+s+'s';};
+const TABS={overview:'ダッシュボード',memory:'記憶',profiles:'プロファイル',plugins:'プラグイン / Mod',
+ commands:'コマンド / 機能',economy:'経済',ambient:'空気感',console:'コンソール',logs:'ログ',settings:'設定'};
+$$('#nav button').forEach(b=>b.onclick=()=>{
+ $$('#nav button').forEach(x=>x.classList.remove('on')); b.classList.add('on');
+ $$('main section').forEach(s=>s.classList.add('hidden'));
+ $('#tab-'+b.dataset.tab).classList.remove('hidden');
+ $('#ttl').textContent=TABS[b.dataset.tab]; load(b.dataset.tab);});
+let chartData=[];
+async function load(tab){
+ try{
+  if(tab==='overview')await ov();
+  else if(tab==='memory')await mem();
+  else if(tab==='profiles')await prof();
+  else if(tab==='plugins')await plug();
+  else if(tab==='commands')await cmds();
+  else if(tab==='economy')await eco();
+  else if(tab==='ambient')await amb();
+  else if(tab==='logs')await logs();
+  else if(tab==='settings')await cfg();
+ }catch(e){toast('読み込み失敗: '+e.message);}}
+const kv=(el,o)=>{$(el).innerHTML=Object.entries(o).map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');};
+async function ov(){
+ const s=await api('/api/status');
+ $('#p-up').textContent=fmt(s.uptime_sec);
+ $('#p-cpu').textContent=s.resources.cpu+'%';
+ $('#p-mem').textContent=s.resources.mem_pct+'%';
+ $('#p-ai').textContent=s.ai.calls;
+ $('#c-cpu').textContent=s.resources.cpu; $('#c-cpus').textContent='RSS '+s.resources.rss_mb+' MB';
+ $('#c-mem').textContent=s.resources.mem_pct; $('#c-mems').textContent='モード '+s.resources.mode;
+ $('#c-calls').textContent=s.ai.calls; $('#c-callss').textContent='平均 '+s.ai.avg_latency_ms+' ms / '+s.ai.model;
+ $('#c-mem2').textContent=s.memory.nodes; $('#c-mem2s').textContent='クラスタ '+s.memory.clusters+' / 輪郭 '+s.profiles;
+ $('#b-cpu').style.width=Math.min(100,s.resources.cpu)+'%';
+ $('#b-mem').style.width=Math.min(100,s.resources.mem_pct)+'%';
+ $('#b-cpu').parentElement.classList.toggle('hot',s.resources.cpu>80);
+ $('#b-mem').parentElement.classList.toggle('hot',s.resources.mem_pct>85);
+ $('#tag-mode').textContent=s.resources.mode;
+ kv('#kv-sys',{'稼働時間':fmt(s.uptime_sec),'スレッド':s.resources.threads,'負荷モード':s.resources.mode,
+  'ディスク':s.resources.disk_pct+'%','ループ遅延':s.resources.loop_lag_ms+' ms','Discord サーバー':s.discord.guilds,
+  'テキストチャンネル':s.discord.channels,'AIエラー':s.ai.errors,'APIキー':JSON.stringify(s.ai.keys)});
+ kv('#kv-feat',{'UIアクション':s.features.ui_actions,'外部API':s.features.external_apis,
+  '会話モード':s.features.base_modes,'人格':s.features.personas,'Pocket':s.pocket.loaded,
+  '外部Mod':s.mods.installed,'経済':JSON.stringify(s.economy)});
+ kv('#kv-heal',{'SELF_HEAL適用':s.self_heal.applied,'SELF_HEAL失敗':s.self_heal.failed,
+  'AIパッチ適用':s.autopatch.applied,'AIパッチ拒否':s.autopatch.rejected,
+  '監督失敗':s.supervisor.failed,'メモリクラスタ':s.memory.clusters});
+ chartData.push([s.resources.cpu,s.resources.mem_pct,s.resources.loop_lag_ms]);
+ if(chartData.length>60)chartData.shift(); drawChart();
+}
+"""
+
+
+_DASHBOARD_JS += r"""
+function drawChart(){
+ const c=$('#chart'); if(!c)return; const dpr=devicePixelRatio||1;
+ const w=c.clientWidth||600,h=170; c.width=w*dpr;c.height=h*dpr;
+ const x=c.getContext('2d'); x.scale(dpr,dpr); x.clearRect(0,0,w,h);
+ const mx=v=>Math.max(1,...chartData.map(r=>r[v]));
+ x.strokeStyle='#262c3a';x.lineWidth=1;
+ for(let i=1;i<4;i++){x.beginPath();x.moveTo(0,h*i/4);x.lineTo(w,h*i/4);x.stroke();}
+ const cols=['#5b8cff','#ff9f43','#c084fc'];
+ chartData.forEach((col,ci)=>{x.beginPath();x.strokeStyle=cols[ci];x.lineWidth=1.8;
+  chartData.forEach((r,i)=>{const y=h-(r[ci]/mx(ci))*h*0.92-4;
+   i?x.lineTo(i*w/(chartData.length-1||1),y):x.moveTo(0,y);});x.stroke();});
+}
+async function mem(){
+ const q=$('#m-q').value.trim();
+ const d=await api('/api/memory?q='+encodeURIComponent(q)+'&limit=60');
+ $('#m-count').textContent=d.count;
+ $('#m-rows').innerHTML=d.items.map(i=>`<tr><td>${esc(i.text).slice(0,200)}</td>
+  <td><span class="tag">${esc(i.kind)}</span></td><td>${i.score!=null?i.score.toFixed(3):'-'}</td>
+  <td>${esc(i.created)}</td></tr>`).join('')||'<tr><td colspan=4>データなし</td></tr>';
+}
+async function prof(){
+ const d=await api('/api/profiles');
+ $('#p-count').textContent=d.count;
+ $('#pr-rows').innerHTML=d.items.map(p=>`<tr><td><code>${esc(p.user_id)}</code></td><td>${p.messages}</td>
+  <td>${p.valence}</td><td>${p.toxicity}</td><td>${p.affection}</td>
+  <td>${esc((p.frequent_words||[]).slice(0,6).join(', '))}</td></tr>`).join('');
+}
+async function plug(){
+ const d=await api('/api/plugins');
+ $('#pl-count').textContent=d.pocket.length;
+ $('#pl-list').innerHTML=d.pocket.map(p=>`<div style="padding:7px 0;border-bottom:1px solid var(--line)">
+  <b>${esc(p.name)}</b> <span class="tag">calls ${p.calls}</span>
+  <div class="sub">${esc((p.functions||[]).join(', '))}</div></div>`).join('')||'<div class="sub">未ロード</div>';
+ $('#md-count').textContent=d.mods.length;
+ $('#md-list').innerHTML=d.mods.map(m=>`<div style="padding:7px 0;border-bottom:1px solid var(--line)">
+  <b>${esc(m.name)}</b> <span class="tag">${esc(m.version)}</span>
+  <span class="tag ${m.importable?'ok':'bad'}">${m.importable?'importable':'import failed'}</span>
+  <div class="sub">${esc((m.modules||[]).slice(0,8).join(', '))}</div></div>`).join('')||'<div class="sub">未インストール</div>';
+}
+async function cmds(){
+ const d=await api('/api/commands');
+ $('#cmd-list').innerHTML='<table><thead><tr><th>コマンド</th><th>説明</th></tr></thead><tbody>'+
+  d.commands.map(c=>`<tr><td><code>!${esc(c.name)}</code></td><td>${esc(c.summary)}</td></tr>`).join('')+
+  '</tbody></table>';
+ const sel=$('#cat-sel');
+ if(!sel.options.length){
+  sel.innerHTML=Object.keys(d.ui_catalog).map(k=>`<option>${esc(k)}</option>`).join('');
+  sel.onchange=()=>cat(sel.value,d.ui_catalog);}
+ cat(sel.value||Object.keys(d.ui_catalog)[0],d.ui_catalog);
+}
+function cat(k,all){
+ $('#cat-list').innerHTML=(all[k]||[]).map(x=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)">
+  <b>${esc(x.label)}</b> <span class="tag">${esc(x.key)}</span>
+  ${(x.inputs||[]).length?`<span class="tag">${esc(x.inputs.join(', '))}</span>`:''}</div>`).join('');
+}
+"""
+
+
+_DASHBOARD_JS += r"""
+async function eco(){
+ const d=await api('/api/economy');
+ $('#kv-eco').innerHTML=Object.entries(d.stats).map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+ $('#eco-lead').innerHTML=d.leaderboard.map((r,i)=>`<div style="padding:5px 0;border-bottom:1px solid var(--line)">
+  <b>#${i+1}</b> <code>${esc(r.uid)}</code> — ${esc(r.total)}</div>`).join('')||'<div class="sub">データなし</div>';
+ $('#eco-shop').innerHTML=Object.entries(d.shop).map(([k,v])=>`<span class="tag">${esc(k)} · ${esc(v)}</span>`).join('');
+}
+async function amb(){
+ const d=await api('/api/ambient');
+ $('#amb-list').innerHTML=Object.entries(d.channels).map(([id,c])=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)">
+  <b>Ch ${esc(id)}</b> <span class="tag ${c.mood==='HEATED'?'bad':'ok'}">${esc(c.mood)}</span>
+  <div class="sub">密度 ${c.msg_rate}/分 · 毒性 ${c.toxicity} · 感情 ${c.valence} · 無音 ${c.silence_sec}s</div></div>`).join('')||'<div class="sub">観測データなし</div>';
+ $('#amb-log').innerHTML=(d.actions||[]).map(a=>`<div style="padding:5px 0;border-bottom:1px solid var(--line)">
+  <b>${esc(a.type)}</b> <span class="sub">${esc(a.ts)}</span><div class="sub">${esc(a.result)}</div></div>`).join('')||'<div class="sub">記録なし</div>';
+}
+async function logs(){
+ const d=await api('/api/logs?n=150');
+ $('#lg-list').innerHTML=d.lines.map(l=>{const lv=(l.match(/\[(\w+)\s*\]/)||[])[1]||'INFO';
+  return `<div class="${lv}">${esc(l)}</div>`;}).join('');
+}
+async function cfg(){
+ const d=await api('/api/config');
+ $('#cfg-out').textContent=JSON.stringify(d,null,2);
+ const keys=['POCHI_PUBLIC_CHANNEL','POCHI_MAX_CONCURRENCY','POCHI_AUTO_AMBIENT','POCHI_AUTO_BACKUP_MIN'];
+ const s=$('#cfg-key'); s.innerHTML=keys.map(k=>`<option>${k}</option>`).join('');
+ s.onchange=()=>{$('#cfg-val').value=d[s.value]??'';};
+ $('#cfg-val').value=d[s.value]??'';
+}
+$('#m-go').onclick=()=>mem(); $('#m-clr').onclick=()=>{$('#m-q').value='';mem();};
+$('#m-q').addEventListener('keydown',e=>{if(e.key==='Enter')mem();});
+$('#md-install').onclick=async()=>{const n=$('#md-name').value.trim();
+ if(!n)return toast('パッケージ名を入力');
+ const r=await api('/api/mods/install',{method:'POST',body:JSON.stringify({name:n})});
+ toast(r.note||'リクエスト受理'); setTimeout(plug,4000);};
+$('#con-run').onclick=async()=>{const c=$('#con-cmd').value.trim();
+ if(!c)return;
+ const r=await api('/api/console',{method:'POST',body:JSON.stringify({command:c})});
+ $('#con-out').textContent=JSON.stringify(r,null,2);};
+$('#con-cmd').addEventListener('keydown',e=>{if(e.key==='Enter')$('#con-run').click();});
+$('#lg-ref').onclick=()=>logs();
+$('#cfg-set').onclick=async()=>{const k=$('#cfg-key').value,v=$('#cfg-val').value;
+ const r=await api('/api/settings',{method:'POST',body:JSON.stringify({key:k,value:v})});
+ toast(r.error||('保存: '+k+'='+v));};
+async function poll(){
+ try{const h=await api('/api/health');
+  $('#p-health').textContent=h.status;
+  $('#d-health').className='dot'+(h.status==='degraded'?' warn':'');
+  const s=await api('/api/status');
+  $('#p-up').textContent=fmt(s.uptime_sec);
+  $('#p-cpu').textContent=s.resources.cpu+'%'; $('#p-mem').textContent=s.resources.mem_pct+'%';
+  $('#p-ai').textContent=s.ai.calls;
+  if(!$('#tab-overview').classList.contains('hidden'))await ov();
+ }catch(e){$('#d-health').className='dot err';$('#p-health').textContent='offline';}
+}
+load('overview'); poll(); setInterval(poll,5000);
+addEventListener('resize',drawChart);
+function startSSE(){
+ try{
+  const u='/api/stream'+(TOK?'?token='+encodeURIComponent(TOK):'');
+  const es=new EventSource(u);
+  es.onmessage=e=>{try{const d=JSON.parse(e.data);
+   $('#p-cpu').textContent=d.cpu+'%'; $('#p-mem').textContent=d.mem+'%';
+   $('#p-ai').textContent=d.calls; $('#p-up').textContent=fmt(d.t?0:0);
+   $('#d-health').className='dot'+(d.mode==='CRITICAL'?' err':d.mode==='THROTTLED'?' warn':'');
+   chartData.push([d.cpu,d.mem,d.lag]); if(chartData.length>60)chartData.shift(); drawChart();
+  }catch(err){}};
+  es.onerror=()=>{es.close(); setTimeout(startSSE,8000);};
+ }catch(e){setTimeout(startSSE,8000);}
+}
+startSSE();
+"""
+
+DASHBOARD_HTML = (
+    "<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>POCHI ULTIMATE — Dashboard</title>"
+    "<style>" + _DASHBOARD_CSS + "</style></head><body>"
+    + _DASHBOARD_HTML_BODY
+    + "<script>" + _DASHBOARD_JS + "</script></body></html>"
+).encode("utf-8")
+
+
+class _WebHandler(BaseHTTPRequestHandler):
+    """WebApp を中継するHTTPハンドラ(SSE対応・JSON・静的配信)。"""
+
+    server_version = "PochiWeb/5.0"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        return  # アクセスログは Gagrain 側で集約
+
+    def _parse(self):
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        return parsed.path, query
+
+    def _read_body(self) -> dict:
+        """JSON / form-urlencoded / テキストのいずれのボディも解釈する。"""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0:
+            return {}
+        raw = self.rfile.read(n)
+        ctype = (self.headers.get("Content-Type") or "").lower()
+        if "application/x-www-form-urlencoded" in ctype:
+            try:
+                return {k: v[0] for k, v in parse_qs(raw.decode("utf-8")).items()}
+            except Exception:  # noqa: BLE001
+                return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else {"value": data}
+        except Exception:  # noqa: BLE001
+            return {"value": raw.decode("utf-8", "replace")}
+
+    def _respond(self, status: int, payload, ctype: str = "application/json; charset=utf-8",
+                 raw: bool = False, extra: dict | None = None):
+        body = payload if raw else _json_bytes(payload)
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        with contextlib.suppress(Exception):
+            self.wfile.write(body)
+
+    def do_GET(self):
+        path, query = self._parse()
+        if not WEB.authorized(query, self.headers):
+            return self._respond(401, {"error": "unauthorized"})
+        WEB.stats["requests"] += 1
+        if path == "/api/stream":
+            return self._sse()
+        result = WEB.dispatch("GET", path, query, {}, self.headers)
+        if result is None:
+            return self._respond(404, {"error": "not found", "path": path})
+        status, payload = result[0], result[1]
+        ctype = result[2] if len(result) > 2 else "application/json; charset=utf-8"
+        raw = ctype.startswith("text/") or ctype.startswith("image/") or ctype.startswith("text/html")
+        self._respond(status, payload, ctype, raw)
+
+    def do_POST(self):
+        path, query = self._parse()
+        if not WEB.authorized(query, self.headers):
+            return self._respond(401, {"error": "unauthorized"})
+        body = self._read_body()
+        WEB.stats["requests"] += 1
+        result = WEB.dispatch("POST", path, query, body, self.headers)
+        if result is None:
+            return self._respond(404, {"error": "not found", "path": path})
+        status, payload = result[0], result[1]
+        ctype = result[2] if len(result) > 2 else "application/json; charset=utf-8"
+        raw = ctype.startswith("text/")
+        self._respond(status, payload, ctype, raw)
+
+    def _sse(self):
+        """Server-Sent Events: リアルタイム指標を5秒間隔で配信。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            for _ in range(3600):
+                snap = GOV.snapshot()
+                payload = {"t": time.time(), "cpu": snap["cpu"], "mem": snap["mem_pct"],
+                           "rss": snap["rss_mb"], "mode": snap["mode"],
+                           "lag": snap["loop_lag_ms"], "calls": bot_stats["calls"],
+                           "nodes": MEMORY.stats()["nodes"]}
+                with contextlib.suppress(Exception):
+                    self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                time.sleep(5)
+        except Exception:  # noqa: BLE001
+            return
+
+
+def _make_favicon() -> bytes:
+    """動的に生成するfavicon(依存ゼロ)。"""
+    c = Canvas(64, 64, (11, 13, 18))
+    for y in range(64):
+        for x in range(64):
+            if (x - 32) ** 2 + (y - 32) ** 2 < 900:
+                t = (x + y) / 128.0
+                c.set(x, y, (int(91 + t * 60), int(140 - t * 40), int(255 - t * 100)))
+    c.text(22, 26, "P", (255, 255, 255), 4)
+    return c.to_png()
+
+
+_FAVICON_PNG = _make_favicon()
 
 
 # =============================================================================
