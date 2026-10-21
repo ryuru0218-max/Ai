@@ -8686,6 +8686,18 @@ def _r_status(params, query, body, headers):
         "self_heal": REPAIR.stats(),
         "autopatch": AUTOPATCH.stats(),
         "supervisor": SUPERVISOR.status(),
+        "flags": FLAGS.snapshot(),
+        "audit_rows": AUDIT.count(),
+        "costs": COSTS.snapshot(),
+        "cost_usd": COSTS.total_usd(),
+        "backups": len(BACKUPS.list()),
+        "market": MARKET.board()[:6],
+        "portfolio_top": MARKET.leaderboard(5),
+        "message_index": MSGINDEX.stats(),
+        "levels": len(LEVELS.leaderboard(0, 100)),
+        "playlists": len(PLAYLISTS.list(0)),
+        "trends": {str(cid): TRENDS.analyze(cid) for cid in list(TRENDS.series)[:8]},
+        "web": dict(WEB.stats),
     }
 
 
@@ -8959,6 +8971,7 @@ _DASHBOARD_HTML_BODY = r"""
     <button data-tab="logs">📜 ログ</button>
     <div class="side">System</div>
     <button data-tab="settings">⚙️ 設定</button>
+    <button data-tab="system">🧩 内部システム</button>
   </nav>
 </aside>
 <main>
@@ -9084,6 +9097,17 @@ _DASHBOARD_HTML_BODY += r"""
           POCHI_AUTO_AMBIENT / POCHI_AUTO_BACKUP_MIN</p></div>
     </div>
   </section>
+
+  <section id="tab-system" class="hidden">
+    <div class="grid g2">
+      <div class="card"><h3>機能フラグ</h3><div id="sys-flags"></div></div>
+      <div class="card"><h3>API利用状況 / コスト</h3><div id="sys-costs"></div></div>
+      <div class="card"><h3>市場</h3><div id="sys-market"></div></div>
+      <div class="card"><h3>感情トレンド</h3><div id="sys-trends"></div></div>
+      <div class="card"><h3>監査 / バックアップ</h3><div id="sys-audit"></div></div>
+      <div class="card"><h3>内部状態</h3><dl class="kv" id="kv-sys2"></dl></div>
+    </div>
+  </section>
 </main>
 </div>
 <div id="toast"></div>
@@ -9122,6 +9146,7 @@ async function load(tab){
   else if(tab==='ambient')await amb();
   else if(tab==='logs')await logs();
   else if(tab==='settings')await cfg();
+  else if(tab==='system')await system();
  }catch(e){toast('読み込み失敗: '+e.message);}}
 const kv=(el,o)=>{$(el).innerHTML=Object.entries(o).map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');};
 async function ov(){
@@ -9228,6 +9253,37 @@ async function amb(){
   <div class="sub">密度 ${c.msg_rate}/分 · 毒性 ${c.toxicity} · 感情 ${c.valence} · 無音 ${c.silence_sec}s</div></div>`).join('')||'<div class="sub">観測データなし</div>';
  $('#amb-log').innerHTML=(d.actions||[]).map(a=>`<div style="padding:5px 0;border-bottom:1px solid var(--line)">
   <b>${esc(a.type)}</b> <span class="sub">${esc(a.ts)}</span><div class="sub">${esc(a.result)}</div></div>`).join('')||'<div class="sub">記録なし</div>';
+}
+async function system(){
+ const s=await api('/api/status');
+ const fl=s.flags||{};
+ $('#sys-flags').innerHTML=Object.entries(fl).map(([k,v])=>
+  `<span class="tag ${v?'ok':'bad'}">${esc(k)} ${v?'ON':'OFF'}</span>`).join('');
+ const c=s.costs||{};
+ $('#sys-costs').innerHTML=(Object.entries(c).map(([k,v])=>
+  `・<b>${esc(k)}</b>: ${v.calls}回 / ${v.tokens.toLocaleString()}tok / $${(v.usd||0).toFixed(6)}`).join('<br>')
+  ||'利用実績なし')+`<div class="sub">合計 $${(s.cost_usd||0).toFixed(6)}</div>`;
+ $('#sys-market').innerHTML=(s.market||[]).map(m=>
+  `<div style="padding:5px 0;border-bottom:1px solid var(--line)">
+   <b>${esc(m.code)}</b> ${esc(m.name)} — ${m.price.toLocaleString()}
+   <span class="tag ${m.change_pct>=0?'ok':'bad'}">${m.change_pct>=0?'▲':'▼'}${Math.abs(m.change_pct).toFixed(2)}%</span></div>`).join('');
+ const tr=s.trends||{};
+ $('#sys-trends').innerHTML=Object.entries(tr).map(([id,t])=>
+  t.ok?`<div style="padding:5px 0;border-bottom:1px solid var(--line)">Ch ${esc(id)}
+   <span class="tag ${t.direction==='上昇'?'ok':t.direction==='下降'?'bad':''}">${esc(t.direction)}</span>
+   <div class="sub">平均 ${t.avg} / 毒性 ${t.toxicity} / ${t.samples}件</div></div>`
+   :`<div style="padding:5px 0">Ch ${esc(id)} <span class="sub">データ不足</span></div>`).join('')
+   ||'<div class="sub">トレンドデータなし</div>';
+ $('#sys-audit').innerHTML=`<dl class="kv">
+  <dt>監査レコード</dt><dd>${s.audit_rows||0}</dd>
+  <dt>バックアップ</dt><dd>${s.backups||0}</dd>
+  <dt>発言索引</dt><dd>${(s.message_index||{}).messages||0}件</dd>
+  <dt>レベル登録</dt><dd>${s.levels||0}人</dd>
+  <dt>プレイリスト</dt><dd>${s.playlists||0}件</dd></dl>`;
+ kv('#kv-sys2',{'Web要求数':(s.web||{}).requests||0,'Webエラー':(s.web||{}).errors||0,
+  'Pocket':(s.pocket||{}).loaded,'外部Mod':(s.mods||{}).installed,
+  'メモリノード':(s.memory||{}).nodes,'SELF_HEAL':(s.self_heal||{}).applied,
+  'AIパッチ':(s.autopatch||{}).applied,'監督失敗':(s.supervisor||{}).failed});
 }
 async function logs(){
  const d=await api('/api/logs?n=150');
