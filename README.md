@@ -23,6 +23,14 @@ Discord Bot（**1ファイル / 11,900行**）と、実装済みの公式Webダ�
 > 既に別名で作っている場合は Render ダッシュボードの「Public URL」を
 > `POCHI_PUBLIC_URL` 環境変数に入れてください（ログとダッシュボードに反映されます）。
 
+### 公式サイトを GitHub Pages で公開する（設定1クリック）
+
+`docs/index.html` を同梱しています。リポジトリの
+**Settings → Pages → Build and deployment → Source: `Deploy from a branch`**
+→ Branch: `main` / Folder: `/docs` を選択して Save してください。
+公開後 **https://ryuru0218-max.github.io/Ai/** で公式トップページが開きます
+（ワークフローは不要で、外部依存なしの静的ページなので即公開できます）。
+
 > トークンを設定した場合：`https://pochi-ai.onrender.com/?token=<POCHI_WEB_TOKEN>` でログインできます
 > （ブラウザが localStorage に保存し、以後は Bearer ヘッダで自動認証されます）
 
@@ -104,6 +112,7 @@ python main.py --preflight    # 起動前チェック(サイトの公開可否�
 | `requirements.txt` | 依存パッケージ |
 | `render.yaml` | Render Blueprint（デプロイ設定） |
 | `README.md` | このファイル（機能一覧・リンク） |
+| `docs/index.html` | 公式トップページ（GitHub Pages で公開） |
 
 ---
 
