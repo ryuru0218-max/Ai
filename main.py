@@ -795,7 +795,7 @@ def safe_calc(expr: str):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in funcs:
             args = [_ev(a) for a in n.args]
             if n.func.id == "fact" and (args[0] < 0 or args[0] > 300):
-                raise ValueError("fact範囲外")
+                raise ValueError("fact の範囲外")
             return funcs[n.func.id](*args)
         raise ValueError("無効な数式")
 
@@ -2273,7 +2273,7 @@ def local_reasoning(state: dict, text: str, council: dict | None = None) -> str:
         "apology": "気にしなくていいよ。気にせず次の話へ。",
         "casual": "いいねそのノリ。もう少し具体的に聞かせて。",
         "challenge": "いい勝負だ。本気出せ — 負けないよう手筈を組む。",
-        "detail_request": "詳細に decomposed。前提→手順→注意点の3層で説明する。",
+        "detail_request": "詳細に分解。前提→手順→注意点の3層で説明する。",
     }.get(intent["primary"], "内容を組み立てると、こうなる。")
     if facts:
         body += f"\n【記憶参照】" + " / ".join(f[:60] for f in facts)
@@ -4456,7 +4456,7 @@ UI_CONFIG = {
         "create_emoji": ["🖼️ 絵文字作成", ["名", "URL"]],
     },
     "MUSIC_ECON": {
-        "music_play": ["🎵 再生(.internal)", ["曲名"]],
+        "music_play": ["🎵 再生(音源生成)", ["曲名"]],
         "music_skip": ["⏭️ スキップ", []],
         "music_stop": ["⏹️ 停止", []],
         "music_queue": ["📋 キュー表示", []],
@@ -6161,7 +6161,7 @@ async def execute_modal_action(ch, guild, ctx_mock, action: str, vals: list[str]
             tn, tid = (t.display_name if t else v0), (t.id if t else v0)
             res = await asyncio.to_thread(
                 call_ai, get_state(ch.id),
-                f"対象:{tn} の不祥事を面白く捏造し、iertitle付きで書け。")
+                f"対象:{tn} の不祥事を面白く捏造し、タイトル付きで書け。")
             ans, _ = await handle_special_actions(ctx_mock, res.text or "")
             await interaction.followup.send(f"🚨 **【流出速報】**\n{ans}")
         elif action in AI_PROMPTS:
@@ -6586,7 +6586,7 @@ async def dungeon(ctx, *, action: str = ""):
         img = DUNGEON.render(dg)
         return await ctx.send(
             f"🏰 **【AIダンジョン】** B{dg['floor']}F / HP {dg['hp']} / {dg['gold']}G\n"
-            "ボタンで探索、free话语で記述してもよい。",
+            "ボタンで探索、自由な言葉で記述してもよい。",
             file=discord.File(io.BytesIO(img), "dungeon.png"), view=VisualDungeonView(cid))
     res = await asyncio.to_thread(
         call_ai, get_state(cid),
@@ -7119,184 +7119,6 @@ async def download_attachment_as_pil(att):
         return None
 
 
-# =============================================================================
-#  SECTION 13 -  エントリポイント
-# =============================================================================
-def preflight() -> dict:
-    """起動前チェック。problems が空なら実行可能。"""
-    problems: list[str] = []
-    if not CONFIG["TOKEN"]:
-        problems.append("DISCORD_TOKEN が未設定です (実行はオフライン検証に制限されます)")
-    if not (CONFIG["GEMINI_KEYS"] or CONFIG["GROQ_KEYS"] or CONFIG["OPENROUTER_KEYS"]):
-        problems.append("AI APIキーが未設定です (ローカルルールエンジンで動作します)")
-    if not os.access(CONFIG["DATA_DIR"], os.W_OK):
-        problems.append(f"データディレクトリが書込不可: {CONFIG['DATA_DIR']}")
-    with contextlib.suppress(Exception):
-        compile(open(os.path.abspath(__file__), encoding="utf-8").read(), "main.py", "exec")
-    return {"ok": not problems, "problems": problems,
-            "discord_stub": DISCORD_IS_STUB,
-            "missing_optional": OPTIONAL_MISSING}
-
-
-def offline_selfcheck() -> int:
-    """Discord接続なしで内部機能を検証する自己診断。"""
-    results: list[tuple[str, bool, str]] = []
-
-    def check(name: str, fn):
-        try:
-            detail = fn()
-            results.append((name, True, str(detail)))
-        except Exception as exc:  # noqa: BLE001
-            results.append((name, False, f"{exc.__class__.__name__}: {exc}"))
-
-    check("safe_calc", lambda: safe_calc("2+3*4"))
-    check("morse", lambda: " ".join(MORSE_DICT.get(c.upper(), "") for c in "SOS"))
-    check("sentiment", lambda: sentiment_score("これは最高に楽しいね！"))
-    check("intent", lambda: detect_intent("これ到底是什么?")["primary"])
-    check("subtext", lambda: infer_subtext("へえ、そうなの。", sentiment_score("へえ、そうなの。"),
-                                           detect_intent("へえ、そうなの。")))
-    check("embed_cosine", lambda: round(cosine(embed("猫が好き"), embed("猫ねこが好き")), 3))
-    def _recall_test():
-        MEMORY.remember("ポチは猫が好き", "fact", {"user": 1})
-        MEMORY.remember("ポチの好きな食べ物はみかん", "fact", {"user": 1})
-        hits = MEMORY.recall("猫", 5)
-        assert hits, "猫で検索しても記憶が返らない"
-        return f"{len(hits)}件 (top={hits[0][0].text[:16]})"
-    check("memory_recall", _recall_test)
-
-    def _consolidate_test():
-        for i in range(5):
-            MEMORY.remember(f"ポチは猫がdma*iSynchronousTerminated{i}好き", "fact", {"user": 1})
-        n = MEMORY.consolidate()
-        assert n >= 1, "統合ノードが生成されなかった"
-        return f"{n}ノード生成"
-    check("memory_consolidate", _consolidate_test)
-    check("council", lambda: asyncio.get_event_loop().run_until_complete(
-        COUNCIL.deliberate("テスト発話", get_state(0)))["summary"]["tone"])
-    check("pocket_gen", lambda: POCKET.load_source("selftest", POCKET.generate_source("dice"))["ok"])
-    def _pocket_exec():
-        out = POCKET.execute("selftest", ["6", "2"])
-        assert "合計" in out, f"プラグイン出力が不正: {out}"
-        return out[:40]
-    check("pocket_exec", _pocket_exec)
-    check("pocket_unload", lambda: POCKET.unload("selftest"))
-    def _sb_ok():
-        out = run_python_inline("print(sum(range(10)))")
-        assert "45" in out, f"計算結果不正: {out}"
-        return out.strip()
-    check("sandbox_ok", _sb_ok)
-
-    def _sb_block():
-        out = run_python_inline("import os")
-        assert "禁止" in out, f"危険コードが通過: {out}"
-        return out[:30]
-    check("sandbox_block", _sb_block)
-
-    def _sb_proc():
-        out = run_python_sandbox("print(6*7)")
-        assert "42" in out, f"隔離実行結果不正: {out}"
-        return out.strip()
-    check("sandbox_process", _sb_proc)
-    def _png():
-        data = Canvas(32, 32).to_png()
-        assert data[:8] == b"\x89PNG\r\n\x1a\n", "PNGシグネチャ不正"
-        assert data[-12:] == b"\x00\x00\x00\x00IEND\xaeB`\x82", "IENDチャンク不正"
-        w, h = struct.unpack(">II", data[16:24])
-        assert (w, h) == (32, 32), f"寸法不正: {w}x{h}"
-        return f"{w}x{h} {len(data)}bytes"
-    check("canvas_png", _png)
-    check("dungeon_render", lambda: len(DUNGEON.render(DUNGEON.new_game(1))))
-    check("blackjack_render", lambda: len(BLACKJACK.render(BLACKJACK.start(1))))
-    def _econ():
-        ECON.credit(999, 1000, 0, "reward", "selftest")
-        bal = ECON.balance(999, 0)
-        assert bal["coins"] >= 1000, f"credit反映失敗: {bal}"
-        ok, _ = ECON.debit(999, 500, 0, "spend", "selftest")
-        assert ok, "debit失敗"
-        res = ECON.transfer(999, 998, 100, 0)
-        assert res["ok"], f"transfer失敗: {res}"
-        assert res["fee"] > 0, "手数料が加算されていない"
-        return f"残高={ECON.balance(999,0)['coins']:.0f} 手数料={res['fee']:.1f}"
-    check("economy", _econ)
-    check("music_add", lambda: MUSIC.add(1, MUSIC.make_track("Test Song", "Tester")) is not None)
-    def _gacha():
-        res, ssr = gacha_pull(10)
-        assert len(res) == 10, f"ガチャ数が不正: {len(res)}"
-        return f"10連 SSR={ssr}"
-    check("gacha", _gacha)
-    check("tarot", lambda: draw_tarot()[0])
-    def _ttt():
-        s = TTT.start(7)
-        mv = TTT.ai_move(s["board"])
-        assert 0 <= mv < 9, f"AIの手が不正: {mv}"
-        return f"手={mv}"
-    check("ttt_ai", _ttt)
-    def _shell_allow():
-        r = SHELL.run("echo hello")
-        assert r["ok"] and "hello" in r["output"], f"許可コマンドが失敗: {r}"
-        return r["output"].strip()
-    check("shell_allow", _shell_allow)
-
-    def _shell_deny():
-        r = SHELL.run("rm -rf /")
-        assert not r["ok"], "危険コマンドが許可された"
-        return r["error"][:40]
-    check("shell_deny", _shell_deny)
-    check("ambient", lambda: AMBIENT.observe(0, 1, "こんにちは") or AMBIENT.report(0)["mood"])
-    check("repair_diag", lambda: REPAIR.diagnose(ValueError, ValueError("x"), None)["type"])
-    check("selfheal_rewrite", lambda: bool(REPAIR.rewrite_function(
-        safe_calc, REPAIR.diagnose(ValueError, ValueError("x"), None))))
-    check("local_engine", lambda: local_reasoning(get_state(0), "こんにちは", None)[:16])
-    check("prompt_build", lambda: len(build_system_instruction(get_state(0))) > 100)
-    check("preflight", lambda: f"problems={len(preflight()['problems'])} (未設定は許容)")
-
-    ok = sum(1 for _n, o, _d in results if o)
-    print("\n=== POCHI ULTIMATE 内部自己診断 ===")
-    for name, o, detail in results:
-        print(f"[{'OK ' if o else 'FAIL'}] {name:<22} {detail[:70]}")
-    print(f"=== {ok}/{len(results)} passed ===\n")
-    return 0 if ok == len(results) else 1
-
-
-def main():
-    parser = argparse.ArgumentParser(description="POCHI ULTIMATE Discord Bot")
-    parser.add_argument("--selfcheck", action="store_true", help="内部自己診断のみ実行")
-    parser.add_argument("--no-network", action="store_true", help="外部通信を無効化")
-    args = parser.parse_args()
-
-    install_excepthook()
-    start_keepalive()
-    GOV.start()
-
-    if args.selfcheck:
-        code = offline_selfcheck()
-        sys.exit(code)
-
-    pf = preflight()
-    for p in pf["problems"]:
-        LOG.warn(f"PREFLIGHT: {p}")
-    if not CONFIG["TOKEN"]:
-        LOG.error("DISCORD_TOKEN が未設定のため Discord 接続をスキップします。")
-        LOG.info("内部機能のみを起動しました。--selfcheck で診断できます。")
-        code = offline_selfcheck()
-        sys.exit(code)
-
-    async def _run():
-        async with bot:
-            await bot.start(CONFIG["TOKEN"])
-
-    try:
-        asyncio.run(_run())
-    except KeyboardInterrupt:
-        LOG.info("KeyboardInterrupt — 停止します。")
-    except Exception as exc:  # noqa: BLE001
-        LOG.crit(f"起動失敗: {exc}")
-        traceback.print_exc()
-        sys.exit(1)
-
-
-
-# =============================================================================
 #  SECTION 14 -  自己修復ループ(タスク监督) / AI駆動コード生成 / 自律実行
 # =============================================================================
 class TaskSupervisor:
@@ -7494,7 +7316,7 @@ class PocketForge:
         kind = "custom"
         for key, aliases in {
             "dice": ("dice", "ダイス", "サイコロ", "乱数"),
-            "echo": ("echo", "オウム", "复读", "エcho"),
+            "echo": ("echo", "オウム", "オウム返し", "エコー"),
             "timer": ("timer", "タイマー", "時間"),
             "greet": ("greet", "挨拶", " greet"),
             "counter": ("counter", "カウンター", "カウント"),
@@ -7566,7 +7388,7 @@ class AutonomousActor:
                         "action": "スローモード(10秒)の適用を推奨"})
         elif mood == "CHILL":
             out.append({"type": "warmup", "priority": 30,
-                        "action": " lighten ムード転換のgamut" if False else "ムード転換のきっかけ"})
+                        "action": "ムード転換のきっかけ"})
         if ctx.get("resource_mode") in ("CRITICAL", "THROTTLED"):
             out.append({"type": "throttle", "priority": 95,
                         "action": f"並列度を引き下げ(現在 {ctx.get('limit')}、GC実行)"})
