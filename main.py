@@ -731,6 +731,7 @@ CONFIG = {
     "GROQ_KEYS": [k.strip() for k in os.environ.get("GROQ_API_KEY", "").split(",") if k.strip()],
     "OPENROUTER_KEYS": [k.strip() for k in os.environ.get("OPENROUTER_API_KEY", "").split(",") if k.strip()],
     "OWNER_IDS": [int(x) for x in os.environ.get("OWNER_IDS", "").split(",") if x.strip().isdigit()],
+    "POCHI_WEB_TOKEN": os.environ.get("POCHI_WEB_TOKEN", ""),
     "PORT": int(os.environ.get("PORT", "8080")),
     "DATA_DIR": os.environ.get("POCHI_DATA_DIR", os.path.join(os.getcwd(), "pochi_data")),
     "PLUGIN_DIR": os.environ.get("POCHI_PLUGIN_DIR", os.path.join(os.getcwd(), "pochi_plugins")),
@@ -8660,7 +8661,7 @@ class WebApp:
         return supplied == self.token
 
 
-WEB = WebApp(port=CONFIG["PORT"], token=os.environ.get("POCHI_WEB_TOKEN", ""))
+WEB = WebApp(port=CONFIG["PORT"], token=CONFIG.get("POCHI_WEB_TOKEN", ""))
 
 
 def _json_bytes(payload) -> bytes:
@@ -11773,8 +11774,26 @@ def preflight() -> dict:
         compile(open(os.path.abspath(__file__), encoding="utf-8").read(), "main.py", "exec")
     except Exception as exc:  # noqa: BLE001
         problems.append(f"ソースのコンパイルに失敗: {exc}")
+    # --- Web サイトの公開可否(解禁チェック) ---
+    port = CONFIG["PORT"]
+    try:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+            sk.settimeout(1.0)
+            sk.connect(("127.0.0.1", port))
+        web_ok = True
+    except Exception:  # noqa: BLE001
+        web_ok = False
+        problems.append(
+            f"Webダッシュボードがポート {port} で待ち受けていません"
+            "(.Render では PORT 環境変数をそのまま使用してください)")
+    if not CONFIG.get("WEB_TOKEN"):
+        problems.append(
+            "POCHI_WEB_TOKEN が未設定です (/sites は誰でも閲覧できます。管理APIも保護されることを推奨)")
     return {"ok": not problems, "problems": problems,
             "discord_stub": DISCORD_IS_STUB,
+            "web": {"port": port, "listening": web_ok,
+                    "token_protected": bool(CONFIG.get("WEB_TOKEN"))},
             "missing_optional": OPTIONAL_MISSING}
 
 
