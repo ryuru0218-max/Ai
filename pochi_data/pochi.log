@@ -50,3 +50,10 @@
 09:27:23 [INFO   ] Pocket[hotplug] メモリ展開完了 (関数: ['run'])
 09:27:34 [WARN   ] Cloud Restore スキップ: 'Bot' object has no attribute 'guilds'
 09:28:01 [WARN   ] Cloud Restore スキップ: 'Bot' object has no attribute 'guilds'
+09:30:34 [INFO   ] Pocket[selftest] メモリ展開完了 (関数: ['run'])
+09:30:34 [INFO   ] Pocket[self_forge] メモリ展開完了 (関数: ['run'])
+09:30:34 [INFO   ] KeepAliveサーバーを port=8082 で起動
+09:30:41 [INFO   ] Pocket[dice] メモリ展開完了 (関数: ['run'])
+09:30:41 [INFO   ] Pocket[t_dice] メモリ展開完了 (関数: ['run'])
+09:30:41 [INFO   ] Pocket[hotplug] メモリ展開完了 (関数: ['run'])
+09:31:25 [WARN   ] Cloud Restore スキップ: 'Bot' object has no attribute 'guilds'

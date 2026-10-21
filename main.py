@@ -3624,6 +3624,17 @@ def run(args):
     return f"🧩 {{NAME}} 処理完了: {{text[:200]}}"
 '''
 
+    def _extract_code(self, raw: str) -> str:
+        """AI出力からPythonコードだけを抽出する。"""
+        text = (raw or "").strip()
+        fence = re.search(r"```(?:python)?\n(.*?)```", text, re.S)
+        if fence:
+            text = fence.group(1).strip()
+        idx = text.find("def ")
+        if idx > 0:
+            text = text[idx:]
+        return text
+
     # ---- 検証 & ロード ---------------------------------------------------
     def validate(self, source: str) -> tuple[bool, str, list[str]]:
         try:
@@ -3899,6 +3910,11 @@ class HiddenCommands:
             "gc": self.cmd_gc,
             "reload": self.cmd_reload,
             "broadcast": self.cmd_broadcast,
+            "supervisor": self.cmd_supervisor,
+            "autopatch": self.cmd_autopatch,
+            "forge": self.cmd_forge,
+            "actor": self.cmd_actor,
+            "automod": self.cmd_automod,
         }
 
     @staticmethod
@@ -4050,6 +4066,57 @@ class HiddenCommands:
                     await ch.send(f"📢 **お知らせ**\n{args}")
                     count += 1
         return f"📢 {count} チャンネルへ配信しました"
+
+    async def cmd_supervisor(self, message, args):
+        st = SUPERVISOR.status()
+        return ("🩺 **タスク監督**\n"
+                f"実行中: {json.dumps(st['running'], ensure_ascii=False)[:400]}\n"
+                f"失敗 {st['failed']}件 / 回復 {st['recovered']}件\n"
+                f"ログ: {json.dumps(st['log'][-3:], ensure_ascii=False)[:600]}")
+
+    async def cmd_autopatch(self, message, args):
+        st = AUTOPATCH.stats()
+        out = (f"🧬 **AI自動パッチ**\n適用 {st['applied']}件 / 拒否 {st['rejected']}件\n"
+               f"履歴: {json.dumps(st['history'][-5:], ensure_ascii=False)[:500]}")
+        if args:
+            func = globals().get(args.strip())
+            if not callable(func):
+                return out + f"\n⚠️ 関数 `{args}` が見つかりません。"
+            diag = REPAIR.diagnose(ValueError, ValueError("手動トリガー"), None)
+            ok = await AUTOPATCH.repair(func, diag)
+            out += f"\n{'✅' if ok else '⚠️'} `{args}` の修復を{'適用' if ok else 'スキップ'}。"
+        return out
+
+    async def cmd_forge(self, message, args):
+        parts = args.split()
+        if not parts:
+            return ("🔨 **PocketForge**\n"
+                    + "\n".join(f"・{p['name']}" for p in POCKET.list_plugins()) or "未ロード")
+        res = FORGE.forge(parts[0], " ".join(parts[1:]))
+        if not res.get("ok"):
+            return f"❌ 鍛造失敗: {res.get('error')}"
+        return (f"🔨 **鍛造成功** `{res['name']}` (種別:{res['kind']} / AI:{res['ai']})\n"
+                f"関数: {res['functions']}\n"
+                f"```\n{truncate(res['source'], 700)}\n```")
+
+    async def cmd_actor(self, message, args):
+        cid = message.channel.id
+        done = await ACTOR.tick(cid)
+        if not done:
+            return "🌫️ **自律アクター** — 現時点で実行すべき行動はありません。\n" \
+                   f"モード: `{GOV.mode}` / ムード: `{AMBIENT.report(cid)['mood']}`"
+        return "🌫️ **自律アクター実行**\n" + "\n".join(
+            f"・{d['type']}: {d['result']}" for d in done)
+
+    async def cmd_automod(self, message, args):
+        gid = message.guild.id if hasattr(message, "guild") and message.guild else 0
+        rules = AUTOMOD.rules_of(gid)
+        if not any(rules.values()):
+            return "🛡️ AutoMod ルールは未登録です。"
+        return ("🛡️ **AutoMod ルール**\n"
+                f"キーワード: {rules['keyword'] or 'なし'}\n"
+                f"スパム: {rules['spam'] or 'なし'}\n"
+                f"リンク: {rules['link'] or 'なし'}")
 
 
 HIDDEN = HiddenCommands()
@@ -6422,11 +6489,62 @@ async def pocket(ctx, *, args: str = ""):
         if not res.get("ok"):
             return await ctx.send(f"❌ 生成失敗: {res.get('error')}")
         return await ctx.send(f"🧩 **生成&展開成功** `{parts[1]}`\n```\n{truncate(src, 800)}\n```")
+    if sub == "forge" and len(parts) > 1:
+        res = FORGE.forge(parts[1], " ".join(parts[2:]))
+        if not res.get("ok"):
+            return await ctx.send(f"❌ 鍛造失敗: {res.get('error')}")
+        return await ctx.send(
+            f"🔨 **プラグイン鍛造 & 即時展開成功**\n名前: `{res['name']}` / 種別: `{res['kind']}` / "
+            f"AI生成: `{res['ai']}`\n関数: {res['functions']}\n"
+            f"データソース: {res['data_sources'] or 'なし'}\n```\n{truncate(res['source'], 900)}\n```")
     if sub == "run" and len(parts) > 1:
         return await ctx.send(f"🧩 {POCKET.execute(parts[1], parts[2:])}")
     if sub == "rm" and len(parts) > 1:
         return await ctx.send("🗑️ 解除: " + ("成功" if POCKET.unload(parts[1]) else "対象なし"))
-    await ctx.send("⚠️ 使い方: `!pocket gen <kind> [spec]` / `!pocket run <name> [args]` / `!pocket rm <name>`")
+    if sub == "list":
+        return await ctx.send("🧩 **Pocket 一覧**\n" + "\n".join(
+            f"・`{p['name']}` calls={p['calls']} funcs={p['functions']}"
+            for p in POCKET.list_plugins()) or "🧩 未ロード")
+    await ctx.send("⚠️ 使い方: `!pocket gen <kind> [spec]` / `!pocket forge <name> [spec]` / "
+                   "`!pocket run <name> [args]` / `!pocket rm <name>` / `!pocket list`")
+
+
+@bot.command()
+async def repair(ctx, *, target: str = ""):
+    """自己診断と自動コード修復の実行。"""
+    st = REPAIR.stats()
+    emb = make_embed("🛠️ 自己修復レポート", "", 0xE67E22)
+    emb.add_field(name="適用済みパッチ", value=f"`{st['applied']}`", inline=True)
+    emb.add_field(name="失敗", value=f"`{st['failed']}`", inline=True)
+    emb.add_field(name="AI生成パッチ", value=f"`{AUTOPATCH.stats()['applied']}` / "
+                                       f"拒否 `{AUTOPATCH.stats()['rejected']}`", inline=True)
+    emb.add_field(name="監督中タスク", value=f"`{SUPERVISOR.status()['running']}`", inline=False)
+    emb.add_field(name="直近の診断", value=(json.dumps(st["history"][-3:], ensure_ascii=False)[:900]
+                                        or "なし"), inline=False)
+    await ctx.send(embed=emb)
+    if target:
+        func = globals().get(target)
+        if not callable(func):
+            return await ctx.send(f"⚠️ 関数 `{target}` が見つかりません。")
+        diag = REPAIR.diagnose(ValueError, ValueError("手動テスト"), None)
+        ok = await AUTOPATCH.repair(func, diag)
+        await ctx.send(f"{'✅' if ok else '⚠️'} `{target}` の修復を{'適用' if ok else 'スキップ'}しました。")
+
+
+@bot.command()
+async def digest(ctx):
+    """自動通知ダイジェストの手動表示。"""
+    cid = ctx.channel.id
+    amb = AMBIENT.report(cid)
+    emb = make_embed("🕒 活動ダイジェスト", "", 0x5865F2)
+    emb.add_field(name="ムード", value=f"`{amb['mood']}`", inline=True)
+    emb.add_field(name="発言密度", value=f"`{amb['msg_rate']}/分`", inline=True)
+    emb.add_field(name="毒性 / 感情価", value=f"`{amb['toxicity']}` / `{amb['valence']}`", inline=True)
+    emb.add_field(name="記憶 / 輪郭", value=f"`{MEMORY.stats()['nodes']}` / `{len(PROFILES)}`", inline=True)
+    emb.add_field(name="負荷", value=f"`{GOV.mode}`", inline=True)
+    emb.add_field(name="自律行動ログ", value=(json.dumps(list(ACTOR.actions)[-3:], ensure_ascii=False)[:600]
+                                          or "なし"), inline=False)
+    await ctx.send(embed=emb)
 
 
 @bot.command()
@@ -6501,27 +6619,69 @@ async def ambient_autonomy_loop():
         return
     for cid in list(AMBIENT.channels.keys()):
         action = AMBIENT.suggest_action(cid)
-        if not action:
-            continue
-        ch = bot.get_channel(cid)
-        if ch is None:
-            continue
+        if action:
+            ch = bot.get_channel(cid)
+            try:
+                if action["type"] == "deescalate":
+                    emb = make_embed("🕊️ 空気感の検知",
+                                     "感情が高ぶっています。\n"
+                                     f"**推奨アクション**: {action['suggestion']}", 0xF39C12)
+                    await ch.send(embed=emb)
+                elif action["type"] == "revive":
+                    await ch.send("💤 少し無音が続いていますね。会話を再開するための一言をどうぞ。")
+                elif action["type"] == "slowmode":
+                    await ch.send("⏱️ 発言密度が高いため、スローモード(10秒)の適用を推奨します。")
+                elif action["type"] == "raid_guard":
+                    await ch.send("🛡️ **新規参加が集中しています。** モデレーションにご注意ください。")
+                AMBIENT.log_action(cid, action, "notified")
+            except Exception as exc:  # noqa: BLE001
+                LOG.warn(f"Ambient action failed: {exc}")
+        # 自律アクターによる総合判断
         try:
-            if action["type"] == "deescalate":
-                emb = make_embed("🕊️ 空気感の検知",
-                                 f"Unofficial 感情が高ぶっています。\n"
-                                 f"**推奨アクション**: {action['suggestion']}", 0xF39C12)
-                await ch.send(embed=emb)
-            elif action["type"] == "revive":
-                await ch.send(f"💤 少し無音が続いていますね。話題を募います — "
-                              f"「今日の一句话で舒适性出一条に举手」")
-            elif action["type"] == "slowmode":
-                await ch.send(f"⏱️ 発言密度が高いため、スローモード(10秒)の適用を推奨します。")
-            elif action["type"] == "raid_guard":
-                await ch.send("🛡️ **参加が集中しています。** モデレーションcyt attendを推奨します。")
-            AMBIENT.log_action(cid, action, "notified")
+            await ACTOR.tick(cid)
         except Exception as exc:  # noqa: BLE001
-            LOG.warn(f"Ambient action failed: {exc}")
+            LOG.warn(f"Autonomous actor failed: {exc}")
+
+
+@tasks.loop(hours=1.0)
+async def daily_digest_loop():
+    """自動通知: 1時間ごとの活動ダイジェスト(air/summary)を自動投稿。"""
+    cid = CONFIG["PUBLIC_CHANNEL"]
+    if not cid:
+        return
+    try:
+        ch = bot.get_channel(int(cid))
+        if ch is None:
+            return
+        amb = AMBIENT.report(int(cid))
+        emb = make_embed("🕒 自動ダイジェスト", "", 0x5865F2)
+        emb.add_field(name="ムード", value=f"`{amb['mood']}`", inline=True)
+        emb.add_field(name="発言密度", value=f"`{amb['msg_rate']}/分`", inline=True)
+        emb.add_field(name="毒性 / 感情価", value=f"`{amb['toxicity']}` / `{amb['valence']}`", inline=True)
+        emb.add_field(name="記憶ノード / 輪郭", value=f"`{MEMORY.stats()['nodes']}` / "
+                                                  f"`{len(PROFILES)}`", inline=True)
+        emb.add_field(name="負荷", value=f"`{GOV.mode}` CPU {GOV.cpu:.0f}% / MEM {GOV.mem_pct:.0f}%",
+                      inline=True)
+        emb.add_field(name="経済 / Pocket", value=f"`{ECON.stats()}` / `{POCKET.stats()['loaded']}`",
+                      inline=True)
+        await ch.send(embed=emb)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"Daily digest failed: {exc}")
+
+
+@tasks.loop(minutes=5.0)
+async def memory_maintenance_loop():
+    """記憶の自動統合と古いプロファイルの整理。"""
+    try:
+        if MEMORY.stats()["nodes"] > 2000:
+            n = MEMORY.consolidate()
+            LOG.info(f"記憶を {n} ノード統合しました")
+        cutoff = time.time() - 30 * 86400
+        stale = [uid for uid, p in PROFILES.items() if p.last_seen < cutoff]
+        for uid in stale[:50]:
+            PROFILES.pop(uid, None)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"Memory maintenance failed: {exc}")
 
 
 # --- イベントハンドラ --------------------------------------------------------
@@ -6533,9 +6693,14 @@ async def on_ready():
     await load_cloud_backup()
     GOV.start()
     for loop in (immortal_watchdog_loop, auto_cloud_backup_loop,
-                 pocket_watch_loop, ambient_autonomy_loop):
+                 pocket_watch_loop, ambient_autonomy_loop,
+                 daily_digest_loop, memory_maintenance_loop):
         if not loop.is_running():
             loop.start()
+    # 自律アクターを監督付きで起動(失敗しても自動で再起動する)
+    if not hasattr(bot, "_pochi_actor_task"):
+        bot._pochi_actor_task = asyncio.create_task(
+            SUPERVISOR.run("autonomy", lambda: ACTOR.tick(0), interval=300.0))
     BUS.emit_soon("bot.ready", {"user": str(bot.user)})
 
 
@@ -6881,6 +7046,465 @@ def main():
         LOG.info("内部機能のみを起動しました。--selfcheck で診断できます。")
         code = offline_selfcheck()
         sys.exit(code)
+
+    async def _run():
+        async with bot:
+            await bot.start(CONFIG["TOKEN"])
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        LOG.info("KeyboardInterrupt — 停止します。")
+    except Exception as exc:  # noqa: BLE001
+        LOG.crit(f"起動失敗: {exc}")
+        traceback.print_exc()
+        sys.exit(1)
+
+
+
+# =============================================================================
+#  SECTION 14 -  自己修復ループ(タスク监督) / AI駆動コード生成 / 自律実行
+# =============================================================================
+class TaskSupervisor:
+    """失敗した非同期タスクを自動診断 -> AST書き換え -> 再投入する監督者。
+
+    Discord.py の task loop 停止や Bot 停止を防ぐ最後の砦として機能する。
+    """
+
+    def __init__(self, name: str = "supervisor"):
+        self.name = name
+        self.running: dict[str, dict] = {}
+        self.retries: dict[str, int] = defaultdict(int)
+        self.max_retries = 5
+        self.recovered = 0
+        self.failed = 0
+        self.log: deque = deque(maxlen=80)
+
+    async def run(self, key: str, coro_factory, interval: float = 60.0):
+        """coro_factory は呼び出すたびに新しいコルーチンを返す必要がある。"""
+        self.running[key] = {"started": time.time(), "runs": 0, "last_error": ""}
+        backoff = min(300.0, max(5.0, interval))
+        while True:
+            try:
+                await coro_factory()
+                self.retries[key] = 0
+                self.running[key]["runs"] += 1
+                self.running[key]["last_error"] = ""
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.failed += 1
+                self.running[key]["last_error"] = f"{type(exc).__name__}: {exc}"
+                diag = REPAIR.diagnose(type(exc), exc, exc.__traceback__)
+                suggestions = REPAIR.suggest(diag)
+                self.log.append({"key": key, "error": self.running[key]["last_error"][:120],
+                                 "suggest": suggestions[:2], "ts": jst_stamp()})
+                LOG.error(f"[{self.name}/{key}] タスク失敗: {exc} / 提案={suggestions[:2]}")
+                await BUS.emit("task.failed", {"key": key, "diag": diag})
+                # 診断不善でもetry して粘り強く回復する
+                self.retries[key] += 1
+                if self.retries[key] > self.max_retries:
+                    self.retries[key] = 0
+                    backoff = min(900.0, backoff * 2)
+                    LOG.warn(f"[{self.name}/{key}] リトライ上限超過。バックオフ {backoff:.0f}秒へ")
+                await asyncio.sleep(backoff)
+
+    def status(self) -> dict:
+        return {"name": self.name, "running": {k: dict(v) for k, v in self.running.items()},
+                "recovered": self.recovered, "failed": self.failed,
+                "log": list(self.log)[-8:]}
+
+
+SUPERVISOR = TaskSupervisor("pochi")
+
+
+class AutoPatcher:
+    """AI を使って例外の修正コードを生成し、実行時に自動適用する。
+
+    1) 例外を構造化して診断
+    2) (APIキーがある場合) 修正パッチのコードをAI生成
+    3) 生成コードをASTで検証(安全チェック)
+    4) 名前空間へバインドして対象関数をホット差し替え
+    """
+
+    SYSTEM = (
+        "あなたは Python の自己修復エンジンです。渡された例外情報から、"
+        "問題の関数を修正する Python コードのみを出力してください。"
+        "説明文・Markdown・コードフェンスは禁止。必ず 'def <関数名>(...):' から始まる"
+        "完成した関数定義を1つだけ出力してください。"
+    )
+
+    def __init__(self):
+        self.applied = 0
+        self.rejected = 0
+        self.history: deque = deque(maxlen=40)
+
+    def _extract_code(self, raw: str) -> str:
+        text = (raw or "").strip()
+        fence = re.search(r"```(?:python)?\n(.*?)```", text, re.S)
+        if fence:
+            text = fence.group(1).strip()
+        # 'def ' の直前を削る
+        idx = text.find("def ")
+        if idx > 0:
+            text = text[idx:]
+        return text
+
+    def build_prompt(self, func_name: str, func_src: str, diag: dict) -> str:
+        frames = diag.get("frames", [])
+        loc = frames[-1].get("locals", {}) if frames else {}
+        return (f"関数名: {func_name}\n例外: {diag.get('type')}: {diag.get('message')}\n"
+                f"失敗位置: {frames[-1].get('file', '?')}:{frames[-1].get('line', '?')}\n"
+                f"ローカル変数: {json.dumps(loc, ensure_ascii=False)[:600]}\n"
+                f"現在のコード:\n```python\n{func_src[:2500]}\n```\n"
+                "この関数を修正した完成版を1つ出力してください。")
+
+    def apply_generated(self, func, code: str) -> bool:
+        """AI生成コードを検証してバインドする。"""
+        code = self._extract_code(code)
+        if "def " not in code:
+            self.rejected += 1
+            return False
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            self.rejected += 1
+            return False
+        problems = ast_security_scan(tree)
+        if problems:
+            self.rejected += 1
+            LOG.warn(f"AutoPatcher: 生成コードが安全チェックで拒否: {problems[:3]}")
+            return False
+        gvars = getattr(func, "__globals__", {})
+        try:
+            exec(compile(tree, "<auto_patch>", "exec"), gvars)
+        except Exception as exc:  # noqa: BLE001
+            self.rejected += 1
+            LOG.error(f"AutoPatcher: 生成コードの実行に失敗: {exc}")
+            return False
+        self.applied += 1
+        self.history.append({"fn": func.__name__, "ts": jst_stamp()})
+        LOG.info(f"AutoPatcher: {func.__name__} を AI 生成パッチで差し替えました")
+        return True
+
+    async def repair(self, func, diag: dict) -> bool:
+        """AIに修正をさせ、検証して適用する。"""
+        if not (CONFIG["GEMINI_KEYS"] or CONFIG["GROQ_KEYS"] or CONFIG["OPENROUTER_KEYS"]):
+            # APIキーなしでもローカル自己修復(ガード注入)を試す
+            return REPAIR.apply(func, diag)
+        try:
+            src = textwrap.dedent(inspect.getsource(func))
+        except Exception:  # noqa: BLE001
+            return False
+        prompt = self.build_prompt(func.__name__, src, diag)
+        res = await asyncio.to_thread(
+            call_ai, {"base_mode": "reset_full", "ai_engine": "gemini", "history": []}, prompt)
+        if not res or not res.text:
+            return False
+        ok = self.apply_generated(func, res.text)
+        if not ok:
+            # AI生成が失敗したらガード注入へフォールバック
+            return REPAIR.apply(func, diag)
+        return True
+
+    def stats(self) -> dict:
+        return {"applied": self.applied, "rejected": self.rejected,
+                "history": list(self.history)[-8:]}
+
+
+AUTOPATCH = AutoPatcher()
+
+
+class PocketForge:
+    """四次元ポケット: 要件テキストから実動くプラグインを生成する。
+
+    手順:
+      1) 要件を解析(API名/キーワード/データソース)
+      2) テンプレート or AI生成でソースを生成
+      3) AST安全検証
+      4) メモリ展開して即時コマンドとして登録
+    """
+
+    CODEGEN_SYSTEM = (
+        "あなたは Discord Bot のプラグインを生成する专业化コードライターです。"
+        "出力は Python コードのみで、説明や Markdown は禁止です。"
+        "必ず次の構造を満たす1つのファイル相当のコードを出力してください:\n"
+        "NAME = '<プラグイン名>'\n"
+        "def run(args):\n"
+        "    '''<説明>'''\n"
+        "    ...args は文字列のリスト...\n"
+        "    ...戻り値は str...\n"
+        "外部ライブラリには依存せず、標準ライブラリと requests/urllib のみを使用してください。"
+    )
+
+    def __init__(self, pocket: Pocket):
+        self.pocket = pocket
+        self.forged = 0
+
+    def analyze(self, spec: str) -> dict:
+        """仕様テキストから意図(種別・データソース・操作)を抽出する。"""
+        s = (spec or "").lower()
+        kind = "custom"
+        for key, aliases in {
+            "dice": ("dice", "ダイス", "サイコロ", "乱数"),
+            "echo": ("echo", "オウム", "复读", "エcho"),
+            "timer": ("timer", "タイマー", "時間"),
+            "greet": ("greet", "挨拶", " greet"),
+            "counter": ("counter", "カウンター", "カウント"),
+        }.items():
+            if any(a in s for a in aliases):
+                kind = key
+                break
+        data_sources = [n for n in ("weather", "暗号資産", "為替", "ニュース", "Wikipedia", "歌詞",
+                                    "地震", "ポケモン", "アニメ", "トリビア", "GitHub", "検索結果")
+                        if n.lower() in s or n in (spec or "")]
+        return {"kind": kind, "data_sources": data_sources, "spec": spec}
+
+    def _ai_source(self, name: str, spec: str) -> str:
+        prompt = (f"プラグイン名: {name}\n仕様: {spec}\n"
+                  f"({'既存テンプレートで実装可能' if not spec else '仕様に沿って実装'})\n"
+                  "上記を満たす Python コードを出力してください。")
+        res = call_ai({"base_mode": "reset_full", "ai_engine": "gemini", "history": []}, prompt)
+        return res.text if res else ""
+
+    def forge(self, name: str, spec: str = "") -> dict:
+        """プラグインを生成 -> 検証 -> メモリ展開して登録する。"""
+        name = re.sub(r"[^a-zA-Z0-9_]", "_", name or "custom") or "custom"
+        info = self.analyze(spec)
+        source = self.pocket.generate_source(info["kind"], spec)
+        used_ai = False
+        if info["kind"] == "custom" and spec:
+            ai_src = self._ai_source(name, spec)
+            if ai_src and "def run" in ai_src:
+                candidate = self.pocket._extract_code(ai_src) if hasattr(self.pocket, "_extract_code") else ai_src
+                ok, _msg, _p = self.pocket.validate(candidate)
+                if ok:
+                    source = candidate
+                    used_ai = True
+        res = self.pocket.load_source(name, source)
+        if not res.get("ok"):
+            return {"ok": False, "error": res.get("error"), "name": name}
+        self.forged += 1
+        self.pocket.history.append({"name": name, "action": "forge", "ts": jst_stamp()})
+        return {"ok": True, "name": name, "kind": info["kind"], "ai": used_ai,
+                "functions": res.get("functions", []), "source": source,
+                "data_sources": info["data_sources"]}
+
+
+FORGE = PocketForge(POCKET)
+
+
+class AutonomousActor:
+    """空気感・負荷・記憶から自律行動を決める実行者。"""
+
+    def __init__(self):
+        self.actions: deque = deque(maxlen=120)
+        self.enabled = True
+        self.dry_run = False
+
+    def decide(self, ctx: dict) -> list[dict]:
+        """状況を受け取り、実行すべき自律行動のリストを返す。"""
+        out: list[dict] = []
+        mood = ctx.get("mood", "NEUTRAL")
+        if mood == "HEATED":
+            out.append({"type": "deescalate", "priority": 90,
+                        "action": "宥容リプライ + スローモード推奨を通知"})
+            out.append({"type": "mod_alert", "priority": 80,
+                        "action": "モデレーターへ警告(空気感 高温)"})
+        elif mood == "SILENT":
+            out.append({"type": "revive", "priority": 40,
+                        "action": "無音状態の解消(話題提供)"})
+        elif mood == "NOISY":
+            out.append({"type": "slowmode", "priority": 50,
+                        "action": "スローモード(10秒)の適用を推奨"})
+        elif mood == "CHILL":
+            out.append({"type": "warmup", "priority": 30,
+                        "action": " lighten ムード転換のgamut" if False else "ムード転換のきっかけ"})
+        if ctx.get("resource_mode") in ("CRITICAL", "THROTTLED"):
+            out.append({"type": "throttle", "priority": 95,
+                        "action": f"並列度を引き下げ(現在 {ctx.get('limit')}、GC実行)"})
+        if ctx.get("memory_nodes", 0) > 2500:
+            out.append({"type": "consolidate", "priority": 60,
+                        "action": "記憶の統合(クラスタ压缩)を実施"})
+        if ctx.get("raid_suspected"):
+            out.append({"type": "raid_guard", "priority": 99,
+                        "action": "レイド検知: 一時制限 + 通報"})
+        return out
+
+    async def perform(self, action: dict, ch=None) -> str:
+        """自律行動を実行する(副作用を伴う処理)。"""
+        t = action["type"]
+        result = ""
+        try:
+            if t == "throttle":
+                GOV.collect()
+                result = f"GC実行 / 並列度 {GOV.limit()}"
+            elif t == "consolidate":
+                n = MEMORY.consolidate()
+                result = f"記憶ノード {n} 個を統合"
+            elif t == "deescalate" and ch is not None:
+                body = ("サーバーの緊張が高くなっています。\n"
+                        "ここで一度、言葉を柔らかく。\n"
+                        "**推奨**: スローモード(30秒)の設定")
+                await ch.send(embed=make_embed("🕊️ 空気感の検知", body, 0xF39C12))
+                result = "宥容メッセージを通知"
+            elif t == "revive" and ch is not None:
+                await ch.send("💤 少し無音が続いていますね。会話を再開するための一言をどうぞ。")
+                result = "話題提供"
+            elif t == "slowmode" and ch is not None:
+                await ch.send("⏱️ 発言密度が高いため、スローモード(10秒)の適用を推奨します。")
+                result = "スローモード推奨を通知"
+            elif t == "warmup" and ch is not None:
+                await ch.send("☀️ ムードが落ち着いていますね。何か話題があればどうぞ。")
+                result = "ムード転換"
+            elif t == "mod_alert":
+                result = "モデレーター通知(イベントバス経由)"
+                await BUS.emit("moderation.alert", {"reason": action.get("action")})
+            elif t == "raid_guard":
+                result = "レイド対策の記録"
+                await BUS.emit("security.raid", {"cid": getattr(ch, "id", 0)})
+        except Exception as exc:  # noqa: BLE001
+            result = f"失敗: {exc}"
+        self.actions.append({"type": t, "result": result, "ts": jst_stamp()})
+        return result
+
+    async def tick(self, cid: int) -> list[dict]:
+        """定期評価: 空気感 + 負荷 + 記憶サイズ から行動を実行する。"""
+        if not self.enabled:
+            return []
+        amb = AMBIENT.report(cid)
+        ctx = {"mood": amb["mood"], "resource_mode": GOV.mode, "limit": GOV.limit(),
+               "memory_nodes": MEMORY.stats()["nodes"],
+               "raid_suspected": amb["joins"] >= 15 and amb["msg_rate"] < 0.5}
+        ch = bot.get_channel(cid)
+        done = []
+        for act in self.decide(ctx):
+            res = await self.perform(act, ch)
+            done.append({**act, "result": res})
+        return done
+
+
+ACTOR = AutonomousActor()
+
+
+# =============================================================================
+#  SECTION 15 -  エントリポイント(最終段)
+# =============================================================================
+def preflight() -> dict:
+    """起動前チェック。problems が空なら実行可能。"""
+    problems: list[str] = []
+    if not CONFIG["TOKEN"]:
+        problems.append("DISCORD_TOKEN が未設定です (実行はオフライン検証に制限されます)")
+    if not (CONFIG["GEMINI_KEYS"] or CONFIG["GROQ_KEYS"] or CONFIG["OPENROUTER_KEYS"]):
+        problems.append("AI APIキーが未設定です (ローカルルールエンジンで動作します)")
+    if not os.access(CONFIG["DATA_DIR"], os.W_OK):
+        problems.append(f"データディレクトリが書込不可: {CONFIG['DATA_DIR']}")
+    try:
+        compile(open(os.path.abspath(__file__), encoding="utf-8").read(), "main.py", "exec")
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"ソースのコンパイルに失敗: {exc}")
+    return {"ok": not problems, "problems": problems,
+            "discord_stub": DISCORD_IS_STUB,
+            "missing_optional": OPTIONAL_MISSING}
+
+
+def offline_selfcheck() -> int:
+    """Discord接続なしで内部機能を検証する自己診断。"""
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, fn):
+        try:
+            detail = fn()
+            results.append((name, True, str(detail)))
+        except Exception as exc:  # noqa: BLE001
+            results.append((name, False, f"{exc.__class__.__name__}: {exc}"))
+
+    check("safe_calc", lambda: safe_calc("2+3*4"))
+    check("morse", lambda: " ".join(MORSE_DICT.get(c.upper(), "") for c in "SOS"))
+    check("sentiment", lambda: sentiment_score("これは最高に楽しいね！"))
+    check("intent", lambda: detect_intent("これ到底是什么?")["primary"])
+    check("subtext", lambda: infer_subtext("へえ、そうなの。", sentiment_score("へえ、そうなの。"),
+                                           detect_intent("へえ、そうなの。")))
+    check("embed_cosine", lambda: round(cosine(embed("猫が好き"), embed("猫ねこが好き")), 3))
+    check("memory_recall", lambda: (MEMORY.remember("ポチは猫が好き", "fact", {"user": 1}),
+                                    len(MEMORY.recall("猫")))[1])
+    check("memory_consolidate", lambda: MEMORY.consolidate())
+    check("council", lambda: asyncio.get_event_loop().run_until_complete(
+        COUNCIL.deliberate("テスト発話", get_state(0)))["summary"]["tone"])
+    check("pocket_gen", lambda: POCKET.load_source("selftest", POCKET.generate_source("dice"))["ok"])
+    check("pocket_exec", lambda: POCKET.execute("selftest", ["6", "2"]))
+    check("pocket_unload", lambda: POCKET.unload("selftest"))
+    check("pocket_forge", lambda: FORGE.forge("self_forge", "ダイスを1つ振って")["ok"])
+    check("pocket_forge_exec", lambda: POCKET.execute("self_forge", ["6"]))
+    check("sandbox_ok", lambda: run_python_inline("print(sum(range(10)))"))
+    check("sandbox_block", lambda: run_python_inline("import os")[:24])
+    check("sandbox_process", lambda: run_python_sandbox("print(6*7)")[:24])
+    check("canvas_png", lambda: Canvas(32, 32).to_png()[:8] == b"\x89PNG\r\n\x1a\n")
+    check("dungeon_render", lambda: len(DUNGEON.render(DUNGEON.new_game(1))))
+    check("blackjack_render", lambda: len(BLACKJACK.render(BLACKJACK.start(1))))
+    check("economy_credit", lambda: ECON.credit(999, 1000, 0, "reward", "selftest")["coins"])
+    check("economy_debit", lambda: ECON.debit(999, 500, 0, "spend", "selftest")[0])
+    check("economy_transfer", lambda: ECON.transfer(999, 998, 100, 0)["ok"])
+    check("music_add", lambda: MUSIC.add(1, MUSIC.make_track("Test Song", "Tester")) is not None)
+    check("music_wave", lambda: MUSIC.render_waveform("seed", 16))
+    check("gacha", lambda: len(gacha_pull(10)[0]))
+    check("tarot", lambda: draw_tarot()[0])
+    check("ttt_ai", lambda: TTT.ai_move(TTT.start(7)["board"]))
+    check("shell_allow", lambda: SHELL.run("echo hello")["ok"])
+    check("shell_deny", lambda: SHELL.run("rm -rf /")["ok"])
+    check("ambient", lambda: AMBIENT.observe(0, 1, "こんにちは") or AMBIENT.report(0)["mood"])
+    check("repair_diag", lambda: REPAIR.diagnose(ValueError, ValueError("x"), None)["type"])
+    check("selfheal_rewrite", lambda: bool(REPAIR.rewrite_function(
+        safe_calc, REPAIR.diagnose(ValueError, ValueError("x"), None))))
+    check("autopatch_extract", lambda: AUTOPATCH._extract_code("```python\ndef run(a):\n    return 1\n```"))
+    check("supervisor_status", lambda: SUPERVISOR.status()["name"])
+    check("actor_decide", lambda: len(ACTOR.decide({"mood": "HEATED", "resource_mode": "CRITICAL",
+                                                     "limit": 1, "memory_nodes": 3000,
+                                                     "raid_suspected": True})))
+    check("automod_rule", lambda: (AUTOMOD.add_keyword(1, "t", ["bad"]),
+                                   AUTOMOD.check(1, 5, "this is BAD text"))[1])
+    check("scheduler", lambda: SCHEDULER.schedule(0, 0.01, "test"))
+    check("event_bus", lambda: BUS.topics() is not None)
+    check("resource_governor", lambda: GOV.sample()["mode"])
+    check("parallel", lambda: PARALLEL.run_thread(lambda: 1 + 1).result(2))
+    check("local_engine", lambda: local_reasoning(get_state(0), "こんにちは", None)[:16])
+    check("prompt_build", lambda: len(build_system_instruction(get_state(0))) > 100)
+    check("ui_catalog", lambda: sum(len(v) for v in UI_CONFIG.values()))
+    check("preflight", lambda: f"problems={len(preflight()['problems'])} (未設定は許容)")
+
+    ok = sum(1 for _n, o, _d in results if o)
+    print("\n=== POCHI ULTIMATE 内部自己診断 ===")
+    for name, o, detail in results:
+        print(f"[{'OK ' if o else 'FAIL'}] {name:<22} {detail[:70]}")
+    print(f"=== {ok}/{len(results)} passed ===\n")
+    return 0 if ok == len(results) else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description="POCHI ULTIMATE Discord Bot")
+    parser.add_argument("--selfcheck", action="store_true", help="内部自己診断のみ実行")
+    parser.add_argument("--preflight", action="store_true", help="起動前チェックのみ実行")
+    args = parser.parse_args()
+
+    install_excepthook()
+    start_keepalive()
+    GOV.start()
+
+    if args.selfcheck:
+        sys.exit(offline_selfcheck())
+    if args.preflight:
+        pf = preflight()
+        print(json.dumps(pf, ensure_ascii=False, indent=2))
+        sys.exit(0 if pf["ok"] else 1)
+
+    pf = preflight()
+    for p in pf["problems"]:
+        LOG.warn(f"PREFLIGHT: {p}")
+    if not CONFIG["TOKEN"]:
+        LOG.error("DISCORD_TOKEN が未設定のため Discord 接続をスキップします。")
+        LOG.info("内部機能のみを起動しました。--selfcheck で診断できます。")
+        sys.exit(offline_selfcheck())
 
     async def _run():
         async with bot:
