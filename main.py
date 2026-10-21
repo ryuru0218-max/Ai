@@ -482,6 +482,9 @@ def _install_discord_stub():
         async def __call__(self, ctx, *args, **kwargs):
             return await self.func(ctx, *args, **kwargs)
 
+    class _RegistrationError(Exception):
+        """discord.py の RegistrationError を模す(重複コマンド登録の検出)。"""
+
     class _CommandTree:
         """ discord.py の bot.tree を模した SlashCommand 登録先。 """
 
@@ -513,6 +516,10 @@ def _install_discord_stub():
             self.latency = 0.0
             self.loop = asyncio.get_event_loop_policy().new_event_loop()
             self.tree = _CommandTree()
+            # 実discord.py の Bot は既定で `help` コマンドを持つ(重複登録の基準)
+            async def _default_help(ctx, *args, **kwargs):
+                return None
+            self.commands["help"] = _BotCommand(_default_help, name="help")
 
         def event(self, fn):
             self.events[fn.__name__] = fn
@@ -521,6 +528,14 @@ def _install_discord_stub():
         def command(self, *a, **kw):
             def deco(fn):
                 cmd = _BotCommand(fn, **kw)
+                # 実discord.pyと同様、名前/エイリアスの重複を RegistrationError にする
+                names = [cmd.name] + list(cmd.aliases)
+                for existing in self.commands.values():
+                    clash = names[0] == existing.name or \
+                        set(names) & (set(existing.aliases) | {existing.name})
+                    if clash:
+                        raise _RegistrationError(
+                            f"The command {names[0]} is already an existing command or alias.")
                 self.commands[cmd.name] = cmd
                 return cmd
 
@@ -7305,12 +7320,12 @@ async def modrun(ctx, *, package: str = "", code: str = "1+1"):
 
 @bot.command()
 async def apis(ctx):
-    """利用可能な外部API(キー不要)の一覧。"""
+    """利用可能な外部API一覧(FREE/EXTENDED/EXTRA の3系統すべて)。"""
     lines = []
-    for name, spec in list(FREE_APIS.items()) + list(EXTENDED_APIS.items()):
+    for name, spec in list(FREE_APIS.items()) + list(EXTENDED_APIS.items()) + list(EXTRA_APIS.items()):
         lines.append(f"・`{name}` — {spec[0]}")
-    await ctx.send(f"🌐 **外部API 一覧 ({len(FREE_APIS) + len(EXTENDED_APIS)}種 / すべてキー不要)**\n"
-                   + "\n".join(lines))
+    total = len(FREE_APIS) + len(EXTENDED_APIS) + len(EXTRA_APIS)
+    await ctx.send(f"🌐 **外部API 一覧 ({total}種 / すべてキー不要)**\n" + "\n".join(lines))
 
 
 @bot.command()
@@ -10596,7 +10611,15 @@ def get_user_settings(uid: int) -> dict:
     return s
 
 
-@bot.command()
+# discord.py の Bot は既定で `help` コマンドを保持している。
+# 自前の !help を登録する前に既定分を除去し、RegistrationError を防ぐ。
+# (将来の discord.py が既定コマンドを追加した場合にも備え複数除去する)
+for _builtin in ("help", "hello", "commands"):
+    if bot.remove_command(_builtin) is not None:
+        LOG.info(f"既定の {_builtin} コマンドを除去し、自前の実装に置き換えました。")
+
+
+@bot.command(name="help", aliases=["ヘルプ", "commands"])
 async def help(ctx, *, category: str = ""):
     """カテゴリ別にコマンド一覧を表示。"""
     if category:
@@ -10896,15 +10919,6 @@ async def poker(ctx, *, cards: str = ""):
     rank, name, _tb = evaluate_poker_hand(cs)
     await ctx.send(f"🃏 **{' '.join(cs)}**\nハンド: **{name}** (ランク {rank})")
 
-
-@bot.command()
-async def apis(ctx):
-    """利用可能な外部API一覧。"""
-    lines = []
-    for name, spec in list(FREE_APIS.items()) + list(EXTENDED_APIS.items()) + list(EXTRA_APIS.items()):
-        lines.append(f"・`{name}` — {spec[0]}")
-    total = len(FREE_APIS) + len(EXTENDED_APIS) + len(EXTRA_APIS)
-    await ctx.send(f"🌐 **外部API 一覧 ({total}種 / すべてキー不要)**\n" + "\n".join(lines))
 
 
 # =============================================================================
@@ -11764,6 +11778,28 @@ def preflight() -> dict:
             "missing_optional": OPTIONAL_MISSING}
 
 
+def _check_command_registration() -> str:
+    """コマンド登録の健全性を検査する(重複/エイリアス衝突/既定コマンド残存)。
+
+    discord.py は RegistrationError で起動を落とすため、起動前に自己点検する。
+    """
+    seen: dict[str, str] = {}
+    problems: list[str] = []
+    for name, cmd in sorted(bot.commands.items()):
+        aliases = list(getattr(cmd, "aliases", []) or [])
+        for key in [name, *aliases]:
+            if key in seen:
+                problems.append(f"'{key}' が重複({seen[key]} / {name})")
+            seen[key] = name
+    for builtin in ("help",):
+        cmd = bot.commands.get(builtin)
+        if cmd is not None and getattr(cmd, "__module__", "") == "discord.ext.commands":
+            problems.append(f"discord.py 既定の '{builtin}' が残存")
+    if problems:
+        raise RuntimeError("; ".join(problems[:5]))
+    return f"{len(bot.commands)}コマンド / {len(seen)}キー (重複なし)"
+
+
 def offline_selfcheck() -> int:
     """Discord接続なしで内部機能を検証する自己診断。"""
     results: list[tuple[str, bool, str]] = []
@@ -11826,6 +11862,8 @@ def offline_selfcheck() -> int:
     check("local_engine", lambda: local_reasoning(get_state(0), "こんにちは", None)[:16])
     check("prompt_build", lambda: len(build_system_instruction(get_state(0))) > 100)
     check("ui_catalog", lambda: sum(len(v) for v in UI_CONFIG.values()))
+    check("command_registration", lambda: _check_command_registration())
+    check("help_command", lambda: bot.commands.get("help") is not None)
     check("extended_apis", lambda: len(EXTENDED_APIS))
     check("voice_state", lambda: VOICE.state(0)["connected"])
     check("voice_ffmpeg_detect", lambda: VOICE.ffmpeg_available())
