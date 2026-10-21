@@ -8993,23 +8993,26 @@ class WebApp:
         self.server = None
         self.stats = {"requests": 0, "errors": 0, "bytes_out": 0}
 
-    def route(self, method: str, pattern: str):
+    def route(self, method: str, pattern: str, public: bool = False):
+        """ルートを登録する。public=True なら認証トークンを要求しない。
+        (チャットサイトは「友達と共有」用途のため公開、管理APIは保護)"""
         regex = re.compile("^" + re.sub(r"\{(\w+)\}", r"(?P<\1>[^/]+)", pattern) + "$")
 
         def deco(fn):
-            self.routes.append((method.upper(), regex, fn))
+            self.routes.append((method.upper(), regex, fn, public))
             return fn
 
         return deco
 
     def dispatch(self, method: str, path: str, query: dict, body: dict, headers):
-        for m, rx, fn in self.routes:
+        """(結果, publicフラグ) を返す。マッチ無しは (None, False)。"""
+        for m, rx, fn, public in self.routes:
             if m != method.upper():
                 continue
             mt = rx.match(path)
             if mt:
-                return fn(mt.groupdict(), query, body, headers)
-        return None
+                return fn(mt.groupdict(), query, body, headers), public
+        return None, False
 
     def authorized(self, query: dict, headers) -> bool:
         if not self.token:
@@ -9034,7 +9037,7 @@ def _json_bytes(payload) -> bytes:
     return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
 
 
-@WEB.route("GET", "/api/chat/config")
+@WEB.route("GET", "/api/chat/config", public=True)
 def _r_chat_config(params, query, body, headers):
     """チャットUI用のドロップダウンオプション。"""
     return 200, {"modes": BASE_MODES, "personas": RP_MODES, "styles": CHAT_STYLES,
@@ -9049,17 +9052,17 @@ def _chat_html() -> bytes:
         return fh.read()
 
 
-@WEB.route("GET", "/chat")
+@WEB.route("GET", "/chat", public=True)
 def _r_chat_page(params, query, body, headers):
     return 200, _chat_html(), "text/html; charset=utf-8"
 
 
-@WEB.route("GET", "/room/{code}")
+@WEB.route("GET", "/room/{code}", public=True)
 def _r_chat_room_page(params, query, body, headers):
     return 200, _chat_html(), "text/html; charset=utf-8"
 
 
-@WEB.route("POST", "/api/chat/rooms")
+@WEB.route("POST", "/api/chat/rooms", public=True)
 def _r_chat_create(params, query, body, headers):
     """部屋を作成、または招待コードから参加する。"""
     name = str((body or {}).get("name", "")).strip()[:40] or "ゲスト"
@@ -9080,7 +9083,7 @@ def _r_chat_create(params, query, body, headers):
     return 200, {"room": room, "user": member}
 
 
-@WEB.route("GET", "/api/chat/rooms/{rid}")
+@WEB.route("GET", "/api/chat/rooms/{rid}", public=True)
 def _r_chat_room(params, query, body, headers):
     room = CHAT.get_room(params["rid"])
     if room is None:
@@ -9092,7 +9095,7 @@ def _r_chat_room(params, query, body, headers):
                  "modes": BASE_MODES, "personas": RP_MODES, "styles": CHAT_STYLES}
 
 
-@WEB.route("GET", "/api/chat/rooms/{rid}/messages")
+@WEB.route("GET", "/api/chat/rooms/{rid}/messages", public=True)
 def _r_chat_messages(params, query, body, headers):
     room = CHAT.get_room(params["rid"])
     if room is None:
@@ -9109,7 +9112,7 @@ def _r_chat_messages(params, query, body, headers):
                  "modes": BASE_MODES, "personas": RP_MODES, "styles": CHAT_STYLES}
 
 
-@WEB.route("POST", "/api/chat/rooms/{rid}/messages")
+@WEB.route("POST", "/api/chat/rooms/{rid}/messages", public=True)
 def _r_chat_post(params, query, body, headers):
     """メッセージ投稿 → POCHI が応答を生成する(非同期で配信)。"""
     room = CHAT.get_room(params["rid"])
@@ -9143,7 +9146,7 @@ def _r_chat_post(params, query, body, headers):
     return 200, {"ok": True, "room": CHAT.get_room(room["id"])}
 
 
-@WEB.route("GET", "/api/chat/rooms/{rid}/export")
+@WEB.route("GET", "/api/chat/rooms/{rid}/export", public=True)
 def _r_chat_export(params, query, body, headers):
     room = CHAT.get_room(params["rid"])
     if room is None:
@@ -9151,7 +9154,7 @@ def _r_chat_export(params, query, body, headers):
     return 200, CHAT.export_markdown(room["id"]).encode("utf-8"), "text/markdown; charset=utf-8"
 
 
-@WEB.route("GET", "/api/chat/stream/{rid}")
+@WEB.route("GET", "/api/chat/stream/{rid}", public=True)
 def _r_chat_stream(params, query, body, headers):
     """SSE: 新しいメッセージ/参加者更新を配信する。"""
     return 200, "stream", None
@@ -9359,7 +9362,7 @@ def _r_index(params, query, body, headers):
     return 200, DASHBOARD_HTML, "text/html; charset=utf-8"
 
 
-@WEB.route("GET", "/")
+@WEB.route("GET", "/", public=True)
 def _r_home(params, query, body, headers):
     """トップはチャットサイト(友達と共有できる会話)。"""
     return 200, _chat_html(), "text/html; charset=utf-8"
@@ -9919,17 +9922,19 @@ class _WebHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path, query = self._parse()
-        if not WEB.authorized(query, self.headers):
-            return self._respond(401, {"error": "unauthorized"})
         WEB.stats["requests"] += 1
         if path == "/api/stream":
+            if not WEB.authorized(query, self.headers):
+                return self._respond(401, {"error": "unauthorized"})
             return self._sse()
         if path.startswith("/api/chat/stream/"):
             rid = path.rsplit("/", 1)[-1]
             return self._chat_sse(rid, (query.get("me") or [""])[0])
-        result = WEB.dispatch("GET", path, query, {}, self.headers)
+        result, public = WEB.dispatch("GET", path, query, {}, self.headers)
         if result is None:
             return self._respond(404, {"error": "not found", "path": path})
+        if not public and not WEB.authorized(query, self.headers):
+            return self._respond(401, {"error": "unauthorized"})
         status, payload = result[0], result[1]
         ctype = result[2] if len(result) > 2 else "application/json; charset=utf-8"
         raw = ctype.startswith("text/") or ctype.startswith("image/") or ctype.startswith("text/html")
@@ -9937,13 +9942,13 @@ class _WebHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path, query = self._parse()
-        if not WEB.authorized(query, self.headers):
-            return self._respond(401, {"error": "unauthorized"})
         body = self._read_body()
         WEB.stats["requests"] += 1
-        result = WEB.dispatch("POST", path, query, body, self.headers)
+        result, public = WEB.dispatch("POST", path, query, body, self.headers)
         if result is None:
             return self._respond(404, {"error": "not found", "path": path})
+        if not public and not WEB.authorized(query, self.headers):
+            return self._respond(401, {"error": "unauthorized"})
         status, payload = result[0], result[1]
         ctype = result[2] if len(result) > 2 else "application/json; charset=utf-8"
         raw = ctype.startswith("text/")
@@ -12396,6 +12401,54 @@ def _check_command_registration() -> str:
     return f"{len(bot.commands)}コマンド / {len(seen)}キー (重複なし)"
 
 
+def verify_web_assets() -> str:
+    """Web資産(チャットサイト/JS)の健全性を検査する。
+
+    JSの構文エラーはブラウザで「画面が止まる」原因になるため、
+    Node が使える環境では `node --check` で実際に構文検証する。
+    """
+    import tempfile
+    root = os.path.dirname(os.path.abspath(__file__))
+    problems: list[str] = []
+    for rel in ("web/chat.html",):
+        path = os.path.join(root, rel)
+        if not os.path.exists(path):
+            problems.append(f"{rel} が存在しません")
+            continue
+        with open(path, encoding="utf-8") as fh:
+            html = fh.read()
+        if "<script>" not in html or "</script>" not in html:
+            problems.append(f"{rel} に script ブロックがありません")
+            continue
+        i = html.find("<script>")
+        j = html.find("</script>", i)
+        script = html[i + len("<script>"):j]
+        node = shutil.which("node") or shutil.which("nodejs")
+        if node:
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                             encoding="utf-8") as tf:
+                tf.write(script)
+                tmp = tf.name
+            try:
+                proc = subprocess.run([node, "--check", tmp], capture_output=True,
+                                      timeout=20, text=True)
+                if proc.returncode != 0:
+                    problems.append(f"chat.html の JS 構文エラー: "
+                                    f"{(proc.stderr or '').strip().splitlines()[-1][:120]}")
+            except Exception as exc:  # noqa: BLE001
+                problems.append(f"node --check 実行失敗: {exc}")
+            finally:
+                with contextlib.suppress(Exception):
+                    os.unlink(tmp)
+        else:
+            # Node が無い環境でも最低限の検証(括弧バランス)
+            if script.count("{") != script.count("}"):
+                problems.append("chat.html の JS 括弧が不一致です")
+    if problems:
+        raise RuntimeError("; ".join(problems))
+    return "chat.html OK" + (" (node --check 通過)" if (shutil.which("node") or shutil.which("nodejs")) else "")
+
+
 def offline_selfcheck() -> int:
     """Discord接続なしで内部機能を検証する自己診断。"""
     results: list[tuple[str, bool, str]] = []
@@ -12458,6 +12511,7 @@ def offline_selfcheck() -> int:
     check("local_engine", lambda: local_reasoning(get_state(0), "こんにちは", None)[:16])
     check("prompt_build", lambda: len(build_system_instruction(get_state(0))) > 100)
     check("ui_catalog", lambda: sum(len(v) for v in UI_CONFIG.values()))
+    check("web_assets", lambda: verify_web_assets())
     check("command_registration", lambda: _check_command_registration())
     check("help_command", lambda: bot.commands.get("help") is not None)
     check("extended_apis", lambda: len(EXTENDED_APIS))

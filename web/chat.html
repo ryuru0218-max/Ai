@@ -303,39 +303,52 @@ async function send(){
         mode:$('#selMode').value, persona:$('#selPersona').value, style:$('#selStyle').value})});
     await refresh();
   }catch(e){ toast('送信失敗: '+e.message); ta.value=text; }
+  S.sending=false; $('#send').disabled=!ta.value.trim(); ta.focus();
+}
 
 /* ---------------- 初期化 ---------------- */
-async function boot(){
-  try{
-    const cfg=await api('/api/chat/config');
-    fillSelect($('#selMode'),cfg.modes||{},'normal_full');
-    fillSelect($('#selPersona'),cfg.personas||{},'none');
-    fillSelect($('#selStyle'),cfg.styles||{},'normal');
-  }catch(e){}
-  const rid=localStorage.getItem(KEY);
-  const code=(location.pathname.match(/^\/room\/([A-Za-z0-9]+)/)||[])[1];
-  const nm=localStorage.getItem(NAME)||'';
-  $('#myname').value=nm; if(code)$('#code').value=code.toUpperCase();
-  if(rid){
-    try{
-      const d=await api('/api/chat/rooms/'+rid);
-      S.room=d.room; S.me=d.room.me||nm; S.mode=d.room.mode;
-      S.persona=d.room.persona; S.style=d.room.style; S.lastId=0;
-      showRoom(); await refresh(); connect();
-      $('#boot').style.display='none'; return;
-    }catch(e){ localStorage.removeItem(KEY); }
-  }
-  if(code){
-    if(await enter(code, nm||'ゲスト')){ $('#boot').style.display='none'; return; }
-  }
+function fatal(msg){
   $('#boot').style.display='none';
+  $('#entry').classList.remove('hide');
+  const e=$('#eerr'); e.textContent=msg; e.style.color='var(--err)';
 }
+async function boot(){
+ try{
+  const cfg=await api('/api/chat/config');
+  fillSelect($('#selMode'),cfg.modes||{},'normal_full');
+  fillSelect($('#selPersona'),cfg.personas||{},'none');
+  fillSelect($('#selStyle'),cfg.styles||{},'normal');
+ }catch(e){ /* 設定取得に失敗しても部屋参加は試す */ }
+ const rid=localStorage.getItem(KEY);
+ const code=(location.pathname.match(/^\/room\/([A-Za-z0-9]+)/)||[])[1];
+ const nm=localStorage.getItem(NAME)||'';
+ $('#myname').value=nm; if(code)$('#code').value=code.toUpperCase();
+ if(rid){
+  try{
+   const d=await api('/api/chat/rooms/'+rid);
+   S.room=d.room; S.me=d.room.me||nm; S.mode=d.room.mode;
+   S.persona=d.room.persona; S.style=d.room.style; S.lastId=0;
+   showRoom(); await refresh(); connect();
+   $('#boot').style.display='none'; return;
+  }catch(e){ localStorage.removeItem(KEY); }
+ }
+ if(code){
+  try{
+   if(await enter(code, nm||'ゲスト')){ $('#boot').style.display='none'; return; }
+  }catch(e){ fatal('部屋に参加できません: '+e.message); return; }
+ }
+ $('#boot').style.display='none';
+}
+window.addEventListener('error',e=>{ if($('#boot').style.display!=='none') fatal('読み込みエラー: '+(e.message||'不明')); });
+window.addEventListener('unhandledrejection',e=>{ if($('#boot').style.display!=='none') fatal('読み込みエラー: '+((e.reason&&e.reason.message)||'不明')); });
 $('#go').onclick=async()=>{const n=$('#myname').value.trim();
- if(!n){$('#eerr').textContent='名前を入力してください';return;}
- if(await enter($('#code').value,n)) $('#boot').style.display='none';};
+ if(!n){$('#eerr').textContent='名前を入力してください';$('#eerr').style.color='';return;}
+ try{ if(await enter($('#code').value,n)) $('#boot').style.display='none'; }
+ catch(e){ fatal('参加できません: '+e.message); }};
 $('#newroom').onclick=async()=>{const n=$('#myname').value.trim();
- if(!n){$('#eerr').textContent='名前を入力してください';return;}
- if(await enter('',n)) $('#boot').style.display='none';};
+ if(!n){$('#eerr').textContent='名前を入力してください';$('#eerr').style.color='';return;}
+ try{ if(await enter('',n)) $('#boot').style.display='none'; }
+ catch(e){ fatal('部屋を作成できません: '+e.message); }};
 $('#send').onclick=send;
 $('#text').addEventListener('input',e=>{e.target.style.height='auto';
  e.target.style.height=Math.min(160,e.target.scrollHeight)+'px';
