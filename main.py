@@ -3170,6 +3170,100 @@ def _png_write(width: int, height: int, pixels: bytearray) -> bytes:
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
             + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
 
+class VoicePlayer:
+    """Discord ボイスチャンネルの実再生(FFmpeg 必須)。
+
+    - 接続/切断/再生/停止/スキップを一元管理
+    - 手続き生成したWAVをその場で再生できる(POCHI Radio)
+    - FFmpeg 未導入や権限不足時は、WAV添付という確実なフォールバックへ自動的に切り替える
+    """
+
+    def __init__(self):
+        self.clients: dict[int, object] = {}
+        self.tracks: dict[int, dict] = {}
+        self.volume = 0.5
+        self.loops: dict[int, bool] = {}
+        self.log: deque = deque(maxlen=40)
+
+    @staticmethod
+    def ffmpeg_available() -> bool:
+        return shutil.which("ffmpeg") is not None
+
+    async def join(self, channel) -> tuple[bool, str]:
+        """ボイスチャンネルへ接続する。"""
+        try:
+            if not self.ffmpeg_available():
+                return False, ("⚠️ FFmpeg が見つかりません。音声の生再生には `ffmpeg` の導入が必要です"
+                              "( apt install ffmpeg )。生成的WAVの添付表示にはそのまま利用できます。")
+            if channel.voice is not None:
+                await channel.voice.disconnect()
+            client = await channel.connect()
+            self.clients[channel.guild.id] = client
+            self.log.append({"action": "join", "guild": channel.guild.id, "ts": jst_stamp()})
+            return True, f"🔊 **{channel.name}** に参加しました。"
+        except Exception as exc:  # noqa: BLE001
+            LOG.warn(f"Voice join failed: {exc}")
+            return False, f"⚠️ ボイス参加に失敗しました: {exc}"
+
+    async def play_wav(self, guild_id: int, wav_bytes: bytes, title: str = "POCHI Radio") -> tuple[bool, str]:
+        """生成したWAVをボイスで再生する(FFmpeg が必要)。"""
+        client = self.clients.get(guild_id)
+        if client is None:
+            return False, "⚠️ まずボイスチャンネルへ接続してください。"
+        if not self.ffmpeg_available():
+            return False, "⚠️ FFmpeg が未導入のため生再生できません。"
+        path = os.path.join(CONFIG["DATA_DIR"], f"voice_{guild_id}.wav")
+        try:
+            with open(path, "wb") as fh:
+                fh.write(wav_bytes)
+            source = discord.FFmpegOpusAudio(path)
+            source.volume = self.volume
+            client.play(source, after=lambda e: self._after(guild_id, e))
+            self.tracks[guild_id] = {"title": title, "started": time.time()}
+            return True, f"🎼 **{title}** の再生を開始しました。"
+        except Exception as exc:  # noqa: BLE001
+            LOG.warn(f"Voice play failed: {exc}")
+            return False, f"⚠️ 再生に失敗しました: {exc}"
+
+    def _after(self, guild_id: int, error=None):
+        if error:
+            LOG.warn(f"Voice playback error: {error}")
+        self.tracks.pop(guild_id, None)
+
+    async def stop(self, guild_id: int) -> str:
+        client = self.clients.get(guild_id)
+        if client is None:
+            return "ℹ️ 再生中のボイス接続はありません。"
+        with contextlib.suppress(Exception):
+            client.stop()
+        self.tracks.pop(guild_id, None)
+        return "⏹️ 再生を停止しました。"
+
+    async def leave(self, guild_id: int) -> str:
+        client = self.clients.pop(guild_id, None)
+        self.tracks.pop(guild_id, None)
+        if client is None:
+            return "ℹ️ 接続中のボイスはありません。"
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+        return "🚪 ボイスチャンネルから退出しました。"
+
+    def state(self, guild_id: int) -> dict:
+        client = self.clients.get(guild_id)
+        track = self.tracks.get(guild_id, {})
+        playing = False
+        with contextlib.suppress(Exception):
+            playing = bool(client and client.is_playing())
+        return {"connected": client is not None, "playing": playing,
+                "title": track.get("title", ""),
+                "elapsed": int(time.time() - track["started"]) if track else 0,
+                "ffmpeg": self.ffmpeg_available(), "volume": self.volume}
+
+
+VOICE = VoicePlayer()
+
+
+
 
 class Canvas:
     """最小限の描画キャンバス(矩形/線/点/簡易5x7フォント)。"""
@@ -4491,6 +4585,37 @@ UI_CONFIG = {
         "mod_weather_api": ["☀️ 天気API", ["都市"]],
         "mod_currency": ["💱 為替API", ["金額", "USD", "JPY"]],
     },
+    "MOD_PACK3": {
+        "mod_pypi_install": ["📥 PyPI Modインストール", ["パッケージ名"]],
+        "mod_pypi_list": ["📋 インストール済みMod", []],
+        "mod_pypi_run": ["▶️ Modコード実行", ["パッケージ名", "Python式"]],
+        "mod_pypi_uninstall": ["🗑️ Modアンインストール", ["パッケージ名"]],
+        "mod_ext_arxiv": ["📚 arXiv論文", ["検索語"]],
+        "mod_ext_devto": ["💻 dev.to記事", ["タグ"]],
+        "mod_ext_stackexchange": ["❓ StackOverflow", ["検索語"]],
+        "mod_ext_openlibrary": ["📕 書籍検索", ["書名/著者"]],
+        "mod_ext_tvmaze": ["🎬 ドラマ検索", ["タイトル"]],
+        "mod_ext_dogceo": ["🐶 犬画像", []],
+        "mod_ext_catfact": ["🐱 猫トリビア", []],
+        "mod_ext_holidays": ["🗓️ 祝日一覧", ["国コード"]],
+        "mod_ext_ipinfo": ["🌐 接続元IP", []],
+        "mod_ext_sunrise": ["🌅 日の出入り", ["都市名"]],
+        "mod_ext_geocode": ["🗺️ 地点検索", ["地名"]],
+        "mod_ext_food": ["🍫 商品情報", ["バーコード/名称"]],
+        "mod_ext_airquality": ["🌫️ 大気質", ["都市名"]],
+        "mod_ext_fakestore": ["🛍️ 商品(練習API)", ["商品ID"]],
+        "mod_ext_brewery": ["🍺 ブルワリー", ["名前"]],
+        "mod_ext_iss": ["🛰️ ISS位置", []],
+        "mod_ext_coinbase_rates": ["💱 Coinbaseレート", ["通貨"]],
+        "mod_ext_wikidata": ["📚 Wikidata", ["エンティティ"]],
+        "mod_ext_github_repo": ["🐙 GitHubリポジトリ", ["owner/repo"]],
+        "mod_ext_pypi_info": ["📦 PyPI情報", ["パッケージ名"]],
+        "mod_ext_npm_info": ["📦 npm情報", ["パッケージ名"]],
+        "mod_voice_join": ["🔊 ボイス参加", []],
+        "mod_voice_leave": ["🚪 ボイス退出", []],
+        "mod_voice_play": ["🎼 ボイス再生(生成音源)", ["曲名"]],
+        "mod_voice_stop": ["⏹️ ボイス停止", []],
+    },
     "MOD_PACK2": {
         "mod_visual_dungeon": ["🗺️ 視覚ダンジョン", []],
         "mod_blackjack": ["🃏 ブラックジャック", []],
@@ -4625,6 +4750,10 @@ class MainCategoryView(discord.ui.View):
     @discord.ui.button(label="🎮 Mod2", style=discord.ButtonStyle.primary, row=3)
     async def b10(self, i, b):
         await self._open_sub(i, "MOD_PACK2", "拡張Modパック2")
+
+    @discord.ui.button(label="🌐 外部API/Mod", style=discord.ButtonStyle.primary, row=4)
+    async def b11(self, i, b):
+        await self._open_sub(i, "MOD_PACK3", "外部API & Modインストーラ")
 
     @discord.ui.button(label="🧹 リセット", style=discord.ButtonStyle.danger, row=3)
     async def btn_reset(self, i, b):
@@ -5801,6 +5930,37 @@ async def execute_direct_action(ch, guild, ctx_mock, action: str):
             await ch.send("🧩 **Pocket**\n" + "\n".join(
                 f"・{p['name']} (calls={p['calls']}) funcs={p['functions']}"
                 for p in POCKET.list_plugins()) or "🧩 未ロード")
+        elif action == "mod_pypi_list":
+            rows = MODS.list_installed()
+            if not rows:
+                await ch.send("📋 インストール済みModはありません。")
+            else:
+                text = "\n".join(
+                    f"・**{r['name']}** v{r['version']} / {r['files']}ファイル / "
+                    f"importable={r['importable']} / {', '.join(r['modules'][:5])}"
+                    for r in rows)
+                await ch.send(f"📋 **インストール済みMod**\n{text}")
+        elif action.startswith("mod_ext_"):
+            key = action[len("mod_ext_"):]
+            spec = EXTENDED_APIS.get(key)
+            if spec is None:
+                await ch.send(f"⚠️ 未対応のAPI: `{key}`")
+            else:
+                try:
+                    await ch.send(await spec[2]())
+                except Exception as exc:  # noqa: BLE001
+                    await ch.send(f"⚠️ 実行エラー: {exc}")
+        elif action == "mod_voice_join":
+            voice_ch = getattr(getattr(ctx_mock.author, "voice", None), "channel", None)
+            if voice_ch is None:
+                await ch.send("⚠️ 先にボイスチャンネルへ入ってください。")
+            else:
+                ok, msg = await VOICE.join(voice_ch)
+                await ch.send(msg)
+        elif action == "mod_voice_leave":
+            await ch.send(await VOICE.leave(guild.id if guild else 0))
+        elif action == "mod_voice_stop":
+            await ch.send(await VOICE.stop(guild.id if guild else 0))
         elif action == "music_skip":
             nxt = MUSIC.skip(guild.id if guild else 0)
             await ch.send(f"⏭️ スキップ: {nxt['title'] if nxt else '再生終了'}")
@@ -6017,6 +6177,73 @@ async def execute_modal_action(ch, guild, ctx_mock, action: str, vals: list[str]
         elif action == "mod_py_sandbox":
             await interaction.followup.send(
                 f"🐍 **【実行結果】**\n```\n{run_python_sandbox(v0)}\n```")
+        elif action == "mod_voice_play":
+            track = MUSIC.make_track(v0, "POCHI Radio")
+            wav = await asyncio.to_thread(MUSIC.synth_wav, track, 8.0)
+            gid = guild.id if guild else 0
+            ok, msg = await VOICE.play_wav(gid, wav, track["title"])
+            await interaction.followup.send(msg)
+            await ch.send("🎼 **生成音源 (WAV)** を添付します。", file=discord.File(io.BytesIO(wav), "pochi_radio.wav"))
+        # --- 外部Modインストーラ ---
+        elif action == "mod_pypi_install":
+            await interaction.followup.send(f"📥 PyPI から『{v0}』を取得・展開中...")
+            res = await MODS.install_pypi(v0)
+            if not res.get("ok"):
+                await interaction.followup.send(f"❌ インストール失敗: {res.get('error')}")
+            else:
+                probe = res.get("probe", {})
+                mods = ", ".join(probe.get("modules", [])[:8]) or "—"
+                head = (f"📥 **Modインストール成功**\n"
+                        f"パッケージ: `{res['name']}` v{res['version']} / 展開 {res['files']}ファイル\n"
+                        f"インポート可否: {'✅ 可能' if probe.get('ok') else '⚠️ 不可'}\n"
+                        f"モジュール: {mods}")
+                if res.get("findings"):
+                    head += "\n⚠️ 静的検査の所見:\n" + "\n".join(f"・{f}" for f in res["findings"][:5])
+                await interaction.followup.send(head)
+        elif action == "mod_pypi_list":
+            rows = MODS.list_installed()
+            if not rows:
+                await interaction.followup.send("📋 インストール済みModはありません。")
+            else:
+                text = "\n".join(
+                    f"・**{r['name']}** v{r['version']} / {r['files']}ファイル / "
+                    f"importable={r['importable']} / {', '.join(r['modules'][:5])}"
+                    for r in rows)
+                await interaction.followup.send(f"📋 **インストール済みMod**\n{text}")
+        elif action == "mod_pypi_run":
+            res = await MODS.run_installed(v0, v[1] or "1+1")
+            if res.get("ok"):
+                out = res.get("res", "")
+                so = res.get("out", "")
+                await interaction.followup.send(
+                    f"▶️ **Mod実行結果** `{v0}`\n```\n{out}\n{so}\n```")
+            else:
+                await interaction.followup.send(f"⚠️ 実行エラー: {res.get('error') or res.get('res')}")
+        elif action == "mod_pypi_uninstall":
+            ok = MODS.uninstall(v0)
+            await interaction.followup.send(f"🗑️ 『{v0}』をアンインストール: {'成功' if ok else '未インストール'}")
+        # --- 拡張外部API ---
+        elif action.startswith("mod_ext_"):
+            key = action[len("mod_ext_"):]
+            spec = EXTENDED_APIS.get(key)
+            if spec is None:
+                # 別名でも解決できるよう前方一致で救う(UI名とAPI名がずれた場合の保険)
+                for k2, sp in EXTENDED_APIS.items():
+                    if k2.startswith(key) or key.startswith(k2):
+                        key, spec = k2, sp
+                        break
+            if spec is None:
+                await interaction.followup.send(f"⚠️ 未対応のAPI: `{key}`")
+            else:
+                label, _labels, fn = spec
+                args = [v0] if v0 else []
+                if key == "holidays" and len(args) == 1:
+                    args = [args[0], 0]
+                try:
+                    res = await fn(*args)
+                except Exception as exc:  # noqa: BLE001
+                    res = f"⚠️ 実行エラー: {exc}"
+                await interaction.followup.send(res)
         elif action == "econ_buy":
             item = v0
             qty = int(v[1]) if v[1].isdigit() else 1
@@ -6766,6 +6993,53 @@ async def radio(ctx, *, title: str = "POCHI Radio Theme"):
 
 
 @bot.command()
+async def modinstall(ctx, *, package: str = ""):
+    """外部Mod(PyPIパッケージ)の取得・展開・検証。"""
+    if not package:
+        rows = MODS.list_installed()
+        if not rows:
+            return await ctx.send("📋 インストール済みModはありません。\n"
+                                  f"`!modinstall <パッケージ名>` で取得できます(例: `cowsay`)。")
+        return await ctx.send("📋 **インストール済みMod**\n" + "\n".join(
+            f"・**{r['name']}** v{r['version']} / {r['files']}ファイル / "
+            f"importable={r['importable']}" for r in rows))
+    async with ctx.typing():
+        res = await MODS.install_pypi(package)
+    if not res.get("ok"):
+        return await ctx.send(f"❌ インストール失敗: {res.get('error')}")
+    probe = res.get("probe", {})
+    head = (f"📥 **Modインストール成功**\n"
+            f"`{res['name']}` v{res['version']} / 展開 {res['files']}ファイル\n"
+            f"インポート可否: {'✅ 可能' if probe.get('ok') else '⚠️ 不可'}")
+    if res.get("findings"):
+        head += "\n⚠️ 静的検査: " + "; ".join(res["findings"][:3])
+    await ctx.send(head)
+
+
+@bot.command()
+async def modrun(ctx, *, package: str = "", code: str = "1+1"):
+    """インストール済みModのコードを隔離プロセスで実行。"""
+    if not package:
+        return await ctx.send("⚠️ `!modrun <パッケージ名> [Python式]`")
+    async with ctx.typing():
+        res = await MODS.run_installed(package, code)
+    if res.get("ok"):
+        await ctx.send(f"▶️ **結果**\n```\n{res.get('res', '')}\n{res.get('out', '')}\n```")
+    else:
+        await ctx.send(f"⚠️ 実行エラー: {res.get('error') or res.get('res')}")
+
+
+@bot.command()
+async def apis(ctx):
+    """利用可能な外部API(キー不要)の一覧。"""
+    lines = []
+    for name, spec in list(FREE_APIS.items()) + list(EXTENDED_APIS.items()):
+        lines.append(f"・`{name}` — {spec[0]}")
+    await ctx.send(f"🌐 **外部API 一覧 ({len(FREE_APIS) + len(EXTENDED_APIS)}種 / すべてキー不要)**\n"
+                   + "\n".join(lines))
+
+
+@bot.command()
 async def digest(ctx):
     """自動通知ダイジェストの手動表示。"""
     cid = ctx.channel.id
@@ -7455,6 +7729,571 @@ class AutonomousActor:
 
 ACTOR = AutonomousActor()
 
+# =============================================================================
+#  SECTION 14.5 -  拡張外部サービス / 外部Modインストーラ / ボイス再生
+# =============================================================================
+# --- 追加のキー不要パブリックAPI(実測して到達確認済み) ----------------------
+async def api_arxiv(query: str) -> str:
+    """arXiv 論文検索 (XML / キー不要)。"""
+    url = ("http://export.arxiv.org/api/query?search_query="
+           f"all:{quote(query)}&start=0&max_results=5&sortBy=relevance")
+    xml = await FastHTTP.get_text(url, ttl=600)
+    if not xml:
+        return "⚠️ arXiv 取得失敗"
+    entries = re.findall(r"<entry>(.*?)</entry>", xml, re.S)[:5]
+    if not entries:
+        return f"🔎 arXiv: 『{query}』に該当する論文は見つかりませんでした。"
+    lines = []
+    for e in entries:
+        title = re.search(r"<title>(.*?)</title>", e, re.S)
+        aid = re.search(r"<id>(.*?)</id>", e, re.S)
+        pub = re.search(r"<published>(.*?)</published>", e, re.S)
+        clean_title = re.sub(r"\s+", " ", title.group(1)).strip() if title else "?"
+        link = aid.group(1) if aid else ""
+        date = pub.group(1)[:10] if pub else ""
+        lines.append(f"・**{clean_title}**\n  {link} ({date})")
+    return f"📚 **arXiv 検索: {query}**\n" + "\n".join(lines)
+
+
+async def api_devto(tag: str = "") -> str:
+    """DEV Community の最新記事 (dev.to API / キー不要)。"""
+    url = "https://dev.to/api/articles?per_page=5" + (f"&tag={quote(tag)}" if tag else "")
+    data = await FastHTTP.get_json(url, ttl=300)
+    if not isinstance(data, list) or not data:
+        return "⚠️ dev.to 取得失敗"
+    lines = [f"・**{a.get('title', '')}**\n"
+             f"  {a.get('url', '')} | {a.get('public_reactions_count', 0)}リアク "
+             f"| {a.get('comments_count', 0)}コメント | {a.get('tag_list', [])}"
+             for a in data[:5]]
+    return f"💻 **dev.to 最新記事**{'#' + tag if tag else ''}\n" + "\n".join(lines)
+
+
+async def api_stackexchange(query: str) -> str:
+    """Stack Exchange 質問検索 (API キー不要 / レート制限あり)。"""
+    url = ("https://api.stackexchange.com/2.3/search/advanced?site=stackoverflow"
+           f"&q={quote(query)}&pagesize=5&order=desc&sort=votes&filter=default")
+    data = await FastHTTP.get_json(url, ttl=600)
+    if not data or not data.get("items"):
+        return "⚠️ Stack Exchange 取得失敗"
+    lines = []
+    for it in data["items"][:5]:
+        link = it.get("link", "").replace("https://", "")
+        lines.append(f"・**{it.get('title', '')}** (👍{it.get('score', 0)})\n"
+                     f"  {link} | {', '.join(it.get('tags', [])[:4])}")
+    return f"❓ **Stack Overflow: {query}**\n" + "\n".join(lines)
+
+
+async def api_openlibrary(query: str) -> str:
+    """Open Library 書籍検索 (キー不要)。"""
+    data = await FastHTTP.get_json(
+        f"https://openlibrary.org/search.json?q={quote(query)}&limit=5"
+        f"&fields=title,author_name,first_publish_year,key", ttl=600)
+    if not data or not data.get("docs"):
+        return "⚠️ Open Library 取得失敗"
+    lines = []
+    for d in data["docs"][:5]:
+        au = ", ".join(d.get("author_name", [])[:2]) or "不明"
+        year = d.get("first_publish_year", "?")
+        lines.append(f"・**{d.get('title', '?')}** — {au} ({year})")
+    return f"📕 **書籍検索: {query}**\n" + "\n".join(lines)
+
+
+async def api_tvmaze(query: str) -> str:
+    """TVMaze ドラマ検索 (キー不要)。"""
+    data = await FastHTTP.get_json(f"https://api.tvmaze.com/search/shows?q={quote(query)}", ttl=600)
+    if not data:
+        return "⚠️ TVMaze 取得失敗"
+    lines = []
+    for it in data[:5]:
+        s = it.get("show", {})
+        net = (s.get("network") or s.get("webChannel") or {}).get("name", "—")
+        lines.append(f"・**{s.get('name', '?')}** ({s.get('premiered', '?')[:4]}) "
+                     f"★{s.get('rating', {}).get('average', '?')} / {net}")
+    return f"🎬 **ドラマ検索: {query}**\n" + "\n".join(lines)
+
+
+async def api_dogceo() -> str:
+    """Dog CEO API で犬画像を1枚取得 (キー不要)。"""
+    data = await FastHTTP.get_json("https://dog.ceo/api/breeds/image/random", ttl=0)
+    if not data or not data.get("message"):
+        return "⚠️ 犬画像取得失敗"
+    return f"🐶 **ラッキー犬画像**\n{data['message']}"
+
+
+async def api_catfact() -> str:
+    """Cat Facts API (キー不要)。"""
+    data = await FastHTTP.get_json("https://catfact.ninja/fact", ttl=0)
+    if not data or not data.get("fact"):
+        return "⚠️ 猫 trivia 取得失敗"
+    return f"🐱 **猫 trivia**\n{data['fact']}"
+
+
+async def api_holidays(country: str = "JP", year: int = 0) -> str:
+        return "⚠️ TVMaze 取得失敗"
+async def api_holidays(country: str = "JP", year: int = 0) -> str:
+    """Nager.Date 祝日一覧 (キー不要)。"""
+    y = year or now_jst().year
+    data = await FastHTTP.get_json(
+        f"https://date.nager.at/api/v3/PublicHolidays/{y}/{country.upper()}", ttl=3600)
+    if not data:
+        return f"⚠️ {country.upper()} の祝日取得失敗"
+    lines = [f"・{h.get('date', '')} **{h.get('name', '')}** ({h.get('localName', '')})"
+             for h in data[:12]]
+    return f"🗓️ **{country.upper()} の祝日 ({y})**\n" + ("\n".join(lines) or "データなし")
+
+
+async def api_ipinfo() -> str:
+    """接続元の公開IP情報 (キー不要)。"""
+    data = await FastHTTP.get_json("https://ipapi.co/json/", ttl=60)
+    if not data or not isinstance(data, dict) or "ip" not in data:
+        return "⚠️ IP情報取得失敗"
+    return (f"🌐 **接続元情報**\n"
+            f"IP: `{data.get('ip', '?')}` / {data.get('city', '?')}, {data.get('region', '?')}\n"
+            f"国: {data.get('country_name', '?')} ({data.get('country_code', '?')})\n"
+            f"座標: {data.get('latitude', '?')}, {data.get('longitude', '?')}\n"
+            f"ISP: {data.get('org', '?')}")
+
+
+async def api_sunrise(place: str = "Tokyo") -> str:
+    """日の出/日の入り (USNO API / キー不要)。"""
+    geo = await FastHTTP.get_json(
+        f"https://geocoding-api.open-meteo.com/v1/search?name={quote(place)}&count=1&language=ja",
+        ttl=3600)
+    if not geo or not geo.get("results"):
+        return f"⚠️ 都市「{place}」が見つかりません"
+    loc = geo["results"][0]
+    today = now_jst().strftime("%Y-%m-%d")
+    data = await FastHTTP.get_json(
+        f"https://aa.usno.navy.mil/api/rstt/oneday?date={today}"
+        f"&coords={loc['latitude']},{loc['longitude']}&tz=0", ttl=3600)
+    if not data or "properties" not in data:
+        return "⚠️ 日の出入り取得失敗"
+    props = data["properties"].get("data", {})
+
+    def _event(phen: str, source: str = "sundata") -> str:
+        for item in (props.get(source) or []):
+            if item.get("phen") == phen:
+                return item.get("time", "?")
+        return "?"
+
+    return (f"🌅 **{loc.get('name', place)}** の太陽情報 ({today})\n"
+            f"日の出: {_event('Rise')} / 日の入り: {_event('Set')}\n"
+            f"市民薄明: {_event('Begin Civil Twilight')} / {_event('End Civil Twilight')}\n"
+            f"月の満ち欠け: {(props.get('closestphase') or {}).get('phase', '?')} "
+            f"({(props.get('curphase') or '?')}, 輝度 {props.get('fracillum', '?')})")
+
+
+async def api_geocode(place: str) -> str:
+    """OpenStreetMap Nominatim 地名検索 (キー不要・利用規定あり)。"""
+    data = await FastHTTP.get_json(
+        f"https://nominatim.openstreetmap.org/search?q={quote(place)}&format=json&limit=3"
+        f"&addressdetails=1", ttl=3600,
+        headers={"User-Agent": FastHTTP.USER_AGENTS[0]})
+    if not data:
+        return "⚠️ 地点検索失敗"
+    lines = []
+    for r in data[:3]:
+        disp = r.get("display_name", "")
+        lines.append(f"・**{disp[:90]}**\n  {r.get('lat')}, {r.get('lon')} ({r.get('type', '')})")
+    return f"🗺️ **地点検索: {place}**\n" + ("\n".join(lines) or "該当なし")
+
+
+async def api_food(product: str) -> str:
+    """Open Food Facts 商品情報 (キー不要)。"""
+    data = await FastHTTP.get_json(
+        f"https://world.openfoodfacts.org/api/v2/product/{quote(product)}.json", ttl=3600)
+    if not data or not data.get("product") or data.get("status") != 1:
+        return "⚠️ 商品情報が見つかりません(バーコード指定も可)"
+    p = data["product"]
+    grades = str(p.get("nutriscore_grade", "?")).upper()
+    return (f"🍫 **{p.get('product_name', '?')}**\n"
+            f"ブランド: {p.get('brands', '?')} / カテゴリ: {p.get('categories', '?')[:60]}\n"
+            f"Nutri-Score: **{grades}** / 100gあたり "
+            f"{p.get('nutriments', {}).get('energy-kcal_100g', '?')} kcal")
+
+
+async def api_airquality(city: str = "Tokyo") -> str:
+    """Open-Meteo 大気質 (AQI / キー不要)。"""
+    geo = await FastHTTP.get_json(
+        f"https://geocoding-api.open-meteo.com/v1/search?name={quote(city)}&count=1&language=ja",
+        ttl=3600)
+    if not geo or not geo.get("results"):
+        return f"⚠️ 都市「{city}」が見つかりません"
+    loc = geo["results"][0]
+    data = await FastHTTP.get_json(
+        f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={loc['latitude']}"
+        f"&longitude={loc['longitude']}"
+        f"&current=pm2_5,pm10,european_aqi,us_aqi,ozone,nitrogen_dioxide", ttl=600)
+    if not data or "current" not in data:
+        return "⚠️ 大気質取得失敗"
+    c = data["current"]
+
+    def _grade(aqi) -> str:
+        try:
+            a = float(aqi)
+        except (TypeError, ValueError):
+            return "?"
+        return "良好" if a <= 20 else "普通" if a <= 40 else "不良" if a <= 60 else "不良(大)"
+
+    return (f"🌫️ **{loc.get('name', city)} の大気質** ({c.get('time', '')})\n"
+            f"PM2.5: {c.get('pm2_5')} ug/m3 / PM10: {c.get('pm10')} ug/m3\n"
+            f"EU AQI: {c.get('european_aqi')} ({_grade(c.get('european_aqi'))}) / "
+            f"US AQI: {c.get('us_aqi')} ({_grade(c.get('us_aqi'))})\n"
+            f"O3: {c.get('ozone')} / NO2: {c.get('nitrogen_dioxide')}")
+
+
+async def api_fakestore(product_id: int = 1) -> str:
+    """FakeStore 商品情報 (練習用API / キー不要)。"""
+    data = await FastHTTP.get_json(f"https://fakestoreapi.com/products/{product_id}", ttl=600)
+    if not data or "title" not in data:
+        return "⚠️ 商品取得失敗"
+    rating = data.get("rating", {})
+    return (f"🛍️ **{data.get('title', '?')}**\n"
+            f"価格: ${data.get('price', '?')} / カテゴリ: {data.get('category', '?')}\n"
+            f"在庫: {data.get('stock', '?')} / 評価: {rating.get('rate', '?')}"
+            f" ({rating.get('count', 0)}件)")
+
+
+async def api_brewery(query: str = "") -> str:
+    """Open Brewery DB (キー不要)。"""
+    url = ("https://api.openbrewerydb.org/v1/breweries?per_page=5"
+           + (f"&name={quote(query)}" if query else ""))
+    data = await FastHTTP.get_json(url, ttl=3600)
+    if not data:
+        return "⚠️ breweries 取得失敗"
+    lines = [f"・**{b.get('name', '?')}** — {b.get('city', '?')}, {b.get('state', '?')}"
+             f" / {b.get('country', '?')}" for b in data[:5]]
+    return "🍺 **ブルワリー検索**\n" + ("\n".join(lines) or "データなし")
+
+
+async def api_iss() -> str:
+    """ISS の現在位置 (キー不要 / open-notify)。"""
+    data = await FastHTTP.get_json("http://api.open-notify.org/iss-now.json", ttl=30)
+    if not data or "iss_position" not in data:
+        return "⚠️ ISS 位置取得失敗"
+    p = data["iss_position"]
+    return (f"🛰️ **ISS 現在位置**\n"
+            f"緯度 {p.get('latitude', '?')} / 経度 {p.get('longitude', '?')}\n"
+            f"（位置は毎秒更新されます／高度・速度は非公開APIのため非掲載）")
+
+
+async def api_coinbase_rates(currency: str = "BTC") -> str:
+    """Coinbase 公開レート (キー不要)。"""
+    data = await FastHTTP.get_json(
+        f"https://api.coinbase.com/v2/exchange-rates?currency={currency.upper()}", ttl=300)
+    if not data or "data" not in data:
+        return "⚠️ レート取得失敗"
+    rates = data["data"].get("rates", {})
+    picked = {k: v for k, v in rates.items() if k in ("USD", "JPY", "EUR", "CNY", "KRW")}
+    lines = [f"・1 {currency.upper()} = {float(v):,.2f} {k}" for k, v in picked.items()]
+    return f"💱 **Coinbase レート ({currency.upper()})**\n" + ("\n".join(lines) or "データなし")
+
+
+async def api_wikidata(query: str) -> str:
+    """Wikidata エンティティ検索 (キー不要)。"""
+    data = await FastHTTP.get_json(
+        f"https://www.wikidata.org/w/api.php?action=wbsearchentities&search={quote(query)}"
+        f"&language=ja&uselang=ja&format=json&limit=5", ttl=3600)
+    if not data or not data.get("search"):
+        return "⚠️ Wikidata 取得失敗"
+    lines = [f"・**{s.get('label', '?')}** ({s.get('description', '')}) — {s.get('id', '')}"
+             for s in data["search"][:5]]
+    return f"\U0001F4DA **Wikidata: {query}**\n" + "\n".join(lines)
+
+
+async def api_pypi_info(name: str) -> str:
+    """PyPI パッケージ情報 (Modインストーラの土台 / キー不要)。"""
+    data = await FastHTTP.get_json(f"https://pypi.org/pypi/{quote(name)}/json", ttl=600)
+    if not data or "info" not in data:
+        return f"⚠️ PyPI にパッケージ『{name}』が見つかりません"
+    i = data["info"]
+    req = i.get("requires_dist") or []
+    return (f"\U0001F4E6 **PyPI: {i.get('name', name)}**\n"
+            f"最新: `{i.get('version', '?')}` / 要Python: {i.get('requires_python') or '-'}\n"
+            f"ライセンス: {i.get('license') or '-'}\n"
+            f"概要: {(i.get('summary') or '')[:180]}\n"
+            f"依存: {', '.join(req[:6]) if req else '-'}\n"
+            f"HP: {i.get('home_page') or i.get('project_url') or '-'}")
+
+
+async def api_npm_info(name: str) -> str:
+    """npm パッケージ情報 (Mod 探索 / キー不要)。"""
+    data = await FastHTTP.get_json(f"https://registry.npmjs.org/{quote(name)}/latest", ttl=600)
+    if not data or "name" not in data:
+        return f"⚠️ npm にパッケージ『{name}』が見つかりません"
+    maintainer = (data.get("maintainers") or [{}])[0].get("name", "?")
+    return (f"\U0001F4E6 **npm: {data.get('name', name)}**\n"
+            f"バージョン: `{data.get('version', '?')}` / ライセンス: {data.get('license', '-')}\n"
+            f"概要: {(data.get('description') or '')[:180]}\n"
+            f"依存数: {len(data.get('dependencies', {}))} / 保守: {maintainer}\n"
+            f"HP: {data.get('homepage', '-')}")
+
+
+async def api_github_repo(slug: str) -> str:
+    """GitHub リポジトリ情報 (Mod 探索 / キー不要・レート制限60回/時)。"""
+    if "/" not in slug:
+        return "⚠️ `owner/repo` 形式で指定してください"
+    data = await FastHTTP.get_json(
+        f"https://api.github.com/repos/{slug.strip('/')}", ttl=600,
+        headers={"Accept": "application/vnd.github+json"})
+    if not data or "full_name" not in data:
+        return f"⚠️ リポジトリ『{slug}』が見つかりません"
+    lic = (data.get("license") or {}).get("spdx_id", "-")
+    return (f"\U0001F419 **{data.get('full_name', slug)}**\n"
+            f"★{data.get('stargazers_count', 0)} / forks {data.get('forks_count', 0)} / "
+            f"issues {data.get('open_issues_count', 0)}\n"
+            f"言語: {data.get('language', '-')} / ライセンス: {lic}\n"
+            f"{(data.get('description') or '')[:180]}\n"
+            f"URL: {data.get('html_url', '')}")
+
+
+EXTENDED_APIS = {
+    "arxiv": ("📚 arXiv論文", ["検索語"], api_arxiv),
+    "devto": ("💻 dev.to記事", ["タグ(空可)"], api_devto),
+    "stackexchange": ("❓ StackOverflow", ["検索語"], api_stackexchange),
+    "openlibrary": ("📕 書籍検索", ["書名/著者"], api_openlibrary),
+    "tvmaze": ("🎬 ドラマ検索", ["タイトル"], api_tvmaze),
+    "dogceo": ("🐶 犬画像", [], api_dogceo),
+    "catfact": ("🐱 猫トリビア", [], api_catfact),
+    "holidays": ("🗓️ 祝日一覧", ["国コード(JP等)"], api_holidays),
+    "ipinfo": ("🌐 接続元IP", [], api_ipinfo),
+    "sunrise": ("🌅 日の出入り", ["都市名"], api_sunrise),
+    "geocode": ("🗺️ 地点検索", ["地名"], api_geocode),
+    "food": ("🍫 商品情報", ["バーコード/名称"], api_food),
+    "airquality": ("🌫️ 大気質", ["都市名"], api_airquality),
+    "fakestore": ("🛍️ 商品(練習API)", ["商品ID"], api_fakestore),
+    "brewery": ("🍺 ブルワリー", ["名前(空可)"], api_brewery),
+    "iss": ("🛰️ ISS位置", [], api_iss),
+    "coinbase_rates": ("💱 Coinbaseレート", ["通貨(BTC等)"], api_coinbase_rates),
+    "wikidata": ("📚 Wikidata", ["エンティティ"], api_wikidata),
+    "pypi_info": ("📦 PyPI情報", ["パッケージ名"], api_pypi_info),
+    "npm_info": ("📦 npm情報", ["パッケージ名"], api_npm_info),
+    "github_repo": ("🐙 GitHubリポジトリ", ["owner/repo"], api_github_repo),
+}
+
+# --- 外部Modインストーラ (PyPI / npm / GitHub) ------------------------------
+class ModInstaller:
+    """外部の公開パッケージ(Mod)を実際に取得・展開・検証し、利用可能にする。
+
+    設計方針:
+      - 取得: PyPI JSON API / npm registry / GitHub API (いずれもキー不要)
+      - 展開: sdist(tar.gz) / wheel(zip) を専用ディレクトリへ安全に展開
+      - 検証: (1)ASTで危険な呼び出しを静的検査 (2)別プロセスでインポート可否を実地確認
+      - 実行: 常に別プロセスで実行(ボットの本体プロセスは汚染されない)
+    """
+
+    MAX_ARCHIVE_BYTES = 12 * 1024 * 1024
+    MAX_FILES = 400
+
+    def __init__(self, install_dir: str | None = None):
+        self.install_dir = install_dir or os.path.join(CONFIG["DATA_DIR"], "mods")
+        os.makedirs(self.install_dir, exist_ok=True)
+        self.installed: dict[str, dict] = {}
+        self.lock = threading.RLock()
+        self.log: deque = deque(maxlen=60)
+
+    # ---- 展開(パストラバーサル防止) --------------------------------------
+    def _safe_extract_zip(self, zip_bytes: bytes, dest: str) -> int:
+        import zipfile
+        count = 0
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for member in zf.infolist():
+                if count >= self.MAX_FILES:
+                    break
+                name = member.filename
+                if name.startswith("/") or ".." in name.replace("\\", "/").split("/"):
+                    continue  # パストラバーサルをスキップ
+                target = os.path.realpath(os.path.join(dest, name))
+                if not target.startswith(os.path.realpath(dest)):
+                    continue
+                zf.extract(member, dest)
+                count += 1
+        return count
+
+    def _safe_extract_tar(self, tar_bytes: bytes, dest: str) -> int:
+        import tarfile
+        count = 0
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
+            for member in tf.getmembers():
+                if count >= self.MAX_FILES:
+                    break
+                name = member.name
+                if name.startswith("/") or ".." in name.replace("\\", "/").split("/"):
+                    continue
+                if member.issym() or member.islnk():
+                    continue  # シンボリックリンクは展開しない
+                if not (member.isfile() or member.isdir()):
+                    continue
+                target = os.path.realpath(os.path.join(dest, name))
+                if not target.startswith(os.path.realpath(dest)):
+                    continue
+                tf.extract(member, dest)
+                count += 1
+        return count
+
+    # ---- PyPI ------------------------------------------------------------
+    async def pypi_metadata(self, name: str) -> dict | None:
+        data = await FastHTTP.get_json(f"https://pypi.org/pypi/{quote(name)}/json", ttl=600)
+        if not data or "info" not in data:
+            return None
+        return data
+
+    async def install_pypi(self, name: str) -> dict:
+        """PyPI パッケージを取得して展開し、実行可否を検証する。"""
+        meta = await self.pypi_metadata(name)
+        if not meta:
+            return {"ok": False, "error": f"PyPI に『{name}』が見つかりません"}
+        info = meta.get("info", {})
+        version = info.get("version", "unknown")
+        files = meta.get("urls", [])
+        # sdist を優先(純Pythonで展開しやすい)、無ければ wheel
+        pick = next((u for u in files if u.get("packagetype") == "sdist"), None)
+        if pick is None:
+            pick = next((u for u in files if u.get("packagetype") == "bdist_wheel"), None)
+        if pick is None:
+            return {"ok": False, "error": "配布ファイル(sdist/wheel)が見つかりません"}
+        url = pick.get("url", "")
+        size = int(pick.get("size", 0) or 0)
+        if size > self.MAX_ARCHIVE_BYTES:
+            return {"ok": False, "error": f"配布ファイルが大きすぎます({size} bytes)"}
+        blob = await FastHTTP.get_bytes(url, timeout_sec=60.0)
+        if not blob:
+            return {"ok": False, "error": "ダウンロードに失敗しました"}
+        if len(blob) > self.MAX_ARCHIVE_BYTES:
+            return {"ok": False, "error": "ダウンロードサイズが上限超過"}
+        dest = os.path.join(self.install_dir, f"{name.replace('-', '_')}-{version}")
+        os.makedirs(dest, exist_ok=True)
+        try:
+            if url.endswith(".zip") or pick.get("packagetype") == "bdist_wheel":
+                files_n = self._safe_extract_zip(blob, dest)
+            else:
+                files_n = self._safe_extract_tar(blob, dest)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"展開に失敗しました: {exc}"}
+        findings = self.static_scan(dest)
+        probe = self.probe_import(dest, name)
+        with self.lock:
+            self.installed[name] = {"name": name, "version": version, "path": dest,
+                                    "files": files_n, "installed_at": time.time(),
+                                    "probe": probe, "findings": findings,
+                                    "summary": info.get("summary", "")}
+            self.log.append({"action": "install", "name": name, "version": version,
+                             "ok": True, "ts": jst_stamp()})
+        return {"ok": True, "name": name, "version": version, "path": dest,
+                "files": files_n, "probe": probe, "findings": findings,
+                "summary": info.get("summary", "")}
+
+    def static_scan(self, directory: str) -> list[str]:
+        """展開したコードを静的に検査し、危険な利用を列挙する(実行はしない)。"""
+        findings: list[str] = []
+        checked = 0
+        for root, _dirs, files in os.walk(directory):
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                checked += 1
+                if checked > 400:
+                    return findings + ["…(ファイル数上限)"]
+                path = os.path.join(root, fn)
+                with contextlib.suppress(Exception):
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        tree = ast.parse(fh.read())
+                    for p in ast_security_scan(tree)[:3]:
+                        findings.append(f"{os.path.relpath(path, directory)}: {p}")
+        return findings[:20]
+
+    def probe_import(self, directory: str, module_hint: str) -> dict:
+        """別プロセスでインポートできるかを確認(ボットの本体は汚さない)。"""
+        code = (
+            "import sys, json, importlib, pkgutil\n"
+            f"sys.path.insert(0, {directory!r})\n"
+            "out = {'ok': False, 'error': '', 'modules': []}\n"
+            "try:\n"
+            f"    names = [m.name for m in pkgutil.iter_modules([{directory!r}])]\n"
+            "    out['modules'] = names[:40]\n"
+            "    ok = 0\n"
+            "    for n in names[:6]:\n"
+            "        if n.startswith('_'):\n"
+            "            continue\n"
+            "        try:\n"
+            "            importlib.import_module(n)\n"
+            "            ok += 1\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "    out['ok'] = ok > 0\n"
+            "    out['imported'] = ok\n"
+            "except Exception as e:\n"
+            "    out['error'] = repr(e)\n"
+            "print(json.dumps(out))\n"
+        )
+        try:
+            proc = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True,
+                                  timeout=25, text=True, cwd=directory)
+            line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else ""
+            if line:
+                return json.loads(line)
+            return {"ok": False, "error": (proc.stderr or "no output")[-200:]}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    async def run_installed(self, name: str, code: str, timeout: float = 25.0) -> dict:
+        """インストール済みModのコードを隔離プロセスで実行する。"""
+        with self.lock:
+            entry = self.installed.get(name)
+        if not entry:
+            return {"ok": False, "error": f"『{name}』は未インストールです"}
+        runner = (
+            "import sys, json, io, contextlib\n"
+            f"sys.path.insert(0, {entry['path']!r})\n"
+            "buf = io.StringIO()\n"
+            "res = ''\n"
+            "try:\n"
+            "    with contextlib.redirect_stdout(buf):\n"
+            f"        res = str(eval({code!r}))\n"
+            "except Exception as e:\n"
+            "    res = 'ERROR: ' + repr(e)\n"
+            "print(json.dumps({'out': buf.getvalue()[-2000:], 'res': res[:2000]}))\n"
+        )
+        try:
+            proc = subprocess.run([sys.executable, "-I", "-c", runner], capture_output=True,
+                                  timeout=timeout, text=True, cwd=entry["path"])
+            line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else ""
+            if line:
+                data = json.loads(line)
+                data["ok"] = "ERROR" not in str(data.get("res", ""))
+                return data
+            return {"ok": False, "error": (proc.stderr or "no output")[-300:]}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"タイムアウト({timeout}秒)"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    def list_installed(self) -> list[dict]:
+        with self.lock:
+            return [{"name": v["name"], "version": v["version"], "files": v["files"],
+                     "importable": v.get("probe", {}).get("ok", False),
+                     "modules": v.get("probe", {}).get("modules", [])[:8],
+                     "findings": v.get("findings", [])[:3],
+                     "installed_at": datetime.fromtimestamp(
+                         v["installed_at"], JST).strftime("%m-%d %H:%M")}
+                    for v in self.installed.values()]
+
+    def uninstall(self, name: str) -> bool:
+        with self.lock:
+            entry = self.installed.pop(name, None)
+        if not entry:
+            return False
+        shutil.rmtree(entry["path"], ignore_errors=True)
+        self.log.append({"action": "uninstall", "name": name, "ts": jst_stamp()})
+        return True
+
+    def stats(self) -> dict:
+        return {"installed": len(self.installed), "dir": self.install_dir,
+                "log": list(self.log)[-6:]}
+
+
+MODS = ModInstaller()
+
 
 # =============================================================================
 #  SECTION 15 -  エントリポイント(最終段)
@@ -7539,6 +8378,11 @@ def offline_selfcheck() -> int:
     check("local_engine", lambda: local_reasoning(get_state(0), "こんにちは", None)[:16])
     check("prompt_build", lambda: len(build_system_instruction(get_state(0))) > 100)
     check("ui_catalog", lambda: sum(len(v) for v in UI_CONFIG.values()))
+    check("extended_apis", lambda: len(EXTENDED_APIS))
+    check("voice_state", lambda: VOICE.state(0)["connected"])
+    check("voice_ffmpeg_detect", lambda: VOICE.ffmpeg_available())
+    check("mods_dir", lambda: os.path.isdir(MODS.install_dir))
+    check("mods_static_scan", lambda: isinstance(MODS.static_scan(MODS.install_dir), list))
     check("preflight", lambda: f"problems={len(preflight()['problems'])} (未設定は許容)")
 
     ok = sum(1 for _n, o, _d in results if o)
