@@ -3095,6 +3095,55 @@ class MusicManager:
             out.append("▁▂▃▄▅▆▇█"[min(7, height - 1)])
         return "".join(out)
 
+    # --- 手続き型シンセサイザ(外部依存ゼロで 실제 音声を生成) ---------------
+    SCALE_MAP = {"C": [0, 2, 4, 5, 7, 9, 11], "A": [0, 2, 4, 5, 7, 9, 11],
+                 "F": [0, 2, 4, 5, 7, 9, 11], "G": [0, 2, 4, 5, 7, 9, 11],
+                 "D": [0, 2, 4, 5, 7, 9, 11], "E": [0, 2, 4, 5, 7, 9, 11]}
+
+    def synth_wav(self, track: dict, seconds: float = 6.0, rate: int = 22050) -> bytes:
+        """曲情報からチップチューン風のWAVを生成する(外部API/ライブラリ不要)。"""
+        import wave
+        seed = int(hashlib.sha256((track.get("title", "") + track.get("artist", "")).encode()
+                                  ).hexdigest()[:8], 16)
+        rnd = random.Random(seed)
+        root = rnd.choice(list(self.SCALE_MAP.keys()))
+        base = 220.0 * (2 ** (rnd.randint(0, 2) / 12.0))
+        scale = self.SCALE_MAP[root]
+        bpm = rnd.choice([88, 100, 112, 128, 140])
+        beat = 60.0 / bpm
+        total = int(seconds * rate)
+        #  Adele/wave 形式でサンプル列を生成
+        samples = bytearray()
+        step = 0
+        note_len = max(1, int(rate * beat / 2))
+        env_len = min(note_len, int(rate * 0.25))
+        while len(samples) < total * 2:
+            degree = scale[rnd.randrange(len(scale))]
+            octave = rnd.choice([0, 0, 1, -1])
+            freq = base * (2 ** (degree / 12.0)) * (2 ** octave)
+            # 三角波 + 減衰でチップチューンらしい音色に
+            buf = bytearray()
+            for i in range(note_len):
+                if len(samples) // 2 + i >= total:
+                    break
+                t = i / rate
+                attack = min(1.0, i / max(1, env_len))
+                decay = math.exp(-3.2 * t)
+                ph = (freq * t) % 1.0
+                tri = 4.0 * abs(ph - 0.5) - 1.0
+                val = tri * attack * decay * 0.35
+                buf += struct.pack("<h", int(max(-1.0, min(1.0, val)) * 32767))
+            samples += buf
+            step += 1
+        samples = samples[:total * 2]
+        out = io.BytesIO()
+        with wave.open(out, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(bytes(samples))
+        return out.getvalue()
+
     def make_track(self, title: str, artist: str = "Unknown", album: str = "", length: int = 210) -> dict:
         return {"title": title, "artist": artist, "album": album or "Single",
                 "length_ms": length * 1000, "url": f"https://music.example/{quote(title)}",
@@ -6021,6 +6070,13 @@ async def execute_modal_action(ch, guild, ctx_mock, action: str, vals: list[str]
                 f"🎵 **@{MUSIC.render_waveform(track['title'])}**\n**{track['title']}** / {track['artist']}\n"
                 f"`{stt['bar']}`  ({stt['elapsed']}/{stt['total']}s)\nキュー: {len(stt['queue'])}曲",
                 view=MusicControlView(gid))
+            # 実際の音声(WAV)を生成して添付する(外部依存ゼロ)
+            try:
+                wav = await asyncio.to_thread(MUSIC.synth_wav, track, 6.0)
+                await ch.send("🎼 **生成された音源** (チップチューン / 外部API不要)",
+                              file=discord.File(io.BytesIO(wav), "pochi_radio.wav"))
+            except Exception as exc:  # noqa: BLE001
+                LOG.warn(f"音源生成に失敗: {exc}")
         elif action == "music_lyrics":
             parts = [p.strip() for p in re.split(r"[-–—]", v0, maxsplit=1)]
             if len(parts) < 2:
@@ -6191,6 +6247,102 @@ async def _timer_task(ch, delay: float, message: str, ctx_mock):
     with contextlib.suppress(Exception):
         mention = getattr(ctx_mock.author, "mention", "")
         await ch.send(f"🔔 {mention} **【タイマー】** {message}")
+# =============================================================================
+#  SECTION 11.5 -  CPU並列バッチ解析(ProcessPoolで本当に並列化する仕事)
+# =============================================================================
+def _batch_sentiment_worker(chunk):
+    """ProcessPool のワーカー(pickle可能である必要があるモジュールレベル関数)。"""
+    out = []
+    for text in chunk:
+        t = text or ""
+        pos = _lexicon_score(t, POSITIVE_WORDS)
+        neg = _lexicon_score(t, NEGATIVE_WORDS)
+        tox = _lexicon_score(t, TOXIC_WORDS)
+        valence = max(-1.0, min(1.0, (pos + neg) / 1.6))
+        out.append((t[:80], round(valence, 3), round(min(1.0, tox), 3), len(t)))
+    return out
+
+
+def _batch_similarity_worker(payload):
+    """テキスト群のコサイン類似度上位ペアを計算する(CPU集約処理)。"""
+    texts, dim = payload
+    vecs = []
+    for t in texts:
+        v = [0.0] * dim
+        for tok in _tokens(t):
+            h = int(hashlib.sha1(tok.encode("utf-8")).hexdigest()[:8], 16)
+            v[h % dim] += 1.0
+        n = math.sqrt(sum(x * x for x in v)) or 1.0
+        vecs.append([x / n for x in v])
+    pairs = []
+    for i in range(len(vecs)):
+        for j in range(i + 1, len(vecs)):
+            s = sum(a * b for a, b in zip(vecs[i], vecs[j]))
+            pairs.append((i, j, round(s, 4)))
+    pairs.sort(key=lambda x: -x[2])
+    return pairs[:20]
+
+
+class BatchAnalyzer:
+    """大量テキストの解析を Thread/Process へ並列分散する。"""
+
+    def __init__(self):
+        self.processed = 0
+        self.chunks = 0
+        self.last_ms = 0.0
+        self.used_process = False
+
+    async def analyze_sentiment(self, texts: list[str]) -> list[dict]:
+        if not texts:
+            return []
+        t0 = time.perf_counter()
+        n = max(2, min(8, (os.cpu_count() or 2)))
+        size = max(1, len(texts) // n + 1)
+        chunks = [texts[i:i + size] for i in range(0, len(texts), size)]
+        self.chunks = len(chunks)
+        results: list = []
+        self.used_process = False
+        # CPU集約のためプロセスプールを優先(負荷が高いときはスレッドへ降格)
+        if len(texts) >= 32 and GOV.limit() > 1:
+            try:
+                futs = [PARALLEL.run_process(_batch_sentiment_worker, c) for c in chunks]
+                for f in futs:
+                    with contextlib.suppress(Exception):
+                        results.extend(f.result(timeout=20))
+                self.used_process = bool(results)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warn(f"プロセス並列に失敗、フォールバック: {exc}")
+        if not results:
+            for c in chunks:
+                results.extend(_batch_sentiment_worker(c))
+        self.processed += len(results)
+        self.last_ms = (time.perf_counter() - t0) * 1000
+        return [{"text": t, "valence": v, "toxicity": x, "length": l} for t, v, x, l in results]
+
+    async def similarity(self, texts: list[str]) -> list[tuple]:
+        if len(texts) < 2:
+            return []
+        t0 = time.perf_counter()
+        payload = (texts[:40], 96)
+        try:
+            fut = PARALLEL.run_process(_batch_similarity_worker, payload)
+            pairs = fut.result(timeout=20)
+            self.used_process = True
+        except Exception as exc:  # noqa: BLE001
+            LOG.warn(f"類似度プロセス並列に失敗: {exc}")
+            pairs = _batch_similarity_worker(payload)
+        self.last_ms = (time.perf_counter() - t0) * 1000
+        return pairs
+
+    def stats(self) -> dict:
+        return {"processed": self.processed, "chunks": self.chunks,
+                "last_ms": round(self.last_ms, 1), "process_pool": self.used_process}
+
+
+BATCH = BatchAnalyzer()
+
+
+
 
 # =============================================================================
 #  SECTION 12 -  クラウドセーブ / KeepAlive / コマンド / イベント / ループ
@@ -6267,7 +6419,8 @@ class KeepAliveHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/healthz"):
-            self._send(b"OK - POCHI ULTIMATE ENGINE V5")
+            mode = "standby" if not CONFIG["TOKEN"] else "live"
+            self._send(f"OK - POCHI ULTIMATE ENGINE V5 ({mode})".encode("utf-8"))
         elif self.path.startswith("/metrics"):
             snap = GOV.snapshot()
             lats = list(bot_stats["latencies"])
@@ -6560,6 +6713,56 @@ async def repair(ctx, *, target: str = ""):
         diag = REPAIR.diagnose(ValueError, ValueError("手動テスト"), None)
         ok = await AUTOPATCH.repair(func, diag)
         await ctx.send(f"{'✅' if ok else '⚠️'} `{target}` の修復を{'適用' if ok else 'スキップ'}しました。")
+
+
+@bot.command()
+async def analyze(ctx, *, text: str = ""):
+    """大量のテキストを並列解析(感情・毒性・類似度)。CPU集約部分はプロセスへ分散。"""
+    if not text:
+        return await ctx.send("⚠️ `!analyze <テキスト>` (改行区切りで複数可)")
+    lines = [ln for ln in text.split("\n") if ln.strip()][:200]
+    t0 = time.perf_counter()
+    results = await BATCH.analyze_sentiment(lines)
+    ms = (time.perf_counter() - t0) * 1000
+    pos = sum(1 for r in results if r["valence"] > 0.2)
+    neg = sum(1 for r in results if r["valence"] < -0.2)
+    toxic = [r for r in results if r["toxicity"] > 0.5]
+    avg = sum(r["valence"] for r in results) / max(1, len(results))
+    emb = make_embed("🧠 並列バッチ解析", "", 0x8E44AD)
+    emb.add_field(name="対象件数", value=f"`{len(results)}`", inline=True)
+    emb.add_field(name="所要時間", value=f"`{ms:.0f}ms` / 並列 {BATCH.stats()['chunks']} 分割",
+                  inline=True)
+    emb.add_field(name="プロセスプール", value=f"`{BATCH.stats()['process_pool']}`", inline=True)
+    emb.add_field(name="ポジティブ / ネガティブ", value=f"`{pos}` / `{neg}`", inline=True)
+    emb.add_field(name="平均感情価", value=f"`{avg:.3f}`", inline=True)
+    emb.add_field(name="毒性検出", value=f"`{len(toxic)}`件", inline=True)
+    if toxic:
+        emb.add_field(name="毒性の上位", value="\n".join(
+            f"・{t['text'][:60]} (tox={t['toxicity']})" for t in toxic[:5]), inline=False)
+    await ctx.send(embed=emb)
+    if len(lines) >= 2:
+        pairs = await BATCH.similarity(lines)
+        if pairs:
+            await ctx.send("🔗 **類似度上位ペア**\n" + "\n".join(
+                f"・{i}↔{j} `{s}`" for i, j, s in pairs[:5]))
+
+
+@bot.command()
+async def radio(ctx, *, title: str = "POCHI Radio Theme"):
+    """POCHI Radio: 曲情報 + 実際に生成した音源(WAV)を再生する。"""
+    track = MUSIC.make_track(title, "POCHI Radio")
+    MUSIC.add(ctx.guild.id if ctx.guild else 0, track)
+    stt = MUSIC.state(ctx.guild.id if ctx.guild else 0)
+    await ctx.send(f"🎵 **@{MUSIC.render_waveform(track['title'])}**\n"
+                   f"**{track['title']}** / {track['artist']}\n"
+                   f"`{stt['bar']}` ({stt['elapsed']}/{stt['total']}s)",
+                   view=MusicControlView(ctx.guild.id if ctx.guild else 0))
+    try:
+        wav = await asyncio.to_thread(MUSIC.synth_wav, track, 6.0)
+        await ctx.send("🎼 **生成音源** (チップチューン合成 / 外部API不要)",
+                       file=discord.File(io.BytesIO(wav), "pochi_radio.wav"))
+    except Exception as exc:  # noqa: BLE001
+        await ctx.send(f"⚠️ 音源生成に失敗しました: {exc}")
 
 
 @bot.command()
@@ -7545,8 +7748,26 @@ def main():
     for p in pf["problems"]:
         LOG.warn(f"PREFLIGHT: {p}")
     if not CONFIG["TOKEN"]:
-        LOG.error("DISCORD_TOKEN が未設定のため Discord 接続をスキップします。")
-        LOG.info("内部機能のみを起動しました。--selfcheck で診断できます。")
+        # トークン未設定でもプロセスを生存させ、監視用HTTPを静かに提供し続ける
+        LOG.error("DISCORD_TOKEN が未設定のため Discord 接続はスキップします(スタンバイモード)。")
+        LOG.info("内部機能(--selfcheck)は利用可能です。環境変数に DISCORD_TOKEN を設定して再起動してください。")
+        try:
+            offline_selfcheck()
+        except Exception:  # noqa: BLE001
+            pass
+        standby = os.environ.get("POCHI_STANDBY", "1") not in ("0", "false", "False")
+        if standby:
+            LOG.info("スタンバイモードで待機します(KeepAlive /healthz /metrics が応答します)。")
+
+            async def _standby():
+                while True:
+                    await asyncio.sleep(3600)
+
+            try:
+                asyncio.run(_standby())
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                LOG.info("スタンバイを終了します。")
+            return
         sys.exit(offline_selfcheck())
 
     async def _run():
