@@ -42,7 +42,7 @@ import codecs
 import hashlib
 import uuid
 import sqlite3
-import struct
+import struct as _struct
 import zlib
 import shutil
 import signal
@@ -3132,7 +3132,7 @@ class MusicManager:
                 ph = (freq * t) % 1.0
                 tri = 4.0 * abs(ph - 0.5) - 1.0
                 val = tri * attack * decay * 0.35
-                buf += struct.pack("<h", int(max(-1.0, min(1.0, val)) * 32767))
+                buf += _struct.pack("<h", int(max(-1.0, min(1.0, val)) * 32767))
             samples += buf
             step += 1
         samples = samples[:total * 2]
@@ -3163,10 +3163,10 @@ def _png_write(width: int, height: int, pixels: bytearray) -> bytes:
         raw += pixels[y * stride:(y + 1) * stride]
 
     def chunk(tag: bytes, data: bytes) -> bytes:
-        return (struct.pack(">I", len(data)) + tag + data
-                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+        return (_struct.pack(">I", len(data)) + tag + data
+                + _struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
 
-    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    header = _struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
             + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
 
