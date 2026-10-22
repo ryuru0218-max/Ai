@@ -3755,11 +3755,18 @@ class VoicePlayer:
             if not self.ffmpeg_available():
                 return False, ("⚠️ FFmpeg が見つかりません。音声の生再生には `ffmpeg` の導入が必要です"
                               "( apt install ffmpeg )。生成的WAVの添付表示にはそのまま利用できます。")
-            if channel.voice is not None:
-                await channel.voice.disconnect()
+            guild = getattr(channel, "guild", None)
+            gid = getattr(guild, "id", 0) or 0
+            # 既存接続があれば切断してから入り直す
+            # (discord.py のVoiceChannelに .voice 属性は無いので guild.voice_client を使う)
+            old = getattr(guild, "voice_client", None)
+            if old is not None:
+                with contextlib.suppress(Exception):
+                    await old.disconnect()
             client = await channel.connect()
-            self.clients[channel.guild.id] = client
-            self.log.append({"action": "join", "guild": channel.guild.id, "ts": jst_stamp()})
+            if gid:
+                self.clients[gid] = client
+            self.log.append({"action": "join", "guild": gid, "ts": jst_stamp()})
             return True, f"🔊 **{channel.name}** に参加しました。"
         except Exception as exc:  # noqa: BLE001
             LOG.warn(f"Voice join failed: {exc}")
@@ -3788,7 +3795,8 @@ class VoicePlayer:
     async def play_url(self, guild_id: int, url: str, title: str = "POCHI Radio") -> tuple[bool, str]:
         """指定した曲(URL)をボイスで実際に再生する(FFmpeg が必要)。
 
-        リモートURLを直接FFmpegへ渡すため、実在の楽曲を再生できる。
+        リモートURLを直接FFmpegへ渡すと環境によってセグフォルトするため、
+        必ずローカルへダウンロードしてから再生する。
         """
         client = self.clients.get(guild_id)
         if client is None:
@@ -3798,7 +3806,14 @@ class VoicePlayer:
         if not url:
             return False, "⚠️ 再生可能な音源URLがありません。"
         try:
-            source = discord.FFmpegOpusAudio(url, executable=self.ffmpeg_path())
+            data = await FastHTTP.get_bytes(url, timeout_sec=30.0)
+            if not data:
+                return False, "⚠️ 音源をダウンロードできませんでした。"
+            ext = _preview_filename(url).rsplit(".", 1)[-1]
+            path = os.path.join(CONFIG["DATA_DIR"], f"track_{guild_id}.{ext}")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            source = discord.FFmpegOpusAudio(path, executable=self.ffmpeg_path())
             source.volume = self.volume
             client.play(source, after=lambda e: self._after(guild_id, e))
             self.tracks[guild_id] = {"title": title, "started": time.time()}
@@ -3950,10 +3965,21 @@ class RadioPlayer:
     # ---- 音源の解決(試聴URL or 合成WAV) --------------------------------
     @staticmethod
     async def _resolve_source(track: dict) -> tuple[str | None, bytes | None]:
-        """再生可能な(URL, 生成WAV)を得る。実在の曲なら試聴URLを優先。"""
+        """再生可能な(ローカル音源パス, 生成WAV)を得る。
+
+        実在の曲なら試聴URLを**ローカルへダウンロード**して返す
+        (FFmpegへリモートURLを直接渡すのはセグフォルトする環境があるため)。
+        試聴音源が無い場合は POCHI がオリジナルを合成する。
+        """
         preview = track.get("preview_url") or ""
         if preview:
-            return preview, None
+            data = await FastHTTP.get_bytes(preview, timeout_sec=30.0)
+            if data:
+                ext = _preview_filename(preview).rsplit(".", 1)[-1]
+                path = os.path.join(CONFIG["DATA_DIR"], f"radio_src.{ext}")
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                return path, None
         try:
             wav = await asyncio.to_thread(MUSIC.compose, track, 8.0)
             return None, wav["wav"]
@@ -3970,17 +3996,15 @@ class RadioPlayer:
         if not self.voice.ffmpeg_available():
             return False, "⚠️ FFmpeg が未導入のため生再生できません。"
 
-        url, wav_bytes = await self._resolve_source(track)
-        if not url and not wav_bytes:
+        local_path, wav_bytes = await self._resolve_source(track)
+        if not local_path and not wav_bytes:
             return False, "⚠️ 再生できる音源を取得できませんでした。"
         try:
-            if url:
-                source = discord.FFmpegOpusAudio(url, executable=self.voice.ffmpeg_path())
-            else:
-                path = os.path.join(CONFIG["DATA_DIR"], f"radio_{guild_id}.wav")
-                with open(path, "wb") as fh:
+            if not local_path:
+                local_path = os.path.join(CONFIG["DATA_DIR"], f"radio_{guild_id}.wav")
+                with open(local_path, "wb") as fh:
                     fh.write(wav_bytes)
-                source = discord.FFmpegOpusAudio(path, executable=self.voice.ffmpeg_path())
+            source = discord.FFmpegOpusAudio(local_path, executable=self.voice.ffmpeg_path())
             source.volume = self.voice.volume
             client.play(source, after=lambda e: self._after(guild_id, e))
             self.sources[guild_id] = {"track": track}
@@ -3992,10 +4016,14 @@ class RadioPlayer:
             return False, f"⚠️ 再生に失敗しました: {exc}"
 
     async def enqueue(self, guild_id: int, track: dict) -> tuple[bool, str]:
-        """キューへ追加し、何も再生中なら即座に再生する。"""
+        """キューへ追加する。再生中なら続行し、停止中なら即座に再生を始める。"""
+        was_playing = bool(self.music.now.get(guild_id))
         self.music.queues[guild_id].append(track)
-        if not self.music.now.get(guild_id):
-            self.music.set_now(guild_id, self.music.queues[guild_id].pop(0))
+        if was_playing:
+            # すでに再生中なら次の曲として待つ(再生中の曲を作り直さない)
+            return True, (f"📋 キューに追加しました(残り{len(self.music.queues[guild_id])}曲)"
+                          f" / 次: **{track.get('title', '')}**")
+        self.music.set_now(guild_id, self.music.queues[guild_id].pop(0))
         if self.voice.clients.get(guild_id):
             return await self.play_track(guild_id, self.music.now[guild_id])
         return True, f"📋 キューに追加しました(残り{len(self.music.queues[guild_id])}曲)"
@@ -13753,6 +13781,13 @@ def offline_selfcheck() -> int:
     check("music_preview_name", lambda: _preview_filename("https://x/y.plus.aac.p.m4a"))
     check("tag_strip_keeps_links",
           lambda: strip_action_tags("[Wikipedia](https://a.b) [MUSIC: X]"))
+    check("web_query_build", lambda: build_search_query("Python 3.13の新機能について教えて"))
+    check("web_search_gate", lambda: needs_web_search("こんにちは"))
+    check("user_context", lambda: build_user_context(1) or "(no profile)")
+    check("music_opts_per_guild",
+          lambda: (MUSIC.toggle_opt(1, "loop"), MUSIC.get_opt(1, "loop"),
+                   MUSIC.get_opt(2, "loop"))[2])
+    check("msgindex_author", lambda: MSGINDEX.author_stats(1) or "(none)")
     check("gacha", lambda: len(gacha_pull(10)[0]))
     check("tarot", lambda: draw_tarot()[0])
     check("ttt_ai", lambda: TTT.ai_move(TTT.start(7)["board"]))
