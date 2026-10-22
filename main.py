@@ -3906,7 +3906,10 @@ class SongPlayer:
     @classmethod
     async def play(cls, ch, guild_id: int, query: str,
                    author_voice_channel=None) -> tuple[str, dict | None]:
-        """指定した曲を再生する。戻り値: (ユーザー向けメッセージ, 再生したトラック)。"""
+        """指定した曲を再生する。戻り値: (ユーザー向けメッセージ, 再生したトラック)。
+
+        実際の再生・キュー管理は RADIO が担う(再生状態の二重管理を避ける)。
+        """
         query = (query or "").strip()
         if not query:
             return "⚠️ 曲名を指定してください。", None
@@ -3916,31 +3919,24 @@ class SongPlayer:
             # 実在の曲が無い場合はオリジナル合成へフォールバック
             track = MUSIC.make_track(query, "POCHI Radio")
             wav = await asyncio.to_thread(MUSIC.compose, track, 8.0)
-            MUSIC.set_now(guild_id, track)
-            try:
-                ok, msg = await VOICE.play_wav(guild_id, wav["wav"], track["title"])
-            except Exception:  # noqa: BLE001
-                ok, msg = False, "⚠️ 再生に失敗しました。"
             head = (f"🎵 **{track['title']}** / POCHI Radio "
                     f"({wav['key']} / {wav['bpm']} BPM / {' → '.join(wav['progression'])})")
-            if ok:
-                return head + f"\n{msg}", track
+            if VOICE.clients.get(guild_id):
+                ok, msg = await RADIO.enqueue(guild_id, track)
+                return (head + f"\n{msg}" if ok else head + "\n" + msg), track
             return (head + "\n⚠️ 実在の曲が見つからないため、POCHI がオリジナルを合成しました。\n"
-                    + msg), track
+                    "💡 ボイスチャンネルで `!play` すると実際に再生されます。"), track
 
         track = cls.to_track(row)
-        MUSIC.set_now(guild_id, track)
         head = f"🎵 **{track['title']}** / {track['artist']} — {track['album']}"
         if track["url"]:
             head += f"\n🔗 {track['url']}"
-        # ボイス実再生(接続済み + 試聴音源あり)
-        if track["preview_url"] and VOICE.clients.get(guild_id):
-            ok, msg = await VOICE.play_url(guild_id, track["preview_url"],
-                                           f"{track['title']} / {track['artist']}")
+        # ボイス接続済みならキューへ追加して実再生する
+        if VOICE.clients.get(guild_id):
+            ok, msg = await RADIO.enqueue(guild_id, track)
             return head + f"\n{msg}", track
-        # 未接続 or 音源なし: 試聴リンクとクリック可能なURLを提示
-        if not VOICE.clients.get(guild_id):
-            head += "\n💡 ボイスチャンネルで `!play` すると実音源が再生されます。"
+        # 未接続: 試聴リンクとクリック可能なURLを提示
+        head += "\n💡 ボイスチャンネルで `!play` すると実音源が再生されます。"
         return head, track
 
 
@@ -8053,14 +8049,9 @@ async def play(ctx, *, query: str = ""):
     msg, track = await SONG.play(ctx.channel, gid, query)
     if not track:
         return await ctx.send(msg)
-    # 実在の曲でボイス接続済みなら、キューへ追加して実再生する
-    if track.get("preview_url") and VOICE.clients.get(gid):
-        await RADIO.enqueue(gid, track)
-        await ctx.send(msg, view=MusicControlView(gid))
-        return
     await ctx.send(msg, view=MusicControlView(gid))
     # ボイス未接続でも「聴ける」ように試聴音源を添付する
-    if track.get("preview_url"):
+    if track.get("preview_url") and not VOICE.clients.get(gid):
         data = await FastHTTP.get_bytes(track["preview_url"], timeout_sec=30.0)
         if data:
             await ctx.send(f"🎧 **試聴音源**: {track['title']} / {track['artist']}",
