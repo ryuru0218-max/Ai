@@ -3919,6 +3919,7 @@ class SongPlayer:
             # 実在の曲が無い場合はオリジナル合成へフォールバック
             track = MUSIC.make_track(query, "POCHI Radio")
             wav = await asyncio.to_thread(MUSIC.compose, track, 8.0)
+            track["_wav"] = wav["wav"]   # 二重合成を避けるため保持
             head = (f"🎵 **{track['title']}** / POCHI Radio "
                     f"({wav['key']} / {wav['bpm']} BPM / {' → '.join(wav['progression'])})")
             if VOICE.clients.get(guild_id):
@@ -3976,8 +3977,13 @@ class RadioPlayer:
                 with open(path, "wb") as fh:
                     fh.write(data)
                 return path, None
+        # 既に合成済みなら再合成しない(無駄な計算を避ける)
+        cached = track.get("_wav")
+        if cached:
+            return None, cached
         try:
             wav = await asyncio.to_thread(MUSIC.compose, track, 8.0)
+            track["_wav"] = wav["wav"]
             return None, wav["wav"]
         except Exception as exc:  # noqa: BLE001
             LOG.warn(f"音源合成に失敗: {exc}")
