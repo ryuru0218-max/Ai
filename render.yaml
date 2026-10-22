@@ -20,3 +20,5 @@ services:
         value: https://pochi-ai.onrender.com
       - key: POCHI_PUBLIC_CHANNEL
         sync: false
+      - key: POCHI_YT_COOKIES
+        sync: false

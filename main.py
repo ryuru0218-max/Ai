@@ -748,10 +748,12 @@ CONFIG = {
     "PORT": int(os.environ.get("PORT", "8080")),
     "DATA_DIR": os.environ.get("POCHI_DATA_DIR", os.path.join(os.getcwd(), "pochi_data")),
     "PLUGIN_DIR": os.environ.get("POCHI_PLUGIN_DIR", os.path.join(os.getcwd(), "pochi_plugins")),
-    "MODEL": os.environ.get("POCHI_MODEL", "gemini-3.8-flash"),
+    "MODEL": os.environ.get("POCHI_MODEL", "gemini-2.5-flash"),
+    "MODEL_PRO": os.environ.get("POCHI_MODEL_PRO", "gemini-2.5-pro"),
+    # 実在するモデルのみを既定値にする(存在しない名前だと必ず空応答になる)
     "MODEL_FALLBACKS": [m for m in os.environ.get(
         "POCHI_MODEL_FALLBACKS",
-        "gemini-3.8-flash-lite,gemini-3.5-flash-lite,gemini-2.5-flash").split(",") if m],
+        "gemini-2.5-flash-lite,gemini-2.0-flash,gemini-2.5-pro").split(",") if m],
     "MAX_CONCURRENCY": int(os.environ.get("POCHI_MAX_CONCURRENCY", "6")),
     "AI_TIMEOUT": float(os.environ.get("POCHI_AI_TIMEOUT", "45")),
     "AI_TOTAL_TIMEOUT": float(os.environ.get("POCHI_AI_TOTAL_TIMEOUT", "60")),
@@ -1553,10 +1555,23 @@ class KeyPool:
         with self.lock:
             avail = [i for i in range(len(self.keys)) if now >= self.cooldown[i]]
             if not avail:
+                # 全キーがクールダウン中 → 最も早く復帰するキーを使う
+                # (何も返さないと「empty」エラーが毎回同じキーで繰り返される)
                 idx = min(self.cooldown, key=lambda k: self.cooldown[k])
             else:
                 idx = min(avail, key=lambda i: (self.latency[i], -self.success[i]))
             return idx, self.keys[idx]
+
+    def pick_all(self, limit: int = 2) -> list[tuple[int, str]]:
+        """複数キーを返す(異なるキーでの再試行用)。"""
+        if not self.keys:
+            raise RuntimeError(f"{self.name} の APIキーが未設定です")
+        now = time.time()
+        with self.lock:
+            avail = [i for i in range(len(self.keys)) if now >= self.cooldown[i]]
+            pool = avail or list(range(len(self.keys)))
+            pool.sort(key=lambda i: (self.latency[i], -self.success[i]))
+            return [(i, self.keys[i]) for i in pool[:limit]]
 
     def penalize(self, idx: int, sec: float = 45.0, reason: str = ""):
         with self.lock:
@@ -2341,10 +2356,46 @@ def _gemini_call(model_name: str, key: str, system: str, user: str,
                 res = chat.send_message(user, request_options=req_opts)
             except TypeError:
                 res = chat.send_message(user)
-        return getattr(res, "text", "") or ""
+        text = getattr(res, "text", "") or ""
+        if not text.strip():
+            # ブロック/空応答の場合、理由を出力して原因を追えるようにする
+            reason = _gemini_block_reason(res)
+            LOG.warn(f"Gemini({model_name}) が空応答を返しました: {reason}")
+        return text
     except Exception as exc:  # noqa: BLE001
         LOG.warn(f"Gemini({model_name}) エラー: {exc}")
         return ""
+
+
+def _gemini_block_reason(res) -> str:
+    """空応答の原因(安全フィルタ/超過/其他)を推測して返す。"""
+    try:
+        pf = getattr(res, "prompt_feedback", None)
+        reason = str(getattr(pf, "block_reason", "") or "")
+        if reason:
+            return f"block_reason={reason}"
+        candidates = getattr(res, "candidates", None) or []
+        for c in candidates:
+            fr = str(getattr(c, "finish_reason", "") or "")
+            if fr:
+                return f"finish_reason={fr}"
+    except Exception:  # noqa: BLE001
+        pass
+    return "原因不明(応答本文が空)"
+
+
+def _explain_ai_error(last_err: str, candidates: list) -> str:
+    """AI失敗のメッセージに、原因と対処を明示する(毎回同じ「empty」になるのを防ぐ)。"""
+    models = "、".join(f"{p}/{m}" for p, m, _f, _i in candidates)
+    hint = ""
+    if GEMINI_POOL.keys and not GROQ_POOL.keys and not OPENROUTER_POOL.keys:
+        hint = (" | APIキーの確認: GEMINI_API_KEY が未設定・無効・利用上限の可能性があります"
+                "(「AI Studio」で有効なキーを再取得して設定してください)")
+    elif not (GEMINI_POOL.keys or GROQ_POOL.keys or OPENROUTER_POOL.keys):
+        hint = " | APIキーが1つも設定されていません(ローカル推論で動作します)"
+    else:
+        hint = " | キー/利用上限/モデル名のいずれかが原因の可能性があります"
+    return f"{last_err} (試行: {models or 'なし'}){hint}"
 
 
 def call_ai(state: dict, payload, is_bot_opponent: bool = False,
@@ -2387,7 +2438,8 @@ def call_ai(state: dict, payload, is_bot_opponent: bool = False,
         attempts.append(("local", "heuristic", lambda k: ""))
 
     if engine in ("gemini", "gemini_flash") or not attempts:
-        pref = "gemini-3.8-flash-pro" if engine == "gemini_flash" else CONFIG["MODEL"]
+        # 「-pro」等の実在しないモデルを既定にしない(必ず空応答になる)
+        pref = CONFIG["MODEL"] if engine != "gemini_flash" else CONFIG.get("MODEL_PRO", CONFIG["MODEL"])
         for m in [pref] + [x for x in CONFIG["MODEL_FALLBACKS"] if x != pref]:
             attempts.append(("gemini", m, (lambda mm: lambda k, t=ai_to: _gemini_call(
                 mm, k, system, user_text, hist, has_image, timeout=t))(m)))
@@ -2410,11 +2462,13 @@ def call_ai(state: dict, payload, is_bot_opponent: bool = False,
         pool = {"gemini": GEMINI_POOL, "groq": GROQ_POOL, "openrouter": OPENROUTER_POOL}.get(prov)
         if pool is None or not pool.available():
             continue
+        # 異なるキーを使い回す(1つのキーが死んでも全部失敗にならないように)
         try:
-            idx, key = pool.pick()
+            picked = pool.pick_all(2)
         except RuntimeError:
             continue
-        candidates.append((prov, model_name, (lambda f, kk: (lambda: f(kk)))(fn, key), idx))
+        for idx, key in picked:
+            candidates.append((prov, model_name, (lambda f, kk: (lambda: f(kk)))(fn, key), idx))
         if len(candidates) >= 2:   # コストと並列度のバランス(最大2並列)
             break
 
@@ -2475,6 +2529,10 @@ def call_ai(state: dict, payload, is_bot_opponent: bool = False,
                 for fut in futs:
                     fut.cancel()
                 ex.shutdown(wait=False)
+        # 全モデル/全キーが失敗した場合、原因を詳しく伝える
+        # (「empty」だけでは原因が分からず、毎回同じエラーになる)
+        if last_err:
+            last_err = _explain_ai_error(last_err, candidates)
     # ---- APIキーなしでも動くローカル推論エンジン(ルールベース) --------------
     if not CONFIG["GEMINI_KEYS"] and not CONFIG["GROQ_KEYS"] and not CONFIG["OPENROUTER_KEYS"]:
         local = local_reasoning(state, user_text, council)
@@ -3174,6 +3232,270 @@ async def api_music_search(query: str) -> str:
         tail = " / ".join(x for x in (link, preview) if x)
         lines.append(f"・**{r['title']}** / {r['artist']} ({r['album']}) {tail}".rstrip())
     return "🎵 **検索結果**\n" + "\n".join(lines)
+
+
+# --- YouTube 検索 / 音源解決 -----------------------------------------------
+YTDLP_AVAILABLE = False
+try:  # pragma: no cover - 任意依存
+    import yt_dlp
+    YTDLP_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    yt_dlp = None
+
+_YT_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.|m\.|music\.)?"
+    r"(?:youtube\.com/(?:watch\?|v/|shorts/|live/|embed/)"
+    r"|youtu\.be/)[\w\-=]+", re.IGNORECASE)
+
+
+def is_youtube_url(text: str) -> bool:
+    """文字列がYouTubeのURLかどうかを判定する。"""
+    return bool(_YT_URL_RE.search(text or ""))
+
+
+def _yt_opts() -> dict:
+    """yt-dlp のオプション(静かに・音声のみ・プレイリスト無し)。"""
+    opts = {
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "format": "bestaudio/best",
+        "extract_flat": False, "skip_download": True,
+        "socket_timeout": 20, "retries": 2,
+        # 1本だけ失敗しても検索全体は止めない(年齢制限等で弾かれた場合)
+        "ignoreerrors": True,
+    }
+    # ffmpeg を明示的に指定する(imageio-ffmpeg 同梱版も使えるように)
+    # yt-dlp の ffmpeg_location は「バイナリのフルパス」を要求する
+    try:
+        ffmpeg = VOICE.ffmpeg_path()
+    except Exception:  # noqa: BLE001
+        ffmpeg = None
+    if ffmpeg:
+        opts["ffmpeg_location"] = ffmpeg
+    # Cookie 指定(YouTubeのボット対策で必要な場合があるため)
+    cookies = os.environ.get("POCHI_YT_COOKIES", "").strip()
+    if cookies and os.path.exists(cookies):
+        opts["cookiefile"] = cookies
+    return opts
+
+
+def _yt_search(query: str, limit: int = 5) -> list[dict]:
+    """YouTubeで動画を検索する(同期処理)。
+
+    検索結果は「平坦に取得」して高速化し、個別動画の解決は後段に任せる
+    (年齢制限や地域制限で弾かれた1本が検索全体を失敗させないため)。
+    """
+    if not YTDLP_AVAILABLE:
+        return []
+    opts = _yt_opts()
+    opts["extract_flat"] = "in_playlist"
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            res = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"YouTube検索に失敗: {exc}")
+        return []
+    out: list[dict] = []
+    for e in (res or {}).get("entries", []) or []:
+        if not e:
+            continue
+        out.append({
+            "title": e.get("title") or "",
+            "url": e.get("webpage_url") or e.get("url") or "",
+            "video_id": e.get("id") or "",
+            "duration": int(e.get("duration") or 0),
+            "channel": e.get("channel") or e.get("uploader") or "",
+            "thumbnail": e.get("thumbnail") or "",
+        })
+    return out
+
+
+def _yt_resolve(url: str) -> dict | None:
+    """YouTube URLから動画情報(タイトル等)を取得する。"""
+    if not YTDLP_AVAILABLE:
+        return None
+    try:
+        with yt_dlp.YoutubeDL(_yt_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"YouTube解決に失敗: {exc}")
+        return None
+    if not info:
+        return None
+    return {
+        "title": info.get("title") or "",
+        "url": info.get("webpage_url") or url,
+        "video_id": info.get("id") or "",
+        "duration": int(info.get("duration") or 0),
+        "channel": info.get("channel") or info.get("uploader") or "",
+        "thumbnail": info.get("thumbnail") or "",
+    }
+
+
+def _yt_direct_url(url: str) -> str | None:
+    """動画から直接ダウンロード可能な音声URL(と必要なヘッダ)を取得する。"""
+    if not YTDLP_AVAILABLE:
+        return None
+    opts = _yt_opts()
+    opts["extract_flat"] = False
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"YouTube解決に失敗: {exc}")
+        return None
+    if not info:
+        return None
+    fmts = [f for f in (info.get("formats") or [])
+            if f.get("acodec") and f.get("acodec") != "none" and f.get("url")]
+    if not fmts:
+        return None
+    fmts.sort(key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0))
+    best = fmts[-1]
+    return json.dumps({"url": best["url"],
+                       "headers": best.get("http_headers") or {}})
+
+
+def _yt_download_direct(url: str, dest_dir: str) -> str | None:
+    """直接URLをPythonで取得してファイルへ保存する(yt-dlpのDLが403になる場合の保険)。"""
+    import urllib.request
+    payload = _yt_direct_url(url)
+    if not payload:
+        return None
+    try:
+        info = json.loads(payload)
+        req = urllib.request.Request(info["url"], headers=info.get("headers") or {})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"YouTube直接取得に失敗: {exc}")
+        return None
+    if not data:
+        return None
+    os.makedirs(dest_dir, exist_ok=True)
+    path = os.path.join(dest_dir, "yt_direct.bin")
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return path
+
+
+def _yt_download_audio(url: str, dest_dir: str) -> str | None:
+    """YouTubeの音声だけをローカルへダウンロードする(戻り値: ファイルパス)。
+
+    取得できる形式を順に試す(年齢制限・地域制限で弾かれても
+    別フォーマットや別めの動画なら取得できるようにする)。
+    """
+    if not YTDLP_AVAILABLE:
+        return None
+    os.makedirs(dest_dir, exist_ok=True)
+    base_opts = _yt_opts()
+    # 全体の時間上限(制限で弾かれた動画を次々へ回しても応答を止めない)
+    deadline = time.monotonic() + 30.0
+    # 優先順に試すフォーマット(音声品質の高い順)
+    format_candidates = [
+        "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+        "bestaudio/best",
+        "worstaudio/worst",
+    ]
+    for fmt in format_candidates:
+        if time.monotonic() > deadline:
+            LOG.warn("YouTube音声の取得が時間切れになりました")
+            break
+        opts = dict(base_opts)
+        opts.update({
+            "format": fmt,
+            "skip_download": False,
+            "outtmpl": os.path.join(dest_dir, "%(id)s.%(ext)s"),
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "opus", "preferredquality": "128",
+            }],
+            "overwrites": True,
+        })
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if not info:
+                    continue
+                path = ydl.prepare_filename(info)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warn(f"YouTube音声の取得に失敗({fmt}): {exc}")
+            continue
+        # postprocessor 後に拡張子が変わるため、実在するファイルを探索する
+        base = os.path.splitext(path)[0]
+        for cand in (base + ".opus", base + ".webm", base + ".m4a", base + ".mp3", path):
+            if os.path.exists(cand) and os.path.getsize(cand) > 0:
+                return cand
+    # すべて失敗した場合 → 直接URLでの取得を試す
+    direct = _yt_download_direct(url, dest_dir)
+    if direct:
+        return direct
+    return None
+
+
+async def search_youtube_tracks(query: str, limit: int = 5) -> list[dict]:
+    """YouTubeで動画を検索する(非同期ラッパ)。"""
+    if not YTDLP_AVAILABLE:
+        return []
+    return await asyncio.to_thread(_yt_search, query, limit)
+
+
+async def resolve_youtube(query: str) -> dict | None:
+    """URLならその動画を、キーワードなら検索で1本選ぶ。
+
+    検索上位の動画が年齢制限等で取得できない場合は、
+    次候補へ順に試す(1本が弾かれても必ず1本は見つける)。
+    """
+    if not YTDLP_AVAILABLE:
+        return None
+    if is_youtube_url(query):
+        return await asyncio.to_thread(_yt_resolve, query)
+    rows = await search_youtube_tracks(query, 8)
+    for row in rows:
+        url = row.get("url") or ""
+        if not url:
+            continue
+        info = await asyncio.to_thread(_yt_resolve, url)
+        if info:
+            return info
+    # どれも解決できなかった場合は検索結果をそのまま使う(タイトルは取得済み)
+    return rows[0] if rows else None
+
+
+async def fetch_youtube_audio(query: str, dest_dir: str,
+                              max_candidates: int = 5,
+                              budget: float = 45.0) -> tuple[str | None, dict | None]:
+    """YouTubeの音声を取得して(ローカルパス, 動画情報)を返す。
+
+    検索候補を1本ずつ実際にDLして試し、
+    取得できたものを返す(1本が制限で弾かれても必ず1本は確保する)。
+    全体の待ち時間には上限を設ける(応答を发展的重要にしない)。
+    """
+    if not YTDLP_AVAILABLE:
+        return None, None
+    deadline = time.monotonic() + budget
+    if is_youtube_url(query):
+        info = await asyncio.to_thread(_yt_resolve, query)
+        if not info:
+            return None, None
+        path = await asyncio.to_thread(_yt_download_audio, info["url"], dest_dir)
+        return path, info
+    rows = await search_youtube_tracks(query, max_candidates)
+    last_info: dict | None = None
+    for row in rows:
+        if time.monotonic() > deadline:
+            LOG.warn("YouTube音声の取得が時間切れになりました")
+            break
+        url = row.get("url") or ""
+        if not url:
+            continue
+        info = await asyncio.to_thread(_yt_resolve, url)
+        if not info:
+            continue
+        last_info = info
+        path = await asyncio.to_thread(_yt_download_audio, url, dest_dir)
+        if path:
+            return path, info
+    return None, last_info
 
 
 async def api_lyrics(artist: str, title: str) -> str:
@@ -3894,6 +4216,45 @@ class SongPlayer:
         return best
 
     @staticmethod
+    def _prefers_youtube(query: str) -> bool:
+        """このクエリをYouTubeで探すべきかを判定する。
+
+        - URLがYouTubeなら必ずYouTube
+        - 「YouTube」「YT」「FULL」「公式」等の明示指定があればYouTube
+        - 曲名指定の既定はYouTube(実音源で聞ける)にする。
+          iTunesは試聴音源(30秒)しか無い曲が多いため、第二候補とする。
+        """
+        q = (query or "").strip().lower()
+        if is_youtube_url(q):
+            return True
+        markers = ("youtube", "youtu.be", "yt ", "yt版", "full", "フル", "公式")
+        return any(m in q for m in markers)
+
+    @staticmethod
+    async def resolve_youtube_track(query: str) -> dict | None:
+        """YouTubeの動画(URL or キーワード)を1本解決してトラック辞書へ変換する。
+
+        実際に音声を取得できる候補を選ぶため、
+        検索上位から順にDLを試して成功したものを採用する。
+        """
+        if not YTDLP_AVAILABLE:
+            return None
+        dest = os.path.join(CONFIG["DATA_DIR"], "yt")
+        path, info = await fetch_youtube_audio(query, dest)
+        if not info:
+            return None
+        track = MUSIC.make_track(info.get("title", ""), info.get("channel", "YouTube"),
+                                "YouTube", length=int((info.get("duration") or 0) / 60) or 210,
+                                url=info.get("url", ""),
+                                preview_url="", artwork=info.get("thumbnail", ""))
+        track["youtube_url"] = info.get("url", "")
+        track["source"] = "youtube"
+        # 取得済みのローカルファイルがあれば再DLしない
+        if path:
+            track["_local_audio"] = path
+        return track
+
+    @staticmethod
     def to_track(row: dict) -> dict:
         """iTunes の検索結果を内部トラック辞書へ変換する。"""
         return MUSIC.make_track(row.get("title", ""), row.get("artist", ""),
@@ -3914,31 +4275,48 @@ class SongPlayer:
         if not query:
             return "⚠️ 曲名を指定してください。", None
 
+        # --- 1) YouTube最先 ---
+        # 実音源で聞けるため第一候補にする。URL指定は必ずYouTube。
+        if YTDLP_AVAILABLE:
+            yt = await cls.resolve_youtube_track(query)
+            if yt and yt.get("_local_audio"):
+                head = f"📺 **{yt['title']}** / {yt['artist']}"
+                if yt.get("url"):
+                    head += f"\n🔗 {yt['url']}"
+                if VOICE.clients.get(guild_id):
+                    ok, msg = await RADIO.enqueue(guild_id, yt)
+                    return head + f"\n{msg}", yt
+                return (head + "\n💡 ボイスチャンネルで `!play` すると実音源が再生されます。"), yt
+            if yt:
+                # メタデータだけは取れたが音声取得は失敗 → 下の経路へ
+                LOG.warn(f"YouTubeの音声取得に失敗: {query}")
+
+        # --- 2) iTunes(試聴音源) ---
         row = await cls.resolve(query)
-        if not row:
-            # 実在の曲が無い場合はオリジナル合成へフォールバック
-            track = MUSIC.make_track(query, "POCHI Radio")
-            wav = await asyncio.to_thread(MUSIC.compose, track, 8.0)
-            track["_wav"] = wav["wav"]   # 二重合成を避けるため保持
-            head = (f"🎵 **{track['title']}** / POCHI Radio "
-                    f"({wav['key']} / {wav['bpm']} BPM / {' → '.join(wav['progression'])})")
+        if row:
+            track = cls.to_track(row)
+            head = f"🎵 **{track['title']}** / {track['artist']} — {track['album']}"
+            if track["url"]:
+                head += f"\n🔗 {track['url']}"
+            # ボイス接続済みならキューへ追加して実再生する
             if VOICE.clients.get(guild_id):
                 ok, msg = await RADIO.enqueue(guild_id, track)
-                return (head + f"\n{msg}" if ok else head + "\n" + msg), track
-            return (head + "\n⚠️ 実在の曲が見つからないため、POCHI がオリジナルを合成しました。\n"
-                    "💡 ボイスチャンネルで `!play` すると実際に再生されます。"), track
+                return head + f"\n{msg}", track
+            # 未接続: 試聴リンクとクリック可能なURLを提示
+            head += "\n💡 ボイスチャンネルで `!play` すると実音源が再生されます。"
+            return head, track
 
-        track = cls.to_track(row)
-        head = f"🎵 **{track['title']}** / {track['artist']} — {track['album']}"
-        if track["url"]:
-            head += f"\n🔗 {track['url']}"
-        # ボイス接続済みならキューへ追加して実再生する
+        # --- 3) 実在の曲が無い場合はオリジナル合成 ---
+        track = MUSIC.make_track(query, "POCHI Radio")
+        wav = await asyncio.to_thread(MUSIC.compose, track, 8.0)
+        track["_wav"] = wav["wav"]   # 二重合成を避けるため保持
+        head = (f"🎵 **{track['title']}** / POCHI Radio "
+                f"({wav['key']} / {wav['bpm']} BPM / {' → '.join(wav['progression'])})")
         if VOICE.clients.get(guild_id):
             ok, msg = await RADIO.enqueue(guild_id, track)
-            return head + f"\n{msg}", track
-        # 未接続: 試聴リンクとクリック可能なURLを提示
-        head += "\n💡 ボイスチャンネルで `!play` すると実音源が再生されます。"
-        return head, track
+            return (head + f"\n{msg}" if ok else head + "\n" + msg), track
+        return (head + "\n⚠️ 実在の曲が見つからないため、POCHI がオリジナルを合成しました。\n"
+                "💡 ボイスチャンネルで `!play` すると実際に再生されます。"), track
 
 
 SONG = SongPlayer()
@@ -3959,15 +4337,32 @@ class RadioPlayer:
         self.music = music
         self.sources: dict[int, dict] = {}   # guild -> {"track":..., "url":...}
 
-    # ---- 音源の解決(試聴URL or 合成WAV) --------------------------------
+    # ---- 音源の解決(試聴URL / YouTube / 合成WAV) -------------------------
     @staticmethod
     async def _resolve_source(track: dict) -> tuple[str | None, bytes | None]:
         """再生可能な(ローカル音源パス, 生成WAV)を得る。
 
-        実在の曲なら試聴URLを**ローカルへダウンロード**して返す
-        (FFmpegへリモートURLを直接渡すのはセグフォルトする環境があるため)。
-        試聴音源が無い場合は POCHI がオリジナルを合成する。
+        優先順位:
+          1. YouTube動画(候補を順にDLして、取得できたものを再生)
+          2. iTunes試聴音源(ローカルDLして再生)
+          3. POCHIのオリジナル合成
+
+        ※FFmpegへリモートURLを直接渡すのはセグフォルトする環境があるため、
+          必ずローカルへダウンロードしてから再生する。
         """
+        yt_url = track.get("youtube_url") or ""
+        if yt_url:
+            # 取得済みのローカルファイルがあればそれを使う(再DLを避けて速く再生)
+            local = track.get("_local_audio")
+            if not local or not os.path.exists(local):
+                dest = os.path.join(CONFIG["DATA_DIR"], "yt")
+                local, info = await fetch_youtube_audio(yt_url, dest)
+                if info:
+                    track["title"] = info.get("title") or track.get("title", "")
+                    track["url"] = info.get("url") or track.get("url", "")
+            if local and os.path.exists(local):
+                return local, None
+            LOG.warn(f"YouTube音源の取得に失敗: {yt_url}")
         preview = track.get("preview_url") or ""
         if preview:
             data = await FastHTTP.get_bytes(preview, timeout_sec=30.0)
@@ -12398,7 +12793,7 @@ HELP_CATEGORIES = {
     "モデレーション": ["timeout", "kick", "ban", "purge", "automod", "slowmode", "raidmode"],
     "サーバー管理": ["announce", "poll", "level", "note", "habit", "pomodoro", "macro"],
     "拡張・保守": ["modinstall", "modrun", "pocket", "repair", "diag", "save", "restore", "code"],
-    "その他": ["ping", "ambient", "digest", "radio", "play", "analyze", "help"],
+    "その他": ["ping", "ambient", "digest", "radio", "play", "yt", "ai", "analyze", "help"],
 }
 
 USER_SETTINGS: dict[int, dict] = {}
@@ -12674,6 +13069,25 @@ async def search(ctx, *, query: str = ""):
         return await ctx.send(f"🔍 『{query}』に一致する発言はありません。")
     lines = [f"・<@{h['author']}> {h['content'][:120]} ({h['ts']})" for h in hits]
     await ctx.send(f"🔍 **検索結果: {query}** ({len(hits)}件)\n" + "\n".join(lines))
+
+
+@bot.command(name="yt", aliases=["youtube", "yt検索"])
+async def yt_search_cmd(ctx, *, query: str = ""):
+    """YouTubeで動画を検索する(`!play <曲名>` の実際に再生する相手を探す)。"""
+    if not query.strip():
+        return await ctx.send("⚠️ `!yt <キーワード>`")
+    if not YTDLP_AVAILABLE:
+        return await ctx.send("⚠️ yt-dlp が未導入です(`pip install yt-dlp`)。")
+    await ctx.send(f"📺 YouTubeを検索中: {query}")
+    rows = await search_youtube_tracks(query, 8)
+    if not rows:
+        return await ctx.send(f"🔍 『{query}』に一致する動画はありません。")
+    lines = []
+    for r in rows[:8]:
+        dur = f"{r['duration']//60}:{r['duration']%60:02d}" if r.get("duration") else "?"
+        lines.append(f"・**{r['title']}** ({dur})\n  {r['channel']}\n  {r['url']}")
+    await ctx.send(f"📺 **検索結果: {query}** ({len(rows)}件)\n" + "\n".join(lines) +
+                   "\n\nℹ️ `!play <曲名>` で実際に再生できます。")
 
 
 @bot.command(name="read", aliases=["url", "网页", "記事"])
@@ -13225,6 +13639,29 @@ async def cost(ctx):
                    + ("\n".join(lines) or "利用実績なし"))
 
 
+@bot.command(name="ai", aliases=["AI", "ai診断"])
+async def ai_diag(ctx):
+    """AI接続の診断(キー/モデル/応答を確認)。"""
+    await ctx.send("🔍 AI接続を診断中...")
+    check = _check_ai_connectivity()
+    emb = make_embed("🤖 AI診断", "", 0x7C9CFF)
+    emb.add_field(name="使用モデル", value=f"`{CONFIG.get('MODEL', '-')}`", inline=True)
+    emb.add_field(name="高精度モデル", value=f"`{CONFIG.get('MODEL_PRO', '-')}`", inline=True)
+    emb.add_field(name="フォールバック",
+                  value=("、".join(f"`{m}`" for m in CONFIG.get("MODEL_FALLBACKS", [])) or "-")[:1000],
+                  inline=False)
+    emb.add_field(name="キー数",
+                  value=f"Gemini `{len(GEMINI_POOL.keys)}` / Groq `{len(GROQ_POOL.keys)}` / "
+                        f"OpenRouter `{len(OPENROUTER_POOL.keys)}`", inline=False)
+    if check.get("problems"):
+        emb.add_field(name="❌ 問題", value="\n".join(check["problems"])[:1000], inline=False)
+    elif check.get("ok"):
+        emb.add_field(name="✅ 結果", value=f"正常(`{check.get('engine', '-')}`)", inline=False)
+    else:
+        emb.add_field(name="ℹ️ 状態", value=check.get("note", "未実行"), inline=False)
+    await ctx.send(embed=emb)
+
+
 @bot.command()
 async def rr(ctx, *, args: str = ""):
     """リアクショRole(絵文字->ロール)の設定。"""
@@ -13627,6 +14064,35 @@ async def trend(ctx):
 # =============================================================================
 #  SECTION 15 -  エントリポイント(最終段)
 # =============================================================================
+def _check_ai_connectivity() -> dict:
+    """AI API の疎通を実際に1回叩いて確認する。
+
+    「gemini/gemini-3.8-flash: empty」のような空応答的背后にある
+    「キー無効」「モデル名が存在しない」「利用上限」を起動時に特定する。
+    """
+    out: dict = {"problems": [], "tested": False, "model": CONFIG.get("MODEL", "")}
+    if not (CONFIG["GEMINI_KEYS"] or CONFIG["GROQ_KEYS"] or CONFIG["OPENROUTER_KEYS"]):
+        out["note"] = "APIキー未設定(ローカル推論で動作)"
+        return out
+    if not (HAS_GENAI or HAS_REQUESTS):
+        out["note"] = "AIクライアント未導入(google-generativeai / requests が必要です)"
+        out["problems"].append(
+            "AIクライアントが未導入です(pip install google-generativeai requests で導入してください)")
+        return out
+    out["tested"] = True
+    try:
+        res = call_ai(get_state(0), "ping", council=None)
+    except Exception as exc:  # noqa: BLE001
+        out["problems"].append(f"AI接続確認で例外: {exc}")
+        return out
+    if res.meta.get("error"):
+        out["problems"].append(f"AI接続に失敗: {res.text}")
+    else:
+        out["ok"] = True
+        out["engine"] = res.engine
+    return out
+
+
 def preflight() -> dict:
     """起動前チェック。problems が空なら実行可能。"""
     problems: list[str] = []
@@ -13640,6 +14106,10 @@ def preflight() -> dict:
         compile(open(os.path.abspath(__file__), encoding="utf-8").read(), "main.py", "exec")
     except Exception as exc:  # noqa: BLE001
         problems.append(f"ソースのコンパイルに失敗: {exc}")
+    # --- AIキーの疎通確認(「empty」エラーの原因を起動時に特定する) ---
+    ai_check = _check_ai_connectivity()
+    for msg in ai_check.get("problems", []):
+        problems.append(msg)
     # --- Web サイトの公開可否(解禁チェック) ---
     port = CONFIG["PORT"]
     try:
@@ -13660,6 +14130,7 @@ def preflight() -> dict:
             "discord_stub": DISCORD_IS_STUB,
             "web": {"port": port, "listening": web_ok,
                     "token_protected": bool(CONFIG.get("WEB_TOKEN"))},
+            "ai": ai_check,
             "missing_optional": OPTIONAL_MISSING}
 
 
@@ -13785,6 +14256,10 @@ def offline_selfcheck() -> int:
           lambda: (MUSIC.toggle_opt(1, "loop"), MUSIC.get_opt(1, "loop"),
                    MUSIC.get_opt(2, "loop"))[2])
     check("msgindex_author", lambda: MSGINDEX.author_stats(1) or "(none)")
+    check("ai_error_explain", lambda: _explain_ai_error("gemini/x: empty", []))
+    check("ai_model_valid", lambda: CONFIG["MODEL"] if not CONFIG["MODEL"].endswith("-pro") else "bad")
+    check("yt_url_detect", lambda: is_youtube_url("https://youtu.be/abc123"))
+    check("yt_prefers", lambda: SONG._prefers_youtube("https://youtube.com/watch?v=x"))
     check("gacha", lambda: len(gacha_pull(10)[0]))
     check("tarot", lambda: draw_tarot()[0])
     check("ttt_ai", lambda: TTT.ai_move(TTT.start(7)["board"]))

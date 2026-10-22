@@ -9,4 +9,5 @@ pypdf>=4.0.0
 gTTS>=2.5.1
 psutil>=5.9.8
 imageio-ffmpeg>=0.4.9
+yt-dlp>=2025.1.1
 
