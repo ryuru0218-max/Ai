@@ -305,6 +305,14 @@ def _install_discord_stub():
             self.filename = filename or "file.bin"
             self.spoiler = spoiler
 
+    class _FFmpegOpusAudio:
+        """ボイス再生用ソースのスタブ(実discord.pyのFFmpegOpusAudio相当)。"""
+
+        def __init__(self, source, **kwargs):
+            self.source = source
+            self.volume = 1.0
+            self.options = kwargs
+
     class _Color:
         def __init__(self, value=0):
             self.value = value
@@ -441,6 +449,7 @@ def _install_discord_stub():
     d.TextInput = _TextInput
     d.Embed = _Embed
     d.File = _File
+    d.FFmpegOpusAudio = _FFmpegOpusAudio
     d.Color = _Color
     d.Object = _Object
     d.Intents = _Intents
@@ -2007,11 +2016,25 @@ class DeepMemory:
         return new_key
 
     def recall(self, query: str, k: int = 5, min_sim: float = 0.18) -> list[tuple[MemoryNode, float]]:
+        """ベクター近傍検索。全ノードを走査し上位k件を返す(高速化済み)。"""
         qv = embed(query)
-        scored = [(n, cosine(qv, n.vec)) for n in self.nodes]
-        scored = [x for x in scored if x[1] >= min_sim]
-        scored.sort(key=lambda kv: -kv[1])
-        return scored[:k]
+        if not qv:
+            return []
+        with self._lock:
+            nodes = list(self.nodes)
+        # 上位k件だけを保持(全件ソートを避ける)
+        best: list[tuple[float, MemoryNode]] = []
+        for n in nodes:
+            s = cosine(qv, n.vec)
+            if s < min_sim:
+                continue
+            if len(best) < k:
+                best.append((s, n))
+                best.sort(key=lambda x: -x[0])
+            elif s > best[-1][0]:
+                best[-1] = (s, n)
+                best.sort(key=lambda x: -x[0])
+        return [(n, s) for s, n in best]
 
     def recall_for_user(self, user_id: int, k: int = 5) -> list[MemoryNode]:
         with self._lock:
@@ -2799,6 +2822,148 @@ async def fetch_article(url: str, limit: int = 1800) -> str:
     return truncate(strip_html(html), limit)
 
 
+async def fetch_article_full(url: str, limit: int = 12000) -> str:
+    """URLの本文をほぼ全文まで取得する(「URLの中身も全部見る」用の長い取得)。"""
+    html = await FastHTTP.get_text(url, ttl=300)
+    if not html:
+        return ""
+    return truncate(strip_html(html), limit)
+
+
+# 検索クエリを作るためのキーワード抽出(記号・フィラーを落とす)
+_SEARCH_STOP = ("です", "ます", "した", "して", "いる", "ある", "のこと", "ため",
+                "という", "について", "请问", "您好", "ありがとう", "よろしく",
+                "什么", "怎么", "the", "and", "for", "with", "that", "this")
+
+
+def build_search_query(text: str, limit: int = 120) -> str:
+    """発言から検索クエリを作る(そのままでも検索できる長さに整える)。"""
+    q = re.sub(r"https?://\S+", " ", text or "")
+    q = re.sub(r"[「」『』()（）\[\]{}<>\"'`~\-_=+*.,!?、。！？:;・…\n\r\t]+", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    for w in _SEARCH_STOP:
+        q = q.replace(w, " ")
+    q = re.sub(r"\s+", " ", q).strip()
+    return q[:limit]
+
+
+async def web_context(query: str, limit: int = 5, timeout: float = 5.0) -> str:
+    """Web検索を実行し、AIの提示コンテキストとして整形する。
+
+    - 失敗しても例外は投げず、空文字を返す(応答を止めない)
+    """
+    q = build_search_query(query)
+    if len(q) < 2:
+        return ""
+    try:
+        rows = await asyncio.wait_for(web_search(q, limit), timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"Web検索に失敗: {exc}")
+        return ""
+    if not rows:
+        return ""
+    lines = []
+    for r in rows[:limit]:
+        title = (r.get("title") or "").strip()[:120]
+        url = (r.get("url") or "").strip()
+        snip = re.sub(r"\s+", " ", (r.get("snippet") or "")).strip()[:220]
+        if not title and not url:
+            continue
+        lines.append(f"・{title}\n  {url}\n  {snip}" if snip else f"・{title}\n  {url}")
+    if not lines:
+        return ""
+    return "\n【Web検索結果(検索クエリ: " + q + ")】\n" + "\n".join(lines)
+
+
+async def web_context_full(query: str, limit: int = 5, timeout: float = 6.0) -> str:
+    """Web検索 + 各結果の本文を追加で取得する(「URLの中身も全部見る」モード)。"""
+    q = build_search_query(query)
+    if len(q) < 2:
+        return ""
+    try:
+        rows = await asyncio.wait_for(web_search(q, limit), timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"Web検索に失敗: {exc}")
+        return ""
+    if not rows:
+        return ""
+    pages = await asyncio.gather(
+        *(fetch_article_full(r.get("url", ""), 2500) for r in rows[:3]),
+        return_exceptions=True)
+    lines = []
+    for i, r in enumerate(rows[:limit]):
+        title = (r.get("title") or "").strip()[:120]
+        url = (r.get("url") or "").strip()
+        body = pages[i] if i < len(pages) else ""
+        body = body if isinstance(body, str) else ""
+        snip = re.sub(r"\s+", " ", (r.get("snippet") or "")).strip()[:220]
+        chunk = f"・{title}\n  {url}"
+        if snip:
+            chunk += f"\n  {snip}"
+        if body:
+            chunk += f"\n  [本文]\n  {body}"
+        lines.append(chunk)
+    return "\n【Web検索結果+本文(検索クエリ: " + q + ")】\n" + "\n".join(lines)
+
+
+# 会話文脈が短い場合も「絶対Web検索経由」にするため、除外条件は設けない
+def needs_web_search(text: str) -> bool:
+    """この発言にWeb検索が必要かを判定する。
+
+    方針: **常に検索する**(挨拶や短い発言でも検索する)。
+    検索クエリが有効(2文字以上)でない場合のみ実行を見送る。
+    """
+    q = build_search_query(text)
+    return len(q) >= 2
+
+
+async def web_context_for_message(text: str, user_id: int = 0,
+                                  timeout: float = 5.0) -> str:
+    """メッセージに対してWeb検索コンテキストを返す(失敗しても応答は止めない)。"""
+    if not needs_web_search(text or ""):
+        return ""
+    try:
+        return await web_context(text, 5, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"Web検索コンテキスト生成に失敗: {exc}")
+        return ""
+
+
+def build_user_context(user_id: int) -> str:
+    """話者のプロフィール・記憶・発言履歴をAIへのコンテキストとしてまとめる。
+
+    「ユーザーは誰か」をAIが把握できるようにする(名前・好み・文体・過去の話題)。
+    """
+    if not user_id:
+        return ""
+    parts: list[str] = []
+    prof = PROFILES.get(user_id)
+    if prof is not None and prof.msg_count:
+        topics = "、".join(list(prof.topics.keys())[:8]) or "—"
+        style = "、".join(list(prof.style_tags.keys())[:5]) or "—"
+        parts.append(f"【話者プロフィール】発言{prof.msg_count}回 / 好感度{prof.affection:.0f} / "
+                     f"信頼{prof.trust:.0f} / 話題: {topics} / 文体: {style}")
+    # ユーザーに関する記憶
+    try:
+        nodes = MEMORY.recall_for_user(user_id, 6)
+        if nodes:
+            mem = " / ".join(n.text[:90] for n in nodes)
+            parts.append(f"【このユーザーに関する記憶】{mem}")
+    except Exception:  # noqa: BLE001
+        pass
+    # 最近のこのユーザーの発言(直近のログ把握)
+    try:
+        recent = MSGINDEX.recent_by_author(user_id, 5)
+        if recent:
+            hist = " / ".join(f"{r['content'][:60]}" for r in recent)
+            parts.append(f"【このユーザーの直近の発言】{hist}")
+    except Exception:  # noqa: BLE001
+        pass
+    if not parts:
+        return ""
+    return "\n" + "\n".join(parts)
+
+
 # --- キー不要の無料パブリックAPIカタログ --------------------------------------
 async def api_weather(city: str) -> str:
     """Open-Meteo (APIキー不要) による天気予報。"""
@@ -3288,11 +3453,27 @@ class MusicManager:
         self.queues: dict[int, list[dict]] = defaultdict(list)
         self.now: dict[int, dict] = {}
         self.history: dict[int, list[dict]] = defaultdict(list)
+        # ループ/シャッフルはサーバー(guild)単位に持つ(以前は全体共有だった)
+        self.opts: dict[int, dict] = defaultdict(lambda: {"loop": False, "shuffle": False})
         self.loop = False
         self.shuffle = False
         self.volume = 60
         self.position = 0
         self.started = 0.0
+
+    def get_opt(self, guild: int, name: str) -> bool:
+        """サーバー単位の再生オプション(ループ/シャッフル)を取得。"""
+        return bool(self.opts[guild][name])
+
+    def set_opt(self, guild: int, name: str, value: bool) -> bool:
+        """サーバー単位の再生オプションを設定し、新しい値を返す。"""
+        self.opts[guild][name] = bool(value)
+        return bool(value)
+
+    def toggle_opt(self, guild: int, name: str) -> bool:
+        """サーバー単位の再生オプションを反転し、新しい値を返す。"""
+        self.opts[guild][name] = not self.opts[guild][name]
+        return bool(self.opts[guild][name])
 
     def add(self, guild: int, track: dict) -> int:
         self.queues[guild].append(track)
@@ -3302,10 +3483,13 @@ class MusicManager:
         return len(self.queues[guild])
 
     def skip(self, guild: int) -> dict | None:
-        self.history[guild].append(self.now.get(guild, {}))
+        """再生中の曲を終わりにして次へ進める(キューが空ならループ時は履歴から再生)。"""
+        cur = self.now.get(guild)
+        if cur:
+            self.history[guild].append(cur)
         if self.queues[guild]:
             nxt = self.queues[guild].pop(0)
-        elif self.loop and self.history[guild]:
+        elif self.get_opt(guild, "loop") and self.history[guild]:
             nxt = self.history[guild].pop(0)
         else:
             nxt = None
@@ -3316,6 +3500,7 @@ class MusicManager:
     def stop(self, guild: int):
         self.now.pop(guild, None)
         self.queues[guild].clear()
+        self.history[guild].clear()
 
     def state(self, guild: int) -> dict:
         cur = self.now.get(guild)
@@ -3326,7 +3511,9 @@ class MusicManager:
         filled = int(bar_len * ratio)
         bar = "▬" * filled + "▭" * (bar_len - filled)
         return {"current": cur, "queue": list(self.queues[guild]), "elapsed": elapsed,
-                "total": total, "bar": bar, "loop": self.loop, "shuffle": self.shuffle,
+                "total": total, "bar": bar,
+                "loop": self.get_opt(guild, "loop"),
+                "shuffle": self.get_opt(guild, "shuffle"),
                 "volume": self.volume}
 
     def render_waveform(self, seed: str = "", bars: int = 32) -> str:
@@ -3544,8 +3731,23 @@ class VoicePlayer:
         self.log: deque = deque(maxlen=40)
 
     @staticmethod
-    def ffmpeg_available() -> bool:
-        return shutil.which("ffmpeg") is not None
+    def ffmpeg_path() -> str | None:
+        """利用可能な FFmpeg のパスを返す(システム → imageio-ffmpeg同梱版)。"""
+        exe = shutil.which("ffmpeg")
+        if exe:
+            return exe
+        try:
+            import imageio_ffmpeg
+            bundled = imageio_ffmpeg.get_ffmpeg_exe()
+            if bundled and os.path.exists(bundled):
+                return bundled
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    @classmethod
+    def ffmpeg_available(cls) -> bool:
+        return cls.ffmpeg_path() is not None
 
     async def join(self, channel) -> tuple[bool, str]:
         """ボイスチャンネルへ接続する。"""
@@ -3574,7 +3776,7 @@ class VoicePlayer:
         try:
             with open(path, "wb") as fh:
                 fh.write(wav_bytes)
-            source = discord.FFmpegOpusAudio(path)
+            source = discord.FFmpegOpusAudio(path, executable=self.ffmpeg_path())
             source.volume = self.volume
             client.play(source, after=lambda e: self._after(guild_id, e))
             self.tracks[guild_id] = {"title": title, "started": time.time()}
@@ -3596,7 +3798,7 @@ class VoicePlayer:
         if not url:
             return False, "⚠️ 再生可能な音源URLがありません。"
         try:
-            source = discord.FFmpegOpusAudio(url)
+            source = discord.FFmpegOpusAudio(url, executable=self.ffmpeg_path())
             source.volume = self.volume
             client.play(source, after=lambda e: self._after(guild_id, e))
             self.tracks[guild_id] = {"title": title, "started": time.time()}
@@ -3728,6 +3930,128 @@ class SongPlayer:
 
 
 SONG = SongPlayer()
+
+
+# --- Discord完結の音楽プレイヤー(キュー + 実再生 + 自動送り戻し) --------------
+class RadioPlayer:
+    """Discord上で完結する音楽プレイヤー。
+
+    - キュー管理(追加 / スキップ / 停止 / ループ / シャッフル)
+    - ボイス実再生(試聴音源 or 合成WAV)
+    - 1曲終わったら自動で次へ送る(自動送り戻し)
+    - Embed + コントロールボタンで完結する
+    """
+
+    def __init__(self, voice: VoicePlayer, music: MusicManager):
+        self.voice = voice
+        self.music = music
+        self.sources: dict[int, dict] = {}   # guild -> {"track":..., "url":...}
+
+    # ---- 音源の解決(試聴URL or 合成WAV) --------------------------------
+    @staticmethod
+    async def _resolve_source(track: dict) -> tuple[str | None, bytes | None]:
+        """再生可能な(URL, 生成WAV)を得る。実在の曲なら試聴URLを優先。"""
+        preview = track.get("preview_url") or ""
+        if preview:
+            return preview, None
+        try:
+            wav = await asyncio.to_thread(MUSIC.compose, track, 8.0)
+            return None, wav["wav"]
+        except Exception as exc:  # noqa: BLE001
+            LOG.warn(f"音源合成に失敗: {exc}")
+            return None, None
+
+    # ---- 再生 -------------------------------------------------------
+    async def play_track(self, guild_id: int, track: dict) -> tuple[bool, str]:
+        """1曲をボイスで再生する(キューへ追加して再生)。"""
+        client = self.voice.clients.get(guild_id)
+        if client is None:
+            return False, "⚠️ まずボイスチャンネルへ接続してください。"
+        if not self.voice.ffmpeg_available():
+            return False, "⚠️ FFmpeg が未導入のため生再生できません。"
+
+        url, wav_bytes = await self._resolve_source(track)
+        if not url and not wav_bytes:
+            return False, "⚠️ 再生できる音源を取得できませんでした。"
+        try:
+            if url:
+                source = discord.FFmpegOpusAudio(url, executable=self.voice.ffmpeg_path())
+            else:
+                path = os.path.join(CONFIG["DATA_DIR"], f"radio_{guild_id}.wav")
+                with open(path, "wb") as fh:
+                    fh.write(wav_bytes)
+                source = discord.FFmpegOpusAudio(path, executable=self.voice.ffmpeg_path())
+            source.volume = self.voice.volume
+            client.play(source, after=lambda e: self._after(guild_id, e))
+            self.sources[guild_id] = {"track": track}
+            self.voice.tracks[guild_id] = {"title": track.get("title", ""),
+                                           "started": time.time()}
+            return True, f"🎼 **{track.get('title', '')}** の再生を開始しました。"
+        except Exception as exc:  # noqa: BLE001
+            LOG.warn(f"Radio play failed: {exc}")
+            return False, f"⚠️ 再生に失敗しました: {exc}"
+
+    async def enqueue(self, guild_id: int, track: dict) -> tuple[bool, str]:
+        """キューへ追加し、何も再生中なら即座に再生する。"""
+        self.music.queues[guild_id].append(track)
+        if not self.music.now.get(guild_id):
+            self.music.set_now(guild_id, self.music.queues[guild_id].pop(0))
+        if self.voice.clients.get(guild_id):
+            return await self.play_track(guild_id, self.music.now[guild_id])
+        return True, f"📋 キューに追加しました(残り{len(self.music.queues[guild_id])}曲)"
+
+    def _after(self, guild_id: int, error=None):
+        """1曲終了 → 自動で次を送る。"""
+        if error:
+            LOG.warn(f"Voice playback error: {error}")
+        self.voice.tracks.pop(guild_id, None)
+        nxt = self.music.skip(guild_id)
+        if not nxt:
+            return
+        # 自動送り戻し(Discordのイベントループ上で実行)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._play_next(guild_id, nxt))
+
+    async def _play_next(self, guild_id: int, track: dict):
+        if not self.voice.clients.get(guild_id):
+            return
+        await self.play_track(guild_id, track)
+
+    async def skip(self, guild_id: int) -> str:
+        """再生中の曲を飛ばして次へ。"""
+        client = self.voice.clients.get(guild_id)
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.stop()
+        nxt = self.music.skip(guild_id)
+        if not nxt:
+            return "⏭️ スキップ: 再生終了(キューも空です)"
+        if self.voice.clients.get(guild_id):
+            await self.play_track(guild_id, nxt)
+        return f"⏭️ スキップ: **{nxt.get('title', '')}**"
+
+    async def stop(self, guild_id: int) -> str:
+        """再生を停止し、キューも空にする。"""
+        client = self.voice.clients.get(guild_id)
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.stop()
+        self.music.stop(guild_id)
+        self.voice.tracks.pop(guild_id, None)
+        return "⏹️ 再生を停止しました。"
+
+    def state(self, guild_id: int) -> dict:
+        st = self.music.state(guild_id)
+        vs = self.voice.state(guild_id)
+        st["voice_connected"] = vs["connected"]
+        st["playing"] = vs["playing"]
+        return st
+
+
+RADIO = RadioPlayer(VOICE, MUSIC)
 
 
 def _preview_filename(url: str) -> str:
@@ -5453,6 +5777,8 @@ class TicTacToeView(discord.ui.View):
 
 
 class MusicControlView(discord.ui.View):
+    """音楽コントロール(実再生・キュー・サーバー単位設定)。"""
+
     def __init__(self, guild_id: int):
         super().__init__(timeout=None)
         self.gid = guild_id
@@ -5460,28 +5786,39 @@ class MusicControlView(discord.ui.View):
     @discord.ui.button(label="⏭️ スキップ", style=discord.ButtonStyle.primary, row=0)
     async def skip(self, i, b):
         await i.response.defer()
-        nxt = MUSIC.skip(self.gid)
-        await i.followup.send(f"⏭️ スキップ: {nxt['title'] if nxt else '再生終了'}")
+        await i.followup.send(await RADIO.skip(self.gid))
 
     @discord.ui.button(label="🔁 ループ", style=discord.ButtonStyle.secondary, row=0)
     async def loop(self, i, b):
-        MUSIC.loop = not MUSIC.loop
+        val = MUSIC.toggle_opt(self.gid, "loop")
         await i.response.defer()
-        await i.followup.send(f"🔁 ループ: {'ON' if MUSIC.loop else 'OFF'}")
+        await i.followup.send(f"🔁 ループ: {'ON' if val else 'OFF'}")
 
     @discord.ui.button(label="🔀 シャッフル", style=discord.ButtonStyle.secondary, row=0)
     async def shuffle(self, i, b):
-        MUSIC.shuffle = not MUSIC.shuffle
-        if MUSIC.shuffle:
+        val = MUSIC.toggle_opt(self.gid, "shuffle")
+        if val:
             random.shuffle(MUSIC.queues[self.gid])
         await i.response.defer()
-        await i.followup.send(f"🔀 シャッフル: {'ON' if MUSIC.shuffle else 'OFF'}")
+        await i.followup.send(f"🔀 シャッフル: {'ON' if val else 'OFF'}")
 
     @discord.ui.button(label="⏹️ 停止", style=discord.ButtonStyle.danger, row=0)
     async def stop(self, i, b):
-        MUSIC.stop(self.gid)
         await i.response.defer()
-        await i.followup.send("⏹️ 再生を停止しました。")
+        await i.followup.send(await RADIO.stop(self.gid))
+
+    @discord.ui.button(label="📋 キュー", style=discord.ButtonStyle.secondary, row=1)
+    async def queue(self, i, b):
+        await i.response.defer()
+        st = RADIO.state(self.gid)
+        cur = st.get("current") or {}
+        q = st.get("queue") or []
+        lines = [f"・**{t.get('title', '')}** / {t.get('artist', '')}" for t in q[:10]]
+        body = (f"♪ **再生中**: {cur.get('title', 'なし')} / {cur.get('artist', '')}\n"
+                f"`{st.get('bar', '')}` {st.get('elapsed', 0)}s / {st.get('total', 0)}s\n"
+                f"📋 待機: {len(q)}曲\n" + ("\n".join(lines) if lines else "待機中の曲なし"))
+        await i.followup.send(f"🎵 **再生キュー**\n{body}",
+                              embed=make_embed("POCHI Radio", "", 0x1DB954))
 
 
 class AmbientDashboardView(discord.ui.View):
@@ -5925,7 +6262,7 @@ async def synthesize_voice(text: str, speaker: int = 3) -> bytes | None:
     return None
 
 
-async def _fetch_link_context(url: str) -> str:
+async def _fetch_link_context(url: str, body_limit: int = 4000) -> str:
     """URL 1件の外部コンテキストを取得(YouTube字幕 / PDF / Web本文)。"""
     yt = re.search(r"(?:v=|youtu\.be/|shorts/)([a-zA-Z0-9_-]{11})", url)
     if yt and HAS_YT:
@@ -5946,22 +6283,24 @@ async def _fetch_link_context(url: str) -> str:
         except Exception:  # noqa: BLE001
             pass
         return ""
-    body = await fetch_article(url, 1400)
+    body = await fetch_article(url, body_limit)
     return f"\n【Web抜粋 {url[:60]}】\n{body}\n" if body else ""
 
 
-async def extract_link_context(text: str, timeout: float = 6.0) -> str:
+async def extract_link_context(text: str, timeout: float = 6.0,
+                               max_urls: int = 3, body_limit: int = 4000) -> str:
     """本文中のURLを解析して外部コンテキスト(本文/字幕/PDF)を取得。
 
-    URLは並列取得し、全体の待ち時間にも上限を設ける(返信遅延の_main原因だった)。
+    URLは並列取得し、全体の待ち時間にも上限を設ける(返信遅延の main 原因だった)。
+    body_limit で「URLの中身をどれだけ含めるか」を調整する。
     """
     urls = re.findall(r"https?://[^\s<>\"]+|www\.[^\s<>\"]+", text or "")
     if not urls:
         return ""
-    targets = [(u if u.startswith("http") else "http://" + u) for u in urls[:3]]
+    targets = [(u if u.startswith("http") else "http://" + u) for u in urls[:max_urls]]
     try:
         parts = await asyncio.wait_for(
-            asyncio.gather(*[_fetch_link_context(u) for u in targets],
+            asyncio.gather(*[_fetch_link_context(u, body_limit) for u in targets],
                            return_exceptions=True),
             timeout=timeout)
     except asyncio.TimeoutError:
@@ -6993,7 +7332,10 @@ async def execute_modal_action(ch, guild, ctx_mock, action: str, vals: list[str]
             await interaction.followup.send(await api_ddg_news(v0))
         elif action == "mod_url_deep":
             await interaction.followup.send("🌐 URLを解析中...")
-            ext = await extract_link_context(v0)
+            # URLの中身は本文をほぼ全文まで取得して解析する
+            ext = await extract_link_context(v0, timeout=8.0)
+            if not ext:
+                ext = await web_context_full(v0, 3, timeout=8.0)
             res = await asyncio.to_thread(
                 call_ai, get_state(ch.id),
                 f"以下のURL内容を3行要約・重要論点・背景解説にまとめろ:\nURL: {v0}\n{ext}")
@@ -7670,7 +8012,7 @@ async def radio(ctx, *, title: str = "POCHI Radio Theme"):
 
 @bot.command(name="play", aliases=["制定的曲", "音楽再生"])
 async def play(ctx, *, query: str = ""):
-    """指定した曲を実際に再生する(iTunes検索 → ボイス実再生 / リンク提示)。"""
+    """指定した曲を実際に再生する(iTunes検索 → ボイス実再生 / キュー追加)。"""
     if not query.strip():
         return await ctx.send("⚠️ `!play <曲名>` (例: `!play 夜に駆ける`)")
     gid = ctx.guild.id if ctx.guild else 0
@@ -7681,9 +8023,16 @@ async def play(ctx, *, query: str = ""):
             with contextlib.suppress(Exception):
                 await VOICE.join(vc)
     msg, track = await SONG.play(ctx.channel, gid, query)
-    await ctx.send(msg)
+    if not track:
+        return await ctx.send(msg)
+    # 実在の曲でボイス接続済みなら、キューへ追加して実再生する
+    if track.get("preview_url") and VOICE.clients.get(gid):
+        await RADIO.enqueue(gid, track)
+        await ctx.send(msg, view=MusicControlView(gid))
+        return
+    await ctx.send(msg, view=MusicControlView(gid))
     # ボイス未接続でも「聴ける」ように試聴音源を添付する
-    if track and track.get("preview_url") and not VOICE.clients.get(gid):
+    if track.get("preview_url"):
         data = await FastHTTP.get_bytes(track["preview_url"], timeout_sec=30.0)
         if data:
             await ctx.send(f"🎧 **試聴音源**: {track['title']} / {track['artist']}",
@@ -8132,17 +8481,28 @@ async def on_message(message):
                         *(download_attachment_as_pil(a) for a in img_atts),
                         return_exceptions=True)
                     valid_imgs = [im for im in got if im is not None and not isinstance(im, BaseException)]
-                link_ctx = await extract_link_context(raw) if raw else ""
+                # 外部コンテキスト(リンク解析・Web検索)は並列取得する
+                # (逐次だと応答が遅くなるため、全部まとめて待つ)
+                link_ctx, web_ctx = await asyncio.gather(
+                    extract_link_context(raw) if raw else "",
+                    web_context_for_message(raw, message.author.id),
+                    return_exceptions=True)
+                if isinstance(link_ctx, BaseException):
+                    link_ctx = ""
+                if isinstance(web_ctx, BaseException):
+                    web_ctx = ""
                 ref = message.reference
                 reply_ctx = ""
                 if ref is not None and getattr(ref, "resolved", None) is not None:
                     reply_ctx = (f"【返信対象 ({ref.resolved.author.display_name})】: "
                                  f"{ref.resolved.clean_content[:400]}\n")
-                # 深層記憶の近傍取得
-                mem_refs = MEMORY.recall(raw or " ", 3)
+                # 深層記憶の近傍取得(同期処理なのでスレッドへ逃がしてループを止めない)
+                mem_refs = await asyncio.to_thread(MEMORY.recall, raw or " ", 3)
                 mem_ctx = ("\n【記憶の近傍】" + " / ".join(n.text[:80] for n, _ in mem_refs)) if mem_refs else ""
+                # 話者のプロフィール(誰と話しているか把握するため)
+                user_ctx = await asyncio.to_thread(build_user_context, message.author.id)
                 in_txt = (f"{reply_ctx}【発言者: {message.author.display_name}】\n"
-                          + (raw or "画像を分析して。") + link_ctx + mem_ctx)
+                          + (raw or "画像を分析して。") + link_ctx + web_ctx + user_ctx + mem_ctx)
 
                 council = await COUNCIL.deliberate(raw, st, mem_ctx)
                 clone_prompt = cloned_targets[cid]["prompt"] if is_cloned else None
@@ -9649,10 +10009,13 @@ async def _chat_reply(room_id: str, text: str, author: str, mode: str, persona: 
         }.get(style, "")
         has_key = bool(CONFIG["GEMINI_KEYS"] or CONFIG["GROQ_KEYS"] or CONFIG["OPENROUTER_KEYS"])
         engine = "gemini" if has_key else "local"
+        # Web検索は常に経由する(並列で取得して遅延を抑える)
+        web_ctx = await web_context_for_message(text, timeout=5.0)
         if has_key:
             prompt = (f"{CHAT_SYSTEM_HINT}\n{style_hint}\n"
                       f"会話履歴:\n{convo}\n"
                       f"今 {author} が言った: 「{text}」\n"
+                      f"{web_ctx}\n"
                       f"POCHI としての返信を1つ出力してください。")
             council = await COUNCIL.deliberate(text, state)
             res = await asyncio.to_thread(call_ai, state, prompt, False, None, council)
@@ -11833,6 +12196,34 @@ class MessageIndex:
                  "ts": datetime.fromtimestamp(r["ts"], JST).strftime("%m-%d %H:%M")}
                 for r in rows]
 
+    def recent_by_author(self, author: int, limit: int = 5) -> list[dict]:
+        """特定ユーザーの直近の発言を取得する(「過去のログ把握」用)。"""
+        if not author:
+            return []
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM msg_index WHERE author=? ORDER BY ts DESC LIMIT ?",
+                (author, limit)).fetchall()
+        return [{"author": r["author"], "content": r["content"][:200],
+                 "channel": r["channel"],
+                 "ts": datetime.fromtimestamp(r["ts"], JST).strftime("%m-%d %H:%M")}
+                for r in rows]
+
+    def author_stats(self, author: int) -> dict:
+        """特定ユーザーの発言集計(把握のためのサマリー)。"""
+        if not author:
+            return {}
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) c, MIN(ts) first, MAX(ts) last, "
+                "COUNT(DISTINCT channel) ch FROM msg_index WHERE author=?",
+                (author,)).fetchone()
+        if not row or not row["c"]:
+            return {}
+        return {"messages": row["c"], "channels": row["ch"],
+                "first": datetime.fromtimestamp(row["first"], JST).strftime("%Y-%m-%d"),
+                "last": datetime.fromtimestamp(row["last"], JST).strftime("%Y-%m-%d")}
+
     def stats(self) -> dict:
         with self.lock:
             row = self.conn.execute(
@@ -11972,9 +12363,9 @@ LIMITER = RateLimiter()
 #  使いやすさ(ヘルプ/設定) と 新コマンド
 # =============================================================================
 HELP_CATEGORIES = {
-    "会話": ["menu", "mode", "persona", "engine", "profile", "recall", "remember", "status"],
+    "会話": ["menu", "mode", "persona", "engine", "profile", "user", "recall", "remember", "status"],
     "AIチャット": ["chat", "chatjoin", "chatsend", "chatlog", "chatlist"],
-    "知識・検索": ["wiki", "search", "apis", "modsearch"],
+    "知識・検索": ["wiki", "search", "read", "apis", "modsearch"],
     "変換・計算": ["calc", "unit", "tzone", "ascii", "markdown", "textstat", "palette", "dns"],
     "外部API": ["weather", "wikiimages", "steam", "rss", "translate", "qr", "mod"],
     "経済": ["balance", "shop", "work", "daily", "pay", "leaderboard", "market", "gamble"],
@@ -12258,6 +12649,58 @@ async def search(ctx, *, query: str = ""):
         return await ctx.send(f"🔍 『{query}』に一致する発言はありません。")
     lines = [f"・<@{h['author']}> {h['content'][:120]} ({h['ts']})" for h in hits]
     await ctx.send(f"🔍 **検索結果: {query}** ({len(hits)}件)\n" + "\n".join(lines))
+
+
+@bot.command(name="read", aliases=["url", "网页", "記事"])
+async def read_url(ctx, *, url: str = ""):
+    """URLの中身(本文)をほぼ全文まで読み取って表示する。"""
+    u = (url or "").strip()
+    if not u:
+        return await ctx.send("⚠️ `!read <URL>`")
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    await ctx.send(f"🌐 **読み取り中**: {u}")
+    body = await fetch_article_full(u, 12000)
+    if not body:
+        return await ctx.send(f"⚠️ 『{u}』の内容を取得できませんでした。")
+    head = f"🌐 **{u}**\n📄 {len(body)}文字\n"
+    for idx, chunk in enumerate(smart_chunks(body, 1800)):
+        await ctx.send((head if idx == 0 else "") + chunk)
+        head = ""
+
+
+@bot.command(name="user", aliases=["ユーザー", "プロフィール"])
+async def user_info(ctx, *, member: str = ""):
+    """ユーザーのプロフィール・記憶・過去のログをまとめて把握する。"""
+    target = ctx.author
+    if member.strip():
+        m = find_member(ctx.guild, member.strip()) if ctx.guild else None
+        if m is None:
+            return await ctx.send(f"⚠️ ユーザー『{member}』が見つかりません。")
+        target = m
+    uid = getattr(target, "id", 0)
+    prof = PROFILES.get(uid)
+    snap = prof.snapshot() if prof else {}
+    stats = MSGINDEX.author_stats(uid)
+    recent = MSGINDEX.recent_by_author(uid, 8)
+    mem = MEMORY.recall_for_user(uid, 8)
+    emb = make_embed(f"👤 {getattr(target, 'display_name', '不明')}", "", 0x7C9CFF)
+    emb.add_field(name="発言数", value=f"`{snap.get('messages', stats.get('messages', 0))}`", inline=True)
+    emb.add_field(name="初回 / 最終", value=f"{stats.get('first', '—')} / {stats.get('last', '—')}", inline=True)
+    emb.add_field(name="好感度 / 信頼", value=f"`{snap.get('affection', '—')}` / `{snap.get('trust', '—')}`", inline=True)
+    emb.add_field(name="平均感情価", value=f"`{snap.get('valence', '—')}`", inline=True)
+    emb.add_field(name="話題", value=("、".join(snap.get("top_topics", [])[:8]) or "—")[:1000], inline=False)
+    emb.add_field(name="文体タグ", value=("、".join(snap.get("style", {}).keys()) or "—")[:500], inline=False)
+    if snap.get("flags"):
+        emb.add_field(name="フラグ", value="、".join(snap["flags"])[:200], inline=False)
+    if mem:
+        emb.add_field(name="記憶している内容",
+                     value=(" / ".join(n.text[:90] for n in mem))[:1000], inline=False)
+    if recent:
+        emb.add_field(name="直近の発言",
+                     value=("\n".join(f"・{r['content'][:100]} ({r['ts']})" for r in recent))[:1000],
+                     inline=False)
+    await ctx.send(embed=emb)
 
 
 @bot.command()
