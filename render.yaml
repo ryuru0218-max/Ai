@@ -22,3 +22,7 @@ services:
         sync: false
       - key: POCHI_YT_COOKIES
         sync: false
+      - key: POCHI_MODEL
+        value: gemini-3.8-flash-lite
+      - key: POCHI_MODEL_PRO
+        value: gemini-3.8-flash

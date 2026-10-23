@@ -70,6 +70,14 @@ GET  /api/chat/rooms/{id}/export         Markdown書き出し
 > `gemini/xxx: empty` のようなエラーは「APIキーの無効」「利用上限」「モデル名の不一致」の
 > いずれかが原因です。`!ai` で原因を特定できます。
 > 起動時の `preflight` でも同じ確認を行い、問題があれば起動ログに明示します。
+>
+> **既定モデル**: `gemini-3.8-flash-lite`（高精度は `gemini-3.8-flash`）。
+> `POCHI_MODEL` / `POCHI_MODEL_PRO` / `POCHI_MODEL_FALLBACKS` で変更できます。
+>
+> **自動リカバリ**: APIが返す利用可能モデル一覧と照合してモデル名を自動補正し、
+> `system_instruction` 非対応のモデルでは指示を本文へ埋め込んで再試行します。
+> それでも空の場合は REST API（`v1beta`→`v1`）を直接叩きます。
+> `POCHI_GEMINI_API_VERSION` で REST のバージョンを固定できます。
 
 ### 調べる・把握する
 

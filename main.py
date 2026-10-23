@@ -748,12 +748,14 @@ CONFIG = {
     "PORT": int(os.environ.get("PORT", "8080")),
     "DATA_DIR": os.environ.get("POCHI_DATA_DIR", os.path.join(os.getcwd(), "pochi_data")),
     "PLUGIN_DIR": os.environ.get("POCHI_PLUGIN_DIR", os.path.join(os.getcwd(), "pochi_plugins")),
-    "MODEL": os.environ.get("POCHI_MODEL", "gemini-2.5-flash"),
-    "MODEL_PRO": os.environ.get("POCHI_MODEL_PRO", "gemini-2.5-pro"),
+    "MODEL": os.environ.get("POCHI_MODEL", "gemini-3.8-flash-lite"),
+    "MODEL_PRO": os.environ.get("POCHI_MODEL_PRO", "gemini-3.8-flash"),
+    # Gemini REST の API バージョン(v1beta / v1)
+    "GEMINI_API_VERSION": os.environ.get("POCHI_GEMINI_API_VERSION", "v1beta"),
     # 実在するモデルのみを既定値にする(存在しない名前だと必ず空応答になる)
     "MODEL_FALLBACKS": [m for m in os.environ.get(
         "POCHI_MODEL_FALLBACKS",
-        "gemini-2.5-flash-lite,gemini-2.0-flash,gemini-2.5-pro").split(",") if m],
+        "gemini-3.8-flash,gemini-3.5-flash-lite,gemini-2.5-flash").split(",") if m],
     "MAX_CONCURRENCY": int(os.environ.get("POCHI_MAX_CONCURRENCY", "6")),
     "AI_TIMEOUT": float(os.environ.get("POCHI_AI_TIMEOUT", "45")),
     "AI_TOTAL_TIMEOUT": float(os.environ.get("POCHI_AI_TOTAL_TIMEOUT", "60")),
@@ -2335,36 +2337,225 @@ def _openai_chat(url: str, key: str, model: str, system: str, user: str,
 def _gemini_call(model_name: str, key: str, system: str, user: str,
                  history: list | None = None, has_image: bool = False,
                  timeout: float = 30.0) -> str:
+    """Gemini呼び出し。空応答時に原因を記録し、system_instruction非対応モデルにも対応する。"""
     if not HAS_GENAI:
+        _record_ai_error(model_name, "google-generativeai が未導入")
         return ""
     # 実リクエストにタイムアウトを適用する(応答遅延の main 原因だった)
     req_opts = {"timeout": int(max(5, timeout))}
-    try:
+
+    def _once(with_system: bool) -> str:
+        """1回分のリクエスト。with_system=False では指示を本文へ埋め込む。"""
         genai.configure(api_key=key)
-        model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=system,
-            generation_config={"temperature": 0.85, "top_p": 0.95, "max_output_tokens": 2500})
+        kw = {"generation_config": {"temperature": 0.85, "top_p": 0.95,
+                                    "max_output_tokens": 2500}}
+        sys_text = system or ""
+        body = user
+        if with_system:
+            kw["system_instruction"] = sys_text
+        elif sys_text:
+            body = f"{sys_text}\n\n{user}"
+        model = genai.GenerativeModel(model_name=model_name, **kw)
         if has_image:
             try:
-                res = model.generate_content(user, request_options=req_opts)
+                res = model.generate_content(body, request_options=req_opts)
             except TypeError:
-                res = model.generate_content(user)
+                res = model.generate_content(body)
         else:
             chat = model.start_chat(history=list(history or []))
             try:
-                res = chat.send_message(user, request_options=req_opts)
+                res = chat.send_message(body, request_options=req_opts)
             except TypeError:
-                res = chat.send_message(user)
+                res = chat.send_message(body)
         text = getattr(res, "text", "") or ""
         if not text.strip():
-            # ブロック/空応答の場合、理由を出力して原因を追えるようにする
             reason = _gemini_block_reason(res)
-            LOG.warn(f"Gemini({model_name}) が空応答を返しました: {reason}")
+            _record_ai_error(model_name, f"空応答({reason})")
+            LOG.warn(f"Gemini({model_name}) が空応答を返しました: {reason}"
+                     f" [system_instruction={with_system}]")
         return text
+
+    try:
+        text = _once(True)
     except Exception as exc:  # noqa: BLE001
+        # 実際の例外(404: モデル不在 / 403: キー無効 等)を記録する
+        _record_ai_error(model_name, _short_api_error(exc))
         LOG.warn(f"Gemini({model_name}) エラー: {exc}")
+        text = ""
+    if text.strip():
+        return text
+    # 空応答/例外時の保険: system_instruction を使わずに一度だけ再試行
+    # (system_instruction非対応のモデル・SDKで『empty』になる事例への対策)
+    try:
+        text2 = _once(False)
+        if text2.strip():
+            return text2
+    except Exception as exc:  # noqa: BLE001
+        _record_ai_error(model_name, _short_api_error(exc))
+        LOG.warn(f"Gemini({model_name}) 再試行エラー: {exc}")
+    # 最後の保険: REST API を直接叩く(SDK非対応の新モデル・v1/v1beta差異への対策)
+    for api_ver in (CONFIG.get("GEMINI_API_VERSION", "v1beta"), "v1"):
+        rest = _gemini_rest_call(model_name, key, system, user, history,
+                                 has_image, timeout, api_ver)
+        if rest.strip():
+            LOG.info(f"Gemini({model_name}) を REST({api_ver}) で取得しました")
+            return rest
+    return ""
+
+
+def _gemini_rest_call(model_name: str, key: str, system: str, user: str,
+                      history: list | None = None, has_image: bool = False,
+                      timeout: float = 30.0, api_version: str = "v1beta") -> str:
+    """Gemini REST API を直接呼ぶフォールバック(SDKで空応答になる場合の保険)。"""
+    if not HAS_REQUESTS:
         return ""
+    url = (f"https://generativelanguage.googleapis.com/{api_version}/models/"
+           f"{quote(model_name)}:generateContent")
+    contents: list[dict] = []
+    for h in (history or [])[-8:]:
+        try:
+            txt = h.parts[0].text if hasattr(h, "parts") and h.parts else ""
+            role = "model" if getattr(h, "role", "") == "model" else "user"
+            if txt:
+                contents.append({"role": role, "parts": [{"text": txt}]})
+        except Exception:  # noqa: BLE001
+            continue
+    contents.append({"role": "user", "parts": [{"text": user}]})
+    payload: dict = {"contents": contents,
+                     "generationConfig": {"temperature": 0.85, "topP": 0.95,
+                                          "maxOutputTokens": 2500}}
+    if system:
+        payload["systemInstruction"] = {"parts": [{"text": system}]}
+    try:
+        r = requests.post(url, params={"key": key}, json=payload, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            cands = data.get("candidates") or []
+            for c in cands:
+                parts = (c.get("content") or {}).get("parts") or []
+                txt = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+                if txt.strip():
+                    return txt.strip()
+            pf = data.get("promptFeedback") or {}
+            reason = pf.get("blockReason") or (cands[0].get("finishReason") if cands else "")
+            _record_ai_error(model_name, f"空応答(REST {api_version} {reason or 'unknown'})")
+            return ""
+        _record_ai_error(model_name,
+                         _short_api_error(RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")))
+        LOG.warn(f"Gemini REST({api_version}) HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as exc:  # noqa: BLE001
+        _record_ai_error(model_name, _short_api_error(exc))
+        LOG.warn(f"Gemini REST({api_version}) エラー: {exc}")
+    return ""
+
+
+def _ai_friendly_error(res: "AIResponse") -> str:
+    """AIResponse がエラーのとき、ユーザー向けの短い案内を返す(長文ダンプを防ぐ)。"""
+    if not res.meta.get("error"):
+        return ""
+    cause = ""
+    with _AI_ERR_LOCK:
+        for reason in _AI_LAST_ERRORS.values():
+            if reason:
+                cause = reason
+                break
+    short = cause.split(":")[0] if cause else ""
+    body = f"⚠️ AIに接続できませんでした（{short or '原因不明'}）"
+    body += "\n💡 `!ai` で接続診断を確認してください（キー・モデル名・利用上限）。"
+    return body
+
+
+def _short_api_error(exc: Exception) -> str:
+    """API例外を短く読みやすい文言へ整形する(原因特定用)。"""
+    s = str(exc)
+    low = s.lower()
+    if "not found" in low or "404" in low:
+        return f"モデルが存在しません(404): {s[:140]}"
+    if "api key" in low or "api_key" in low or "401" in low or "403" in low:
+        return f"APIキーが無効/権限なし: {s[:140]}"
+    if "quota" in low or "429" in low or "resource_exhausted" in low:
+        return f"利用上限(クォータ)に達しました: {s[:140]}"
+    if "timeout" in low or "timed out" in low:
+        return f"タイムアウト: {s[:140]}"
+    return s[:160]
+
+
+# 直近のAIエラー(モデル名 -> 理由)。「empty」だけでは原因不明なため実因を保持する。
+_AI_LAST_ERRORS: dict[str, str] = {}
+_AI_ERR_LOCK = threading.RLock()
+# APIが返した利用可能モデル一覧(自動補正用・初回のみ取得)
+_AVAILABLE_MODELS: list[str] = []
+_MODEL_LIST_TRIED = False
+
+
+def _record_ai_error(model_name: str, reason: str) -> None:
+    """AI呼び出しの失敗理由を記録する(ユーザー向けメッセージに含める)。"""
+    with _AI_ERR_LOCK:
+        _AI_LAST_ERRORS[model_name] = reason
+
+
+def _ai_error_of(model_name: str) -> str:
+    with _AI_ERR_LOCK:
+        return _AI_LAST_ERRORS.get(model_name, "")
+
+
+def _list_gemini_models(key: str) -> list[str]:
+    """APIキーで利用可能なGeminiモデル名を取得する(自動補正用)。"""
+    global _AVAILABLE_MODELS, _MODEL_LIST_TRIED
+    if _AVAILABLE_MODELS or _MODEL_LIST_TRIED:
+        return _AVAILABLE_MODELS
+    if not HAS_GENAI:
+        return []
+    names: list[str] = []
+    try:
+        genai.configure(api_key=key)
+        for m in genai.list_models():
+            name = getattr(m, "name", "") or ""
+            methods = getattr(m, "supported_generation_methods", None) or []
+            if name.startswith("models/"):
+                name = name[len("models/"):]
+            if not name:
+                continue
+            if methods and "generateContent" not in methods:
+                continue
+            names.append(name)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warn(f"モデル一覧の取得に失敗: {exc}")
+        _MODEL_LIST_TRIED = True   # 毎回リトライして遅くしない
+        return []
+    # flash系を優先して並べる
+    names.sort(key=lambda n: (0 if "flash" in n else 1, len(n)))
+    _AVAILABLE_MODELS = names
+    _MODEL_LIST_TRIED = True
+    return names
+
+
+def ensure_valid_model(model: str) -> str:
+    """指定モデルがAPIで使えるか確認し、使えなければ近いモデルへ自動補正する。"""
+    if not HAS_GENAI or not GEMINI_POOL.keys:
+        return model
+    try:
+        avail = _list_gemini_models(GEMINI_POOL.keys[0])
+    except Exception:  # noqa: BLE001
+        return model
+    if not avail:
+        return model
+    if model in avail:
+        return model
+    # 前方一致 → 部分一致 の順で探す
+    base = model.split("-preview")[0]
+    for cand in avail:
+        if cand == base:
+            return cand
+    for cand in avail:
+        if base in cand or cand in model:
+            return cand
+    # flash-lite → flash → 先頭 の順でフォールバック
+    for key_part in ("flash-lite", "flash"):
+        for cand in avail:
+            if key_part in cand:
+                return cand
+    return avail[0] if avail else model
 
 
 def _gemini_block_reason(res) -> str:
@@ -2387,15 +2578,31 @@ def _gemini_block_reason(res) -> str:
 def _explain_ai_error(last_err: str, candidates: list) -> str:
     """AI失敗のメッセージに、原因と対処を明示する(毎回同じ「empty」になるのを防ぐ)。"""
     models = "、".join(f"{p}/{m}" for p, m, _f, _i in candidates)
+    # 実際のAPI失敗理由(404/キー無効/クォータ等)を集める
+    reasons: list[str] = []
+    for prov, m, _f, _i in candidates:
+        r = _ai_error_of(m)
+        if r and r not in reasons:
+            reasons.append(f"{m}: {r}")
     hint = ""
-    if GEMINI_POOL.keys and not GROQ_POOL.keys and not OPENROUTER_POOL.keys:
+    joined = " ".join(reasons)
+    if "404" in joined or "存在しません" in joined:
+        hint = (" | モデル名が API に存在しません。`!ai` で利用可能モデルを確認するか、"
+                "POCHI_MODEL に実在するモデル名を設定してください")
+    elif "APIキー" in joined or "401" in joined or "403" in joined:
+        hint = (" | APIキーが無効/権限なしです。「AI Studio」で有効なキーを再取得し、"
+                "GEMINI_API_KEY を設定してください")
+    elif "クォータ" in joined or "429" in joined:
+        hint = " | 利用上限(クォータ)に達しています。時間を置くか、別のキー/プランを利用してください"
+    elif GEMINI_POOL.keys and not GROQ_POOL.keys and not OPENROUTER_POOL.keys:
         hint = (" | APIキーの確認: GEMINI_API_KEY が未設定・無効・利用上限の可能性があります"
                 "(「AI Studio」で有効なキーを再取得して設定してください)")
     elif not (GEMINI_POOL.keys or GROQ_POOL.keys or OPENROUTER_POOL.keys):
         hint = " | APIキーが1つも設定されていません(ローカル推論で動作します)"
     else:
         hint = " | キー/利用上限/モデル名のいずれかが原因の可能性があります"
-    return f"{last_err} (試行: {models or 'なし'}){hint}"
+    detail = ("\n  原因: " + " / ".join(reasons)) if reasons else ""
+    return f"{last_err} (試行: {models or 'なし'}){hint}{detail}"
 
 
 def call_ai(state: dict, payload, is_bot_opponent: bool = False,
@@ -2438,11 +2645,13 @@ def call_ai(state: dict, payload, is_bot_opponent: bool = False,
         attempts.append(("local", "heuristic", lambda k: ""))
 
     if engine in ("gemini", "gemini_flash") or not attempts:
-        # 「-pro」等の実在しないモデルを既定にしない(必ず空応答になる)
+        # モデル名がAPIに存在しない場合は自動補正する(原因不明の「empty」を防ぐ)
         pref = CONFIG["MODEL"] if engine != "gemini_flash" else CONFIG.get("MODEL_PRO", CONFIG["MODEL"])
+        pref = ensure_valid_model(pref)
         for m in [pref] + [x for x in CONFIG["MODEL_FALLBACKS"] if x != pref]:
-            attempts.append(("gemini", m, (lambda mm: lambda k, t=ai_to: _gemini_call(
-                mm, k, system, user_text, hist, has_image, timeout=t))(m)))
+            attempts.append(("gemini", ensure_valid_model(m),
+                             (lambda mm: lambda k, t=ai_to: _gemini_call(
+                                 mm, k, system, user_text, hist, has_image, timeout=t))(ensure_valid_model(m))))
         if engine == "groq" and GROQ_POOL.available():
             attempts.append(("groq", "llama-3.3-70b-versatile",
                              lambda k, t=ai_to: _openai_chat("https://api.groq.com/openai/v1/chat/completions",
@@ -2455,22 +2664,40 @@ def call_ai(state: dict, payload, is_bot_opponent: bool = False,
                                                                     k, m, system, user_text, hist, timeout=t)))
 
     last_err = ""
-    # --- 試行: (プロバイダ, モデル, 呼び出しFn) を並列実行して最初の一件を採用 ---
-    # 逐次実行だと「遅いモデル」「失敗するモデル」で応答が直列に遅れていた。
+    # --- 試行: モデルを優先して多様化し、並列で最初の成功を採用 ---
+    # 重要: 同じモデルを複数キーで試すのではなく、**別モデルを先に試す**。
+    # (旧実装は2キーあると同一モデルを2回試してフォールバックしなかった)
     candidates: list[tuple[str, str, callable, int]] = []
+    seen_models: set[str] = set()
+    # 1周目: モデルごとに1キーずつ(フォールバックを確実に効かせる)
     for prov, model_name, fn in attempts:
+        if model_name in seen_models:
+            continue
         pool = {"gemini": GEMINI_POOL, "groq": GROQ_POOL, "openrouter": OPENROUTER_POOL}.get(prov)
         if pool is None or not pool.available():
             continue
-        # 異なるキーを使い回す(1つのキーが死んでも全部失敗にならないように)
         try:
-            picked = pool.pick_all(2)
+            idx, key = pool.pick()
         except RuntimeError:
             continue
-        for idx, key in picked:
-            candidates.append((prov, model_name, (lambda f, kk: (lambda: f(kk)))(fn, key), idx))
+        candidates.append((prov, model_name, (lambda f, kk: (lambda: f(kk)))(fn, key), idx))
+        seen_models.add(model_name)
         if len(candidates) >= 2:   # コストと並列度のバランス(最大2並列)
             break
+    # 2周目: まだ余力があり、同じプロバイダに別キーがあれば追加する
+    if len(candidates) < 2:
+        for prov, model_name, fn in attempts:
+            if len(candidates) >= 2:
+                break
+            pool = {"gemini": GEMINI_POOL, "groq": GROQ_POOL, "openrouter": OPENROUTER_POOL}.get(prov)
+            if pool is None or not pool.available():
+                continue
+            used = {c[3] for c in candidates if c[0] == prov}
+            for idx, key in pool.pick_all(len(pool.keys)):
+                if idx in used or len(candidates) >= 2:
+                    continue
+                candidates.append((prov, model_name,
+                                   (lambda f, kk: (lambda: f(kk)))(fn, key), idx))
 
     if candidates:
         def _run(item):
@@ -7056,7 +7283,11 @@ async def execute_direct_action(ch, guild, ctx_mock, action: str):
         elif action == "bunshun":
             res = await asyncio.to_thread(call_ai, get_state(cid),
                                           "極悪記者。痛い発言のスクープを書け。")
-            await ch.send(f"📰 **【週刊ポチ春】**\n{res.text}")
+            err = _ai_friendly_error(res)
+            if err:
+                await ch.send(f"📰 **【週刊ポチ春】**\n{err}")
+            else:
+                await ch.send(f"📰 **【週刊ポチ春】**\n{res.text}")
         elif action == "roulette":
             mems = [x for x in getattr(ch, "members", []) if not x.bot]
             if mems:
@@ -14258,6 +14489,9 @@ def offline_selfcheck() -> int:
     check("msgindex_author", lambda: MSGINDEX.author_stats(1) or "(none)")
     check("ai_error_explain", lambda: _explain_ai_error("gemini/x: empty", []))
     check("ai_model_valid", lambda: CONFIG["MODEL"] if not CONFIG["MODEL"].endswith("-pro") else "bad")
+    check("ai_err_record", lambda: (_record_ai_error("t", "x"), _ai_error_of("t"))[1])
+    check("ai_friendly_short",
+          lambda: len(_ai_friendly_error(AIResponse("e", "x", 0.0, {"error": True}))) < 200)
     check("yt_url_detect", lambda: is_youtube_url("https://youtu.be/abc123"))
     check("yt_prefers", lambda: SONG._prefers_youtube("https://youtube.com/watch?v=x"))
     check("gacha", lambda: len(gacha_pull(10)[0]))
