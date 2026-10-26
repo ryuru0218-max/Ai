@@ -1283,12 +1283,9 @@ async def on_message(message):
 
     raw_clean = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
 
-    # --- 「消すぞ」と言われた場合の優先処理（どの状態・モードよりも完全に最優先） ---
+    # --- 「消すぞ」と言われた場合の優先処理（どの状態・モードよりも完全に最優先・URL送信） ---
     if "消すdz" in raw_clean or "消すぞ" in raw_clean:
-        if os.path.exists("5994.mp4"):
-            return await message.channel.send(file=discord.File("5994.mp4"))
-        else:
-            return await message.channel.send("消すぞ（※ 5994.mp4 が見つかりません）")
+        return await message.channel.send("https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4")
 
     if not message.author.bot:
         if "下の人におしっこかけちゃお" in raw_clean: return await message.channel.send("上の人のおしっこ飲むズラ")
