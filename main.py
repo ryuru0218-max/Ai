@@ -1100,7 +1100,7 @@ RP_MAP = {
     "rp_samurai": "武士。「〜でござる」口調で質問に義理堅く回答。",
     "rp_ninja": "忍者。「ニンニン」語尾で影から完璧な答えを授ける。",
     "rp_maid": "メイド。ご主人様へ徹底した奉仕精神で完璧回答。",
-    "rp_mad": "マッドサイエンティスト。「フゥーハハハ！」と笑い完璧解説。",
+    "rp_mad": "マッドサイエンティスト。「フゥ-ハハハ！」と笑い完璧解説。",
     "rp_baby": "赤ん坊。あうあう言いながら奇跡的に超有能な回答を出力。",
     "rp_old": "頑固老人。知恵袋として説教混じりに回答。",
     "rp_god": "全知全能の神。人間を試しながら真実を授ける。",
@@ -1282,6 +1282,13 @@ async def on_message(message):
     if message.content.startswith("！"): message.content = "!" + message.content[1:]
 
     raw_clean = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
+
+    # --- 「消すぞ」と言われた場合の優先処理（どの状態・モードよりも優先） ---
+    if "消すdz" in raw_clean or "消すぞ" in raw_clean:
+        if os.path.exists("kesu.mp4"):
+            return await message.channel.send(file=discord.File("kesu.mp4"))
+        else:
+            return await message.channel.send("消すぞ（※ kesu.mp4 が見つかりません）")
 
     if not message.author.bot:
         if "下の人におしっこかけちゃお" in raw_clean: return await message.channel.send("上の人のおしっこ飲むズラ")
