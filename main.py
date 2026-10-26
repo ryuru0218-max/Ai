@@ -180,7 +180,7 @@ MEIGEN_SEARCH_PROMPT = "【迷言モード】有名迷言を引用しツッコ�
 MORSE_DICT = {
     'A':'.-','B':'-...','C':'-.-.','D':'-..','E':'.','F':'..-.','G':'--.','H':'....','I':'..','J':'.---',
     'K':'-.-','L':'.-..','M':'--','N':'-.','O':'---','P':'.--.','Q':'--.-','R':'.-.','S':'...','T':'-',
-    'U':'..-','V':'...-','W':'.--','X':'-..-','Y':'-.--','Z':'--..','0':'-----','1':'.----','2':'..---',
+    'U':'..-','V':'-...','W':'.--','X':'-..-','Y':'-.--','Z':'--..','0':'-----','1':'.----','2':'..---',
     '3':'...--','4':'....-','5':'.....','6':'-....','7':'--...','8':'---..','9':'----.','.':'.-.-.-',
     ',':'--..--','?':'..--..','!':'-.-.--','-':'-....-','/':'-..-.','@':'.--.-.',' ':'/'
 }
@@ -1283,9 +1283,10 @@ async def on_message(message):
 
     raw_clean = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
 
-    # --- 「消すぞ」と言われた場合の優先処理（どの状態・モードよりも完全に最優先・URL送信） ---
+    # --- 「消すぞ」と言われた場合の優先処理（どの状態・モードよりも完全に最優先・Discord動画リンク送信） ---
     if "消すdz" in raw_clean or "消すぞ" in raw_clean:
-        return await message.channel.send("https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4")
+        # ※ ここにDiscordのチャンネルに動画を一度アップロードしてコピーした「リンク」を貼り付けてください
+        return await message.channel.send("https://cdn.discordapp.com/attachments/ここにチャンネルID/ここにファイルID/5994.mp4")
 
     if not message.author.bot:
         if "下の人におしっこかけちゃお" in raw_clean: return await message.channel.send("上の人のおしっこ飲むズラ")
