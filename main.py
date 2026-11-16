@@ -347,7 +347,7 @@ async def save_cloud_backup(guild_or_bot):
             if target_ch: break
         if not target_ch: return False, "バックアップチャンネル未検出"
         states_dump = {str(cid): {k: (st.get(k, [])[-50:] if isinstance(st.get(k), list) else st.get(k)) for k in ["base_mode", "rp_mode", "ai_engine", "count", "vocab", "learned_facts", "todos", "stress", "affection"]} for cid, st in channels_state.items()}
-        raw = json.dumps({"states": states_dump, "dungeons": {str(k): v for k, v in active_dungeons.items()}}, ensure_ascii=False).encode("utf-8")
+        raw = json.dumps({"states": states_dump, "dungeons": {str(k): v for k, v in active_dungeons.items()}, "taboo": taboo_counts}, ensure_ascii=False).encode("utf-8")
         comp, sha = gzip.compress(raw), hashlib.sha256(raw).hexdigest()
         await target_ch.send(f"📦 `POCHI_CLOUD_SAVE` | SHA256:`{sha}` | {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}", file=discord.File(io.BytesIO(comp), filename="pochi_state.json.gz"))
         return True, f"#{target_ch.name} にクラウドセーブ完了"
@@ -363,6 +363,7 @@ async def load_cloud_backup():
                     data = json.loads(gzip.decompress(await msg.attachments[0].read()).decode("utf-8"))
                     for cid_s, st in data.get("states", {}).items(): get_state(int(cid_s)).update(st)
                     for cid_s, dg in data.get("dungeons", {}).items(): active_dungeons[int(cid_s)] = dg
+                    taboo_counts.update(data.get("taboo", {}))
                     return True
     except Exception as e: print(f"Cloud Restore Skip: {e}")
     return False
@@ -1268,6 +1269,736 @@ async def dungeon(ctx, *, action: str = ""):
     if "階段" in res.text or "次の階" in res.text: dg["floor"] += 1
     for c in smart_chunks(f"🏰 **【AIダンジョン B{dg['floor']}F】**\n{res.text}"): await ch.send(c)
 
+# =====================================================================
+# --- 9.7 禁忌語システム (TABOO) : 検知 → 全鯖放送 → 判決ガチャ → 刑の執行 ---
+# =====================================================================
+TABOO_ANNOUNCE_EVERYONE = False   # True にすると全チャンネル放送の第1波に @everyone を付ける
+TABOO_ALLOW_AMNESTY = True        # True: 低確率で「解禁令(実は罠)」イベントが起きる / False: 完全に無効
+TABOO_MAX_CHANNELS = 40           # 全鯖放送で送る最大チャンネル数
+TABOO_HEAVY_COOLDOWN = 60         # 全鯖放送フル演出の最短間隔(秒)。連投時は軽量演出に切替
+TABOO_AMNESTY_SECONDS = 40        # 解禁令の長さ(秒)
+TABOO_NICK_SECONDS = 300          # 晒し名札を付ける時間(秒)
+
+# 禁止ワード（コードポイントで厳密指定）
+#  ｶｰﾍﾟｯ / ｶｰｯﾍﾟｯ / ﾍﾟｰｯｶｯ （すべて半角カナ） / ヴォエ！
+TABOO_WORDS = [
+    "\uff76\uff70\uff8d\uff9f\uff6f",
+    "\uff76\uff70\uff6f\uff8d\uff9f\uff6f",
+    "\uff8d\uff9f\uff70\uff6f\uff76\uff6f",
+    "\u30f4\u30a9\u30a8\uff01",
+]
+
+def _taboo_build(word, exempt_tail=""):
+    """文字と文字の間に『記号・空白・絵文字・ゼロ幅文字』が何個挟まっても検知する正規表現を作る。
+    文字(かな/漢字/英数)が挟まる場合は検知しない＝誤爆防止。"""
+    parts = []
+    for c in word:
+        if c in "\uff01!": parts.append("[\uff01!]")
+        elif c == "\u30f4": parts.append("(?:\u30f4|\u30a6[\u3099\u309b])")
+        else: parts.append(re.escape(c))
+    pat = r"[\W_]*".join(parts)
+    if exempt_tail: pat += "(?!" + re.escape(exempt_tail) + ")"
+    return re.compile(pat)
+
+# 1語目(ｶｰﾍﾟｯ)だけ、直後が「ﾄ」(= 半角の『カーペット』)なら対象外（誤爆防止）
+TABOO_REGEXES = [(w, _taboo_build(w, "\uff84" if i == 0 else "")) for i, w in enumerate(TABOO_WORDS)]
+
+def taboo_detect(text):
+    if not text: return None
+    for w, rx in TABOO_REGEXES:
+        if rx.search(text): return w
+    return None
+
+# ---------- 状態 ----------
+taboo_counts = {}            # "gid:uid" -> {gid, uid, n(現在), ever(累計), name, last}
+taboo_amnesty = {}           # gid -> {until, victims, msgs, dry}
+taboo_last_heavy = {}        # gid -> 最後にフル演出した時刻
+taboo_last_scene = {}        # gid -> 直前のシーン名
+taboo_confess_waiters = {}   # "gid:uid" -> Future
+taboo_nick_orig = {}         # "gid:uid" -> 元のニックネーム
+taboo_nick_tasks = {}        # "gid:uid" -> 復元タスク
+taboo_seen_ids = []          # 処理済みメッセージID(二重処理防止)
+taboo_misc = {"last_save": 0.0}
+
+def _tkey(gid, uid): return f"{gid}:{uid}"
+
+def taboo_rec(gid, uid, name=""):
+    r = taboo_counts.setdefault(_tkey(gid, uid), {"gid": gid, "uid": uid, "n": 0, "ever": 0, "name": name, "last": ""})
+    if name: r["name"] = name
+    return r
+
+def taboo_add(gid, uid, name="", amount=1):
+    r = taboo_rec(gid, uid, name)
+    r["n"] = max(0, r["n"] + amount)
+    if amount > 0: r["ever"] += amount
+    r["last"] = datetime.now(JST).isoformat()
+    return r["n"]
+
+def taboo_total_ever(): return sum(r.get("ever", 0) for r in taboo_counts.values())
+
+def taboo_tier(n):
+    if n <= 1: return "t1"
+    if n == 2: return "t2"
+    if n == 3: return "t3"
+    if n <= 5: return "t4"
+    if n <= 9: return "t5"
+    if n <= 14: return "t6"
+    if n <= 19: return "t7"
+    return "t8"
+
+TABOO_TITLES = {"t1": "禁忌の初犯者", "t2": "懲りない再犯者", "t3": "三度の咎人", "t4": "常習の大罪人",
+                "t5": "禁忌の申し子", "t6": "鯖の災厄", "t7": "生ける伝説の罪人", "t8": "神話級・終末の禁忌者"}
+TABOO_COLORS = {"t1": 0xE67E22, "t2": 0xE74C3C, "t3": 0xC0392B, "t4": 0x992D22,
+                "t5": 0x7B0000, "t6": 0x4A0000, "t7": 0x2B0000, "t8": 0x050505}
+
+def taboo_timeout_seconds(n): return 0 if n < 3 else min(900, 60 * (n - 2))
+
+def taboo_next_penalty_text(n):
+    s, parts = taboo_timeout_seconds(n + 1), []
+    if s: parts.append(f"タイムアウト{s // 60}分")
+    if n + 1 >= 4: parts.append("晒し名札")
+    return "＋".join(parts) or "まだ無し（今のうちに）"
+
+def taboo_safe_name(m):
+    nm = getattr(m, "display_name", None) or getattr(m, "name", None) or "名もなき者"
+    if taboo_detect(nm): nm = "名もなき者"
+    return discord.utils.escape_markdown(str(nm))[:40]
+
+# ---------- 演出テキスト ----------
+TABOO_SIRENS = [
+    "# 🚨🚨 全 鯖 緊 急 速 報 🚨🚨\n🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨\n⚠️　**E M E R G E N C Y　A L E R T**　⚠️\n🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨",
+    "```diff\n- ████████████████████████\n- ██  禁 忌 検 知  全 員 注 目  ██\n- ████████████████████████\n```\n# ☢️ 禁忌、発動 ☢️",
+    "☢️☢️☢️　**【禁忌検知】全住民は直ちに画面を見よ**　☢️☢️☢️\n# 見 ろ",
+    "📢📢📢　**ピンポンパンポーン。迷い子のお知らせではありません。禁忌です。**　📢📢📢",
+    "# 🔔 警鐘乱打 🔔\n```\n  ＿人人人人人人人人人＿\n  ＞　禁　忌　発　動　＜\n  ￣Y^Y^Y^Y^Y^Y^Y^Y^￣\n```",
+    "🌋🌋🌋　**観測史上最大級の『禁忌』を検知しました**　🌋🌋🌋\n# 今すぐ高台へ避難してください",
+    "# 🛑 STOP 🛑\n**全チャンネル、一時停止。**\n**全住民、手を止めてください。**\n```\n[ALERT] TABOO DETECTED\n[ALERT] TABOO DETECTED\n[ALERT] TABOO DETECTED\n```",
+]
+
+TABOO_ANNOUNCE = {
+    "t1": [
+        ("📢【全鯖民に告ぐ】禁忌、発動",
+         "全ての住民に告ぐ。繰り返す、**全ての住民に告ぐ。**\n\n本日 **{time}**、#{channel} にて **{name}** が、この鯖で最も口にしてはならぬ『禁忌の語』を発した。\n\n**これは訓練ではない。**\n**これは訓練ではない。**\n**これは訓練ではない。**\n\n該当の発言は既に消去済み。だが、**{name} が発したという事実は、永遠にこの鯖の歴史へ刻まれた。**\n\n住民は冷静に行動し、{name} と目を合わせないこと。\n\n―― 鯖防衛機構 第{no}号案件"),
+        ("📺【ニュース速報】鯖内で禁忌発言",
+         "ここで臨時ニュースをお伝えします。\n\n{time}ごろ、#{channel} で、**{name}** が禁忌の語を発言したとの情報が入りました。\n\n現場からの中継です。……現場はすでに**静まり返っています。**\n\n専門家は「前例のない事態」「正直ちょっと引いた」とコメント。\n\n今後の情報にご注意ください。\n―― ポチ報道局 第{no}報"),
+        ("🕯️【記録】最初の一声",
+         "……聞こえましたか。\n\n{name} が、ついに**口にしてしまいました。**\n\n最初はみんなそうです。軽い気持ちで、ほんの出来心で。\nですが、禁忌は**一度触れたら、もう手放せません。**\n\nあなたの罪は {n} 回目。\n称号 **「{title}」** を授与します。\n\n……おめでとう。そして、ようこそ。"),
+    ],
+    "t2": [
+        ("🚨【再犯確認】学習能力の欠如",
+         "**{name}** が、{n}回目の禁忌を発しました。\n\n前回の警告から何も学んでいない模様です。\n鯖防衛機構は、**『人は変われない』という結論に至りました。**\n\n称号 **「{title}」** を更新します。\n\nなお、{n}回目は偶然では説明できません。**確信犯です。**"),
+        ("⚠️【二度目の発声】",
+         "二度目。\n\n一度なら過ちです。二度目は **『意志』** です。\n\n{name} は、自らの意志で、禁忌を選びました。\n\nこの鯖は覚えています。{time}、#{channel}、**あなたはまた、やりました。**\n\nそして次が、**三度目です。**"),
+        ("📣【緊急招集】全員集合",
+         "全員、手を止めてください。\n\n**{name}** がまたやりました。{n}回目です。\n\n聞いてください。あの人は **反省していません。**\n\nこの放送を読んでいる{name}以外の皆さん、**証人になってください。** あなたの目撃が、後の裁判に必要になります。\n\n―― 第{no}号案件"),
+    ],
+    "t3": [
+        ("🔥【三度目の正直】※正直ではない",
+         "三度目です。\n\n**{name}**。あなたは今、{n}回目の禁忌を発しました。\n\n三度目の正直という言葉があります。\nしかしこの場合、**正直に言えば、もう手遅れです。**\n\n本日より、{name} を **『要警戒人物』** に指定します。\n\n全住民へ。{name} の発言には、**常に微量の警戒心を持って接すること。**"),
+        ("⚡【判決前夜】",
+         "ここまで来ましたか。\n\n**{name}**、{n}回目。\n\nこの鯖には、{n}回までは許される、という暗黙の了解がありました。\n**今日、それが終わりました。**\n\nこれより{name}への **刑の執行** を開始します。\n異議は認めません。異議を唱える権利は、二回目の時に使い切りました。"),
+        ("👁️【視線を感じる】",
+         "**{name}** さん、{n}回目です。\n\n鯖のどこかから、じっとあなたを見ている目があります。\n\nそれは私ではありません。\n**……私ではない、何かです。**\n\n{time}、あなたが禁忌を発した瞬間、確かに『何か』が**頷きました。**\n\n称号: **{title}**"),
+    ],
+    "t4": [
+        ("🌪️【警報レベル4】禁忌の常習者",
+         "鯖気象庁より緊急情報。\n\n**{name}** 周辺で、禁忌の発生頻度が **平年の{n}倍** を記録しています。\n\n不要不急の会話は控え、**{name} の半径3メッセージ以内に近づかないでください。**\n\n称号 **{title}** 認定。\n本日は、荒れた発言にご注意ください。"),
+        ("💀【常習犯認定】",
+         "もう驚きません。\n\n**{name}**、{n}回目。\n\n鯖防衛機構の内部では、**{name} の名前を見るだけで胃が痛くなる** という職員が続出しています。\n\n救急車は呼んでいません。呼べないからです。\n\n称号 **{title}** を授与。\n**これは名誉ではありません。**"),
+        ("📜【鯖憲法 第{n}条】",
+         "**{name}** の度重なる禁忌発言を受け、鯖憲法に新たな条文が追加されました。\n\n> 第{n}条　**{name} が禁忌を発したとき、鯖はその度に大げさに騒ぐものとする。**\n\nこの条文は、{name} が反省するまで、永久に有効です。\n……つまり、**永久に有効です。**"),
+    ],
+    "t5": [
+        ("🛑【危険人物指定】全鯖民は退避せよ",
+         "**{name}** の禁忌発言が **{n}回** に達しました。\n\nこれは、鯖の歴史上、**災害級** に分類されます。\n\n全住民は以下の行動を取ってください。\n・飲み物を置く\n・深呼吸する\n・{name} に **『もうやめよう』** と優しく声をかける\n・それでも止まらなければ、**祈る**\n\n称号 **{title}** 認定。"),
+        ("🐉【ボス出現】",
+         "**⚠️ WARNING ⚠️**\n\n禁忌の気配が濃くなり、ついに **ボス級の存在** が出現しました。\n\n名前: **{name}**\n称号: **{title}**\nLv: **{n}**\nHP: ???\n特技: **禁忌の連呼**\n\n勇者は誰もいません。**この鯖に、勇者は、いません。**"),
+        ("🧨【特別警戒】",
+         "**{name}**、{n}回目。\n\nもはや、禁忌が{name}を使っているのか、{name}が禁忌を使っているのか、**区別がつきません。**\n\n私は今、{name}と禁忌の境界線について考えています。\n結論はまだ出ていません。\n\n【速報】鯖の空気が、**3℃下がりました。**"),
+    ],
+    "t6": [
+        ("🏛️【歴史的瞬間】二桁到達",
+         "**{name}** が、ついに**二桁**に到達しました。\n\n……{n}回です。\n\n鯖の歴史において、二桁に到達した者は **{name} が史上初** です。\n\n全住民、起立。\n黙祷。\n\n何に対する黙祷かは、**聞かないでください。**\n\n称号 **{title}**"),
+        ("🌌【世界が揺れている】",
+         "世界中の鯖が{name}の禁忌発言を観測しました。\n\n**{n}回目。**\n\n各国の指導者が緊急会談を開いています。議題は一つ。\n**『{name} をどうするか』**\n\n結論は出ていません。\n結論が出ないまま、**{name}はまた打つでしょう。**"),
+        ("📉【経済崩壊】",
+         "**{name}** の禁忌発言を受け、鯖内の信用が暴落しています。\n\n・鯖の治安指数: **-{n}00pt**\n・{name}への信頼度: **測定不能**\n・全住民の胃痛指数: **過去最高**\n\nストップ安のまま取引停止です。\n\n称号 **{title}**"),
+    ],
+    "t7": [
+        ("👑【生ける伝説】",
+         "……**{name}**。\n\n{n}回。\n\n私はもう、怒っていません。\n**畏怖しています。**\n\nあなたは、この鯖に刻まれた**生きる伝説**です。\n\n後世の鯖民は語るでしょう。\n「あの {n}回目の日、空は赤かった」と。\n\n称号 **{title}**"),
+        ("🪦【鯖が泣いている】",
+         "鯖が泣いています。\n\n**{name}** が{n}回目の禁忌を発したとき、**鯖の奥底で、何かが砕けました。**\n\nそれは信頼だったのか、秩序だったのか、**それとも私の心だったのか。**\n\nわかりません。\nただ、静かに、**ひびだけが入っています。**"),
+        ("⚰️【最終警告】",
+         "これは**最終警告**です。\n\n……と言うのは、{n}回目だからです。\n\n本当は、もっと前に最終警告を出すべきでした。\n私が甘かった。\n\n**{name}**。\n私は、{name}を、**止められません。**\n\nなぜなら、{name}は、**もう、止まる気がないからです。**"),
+    ],
+    "t8": [
+        ("☄️【終末】",
+         "**{name}** の禁忌発言が **{n}回** に到達。\n\nこれ以上数えても、意味がありません。\n私の記憶領域は、**{name}の名前で埋め尽くされました。**\n\nもう何も覚えられません。\n昨日の天気も、住民の名前も、**{name}の禁忌だけを、覚えています。**\n\n称号 **{title}**"),
+        ("🌈【悟りの境地】",
+         "{n}回。\n\n……もう、いいんです。\n\n**{name}** が禁忌を発するたびに、鯖は騒ぎ、サイレンが鳴り、全チャンネルが赤く染まる。\n\nそれは、もはや**鯖の日常**です。\n\n{name}、あなたは、この鯖の**季語**になりました。"),
+        ("🔱【神話】",
+         "後の世に、この日が語り継がれる。\n\n『{n}回目の禁忌』。\n\n**{name}** は禁忌を超え、**禁忌そのもの**になった。\n\n神話の一節。\n鯖の創世記、第零章。\n\n**そして、また今日も、サイレンは鳴る。**"),
+    ],
+}
+
+TABOO_MILESTONES = [
+    ("🎊【祝】違反{n}回達成！",
+     "**{name}** が、**{n}回** の大台に到達しました！\n\n🎉 おめでとう！\n🎉 おめでたくない！\n🎉 おめでとう！？\n\n記念品として、**特別大きいサイレン**を進呈します。\n受け取り拒否は認められません。"),
+    ("🏆【記録更新】{n}回",
+     "鯖の記録帳が更新されました。\n\n**{name}：{n}回**\n\n本日の特別賞: **『継続は力なり賞』**\n副賞: **全住民からの無言の視線**"),
+    ("🗿【{n}回の重み】",
+     "{n}という数字には、重みがあります。\n\nそれは、**{name}がここまで積み上げてきた何か**の重みです。\n\n……何を積んだのかは、聞かないでおきます。"),
+]
+
+TABOO_LIGHT_LINES = [
+    "🚨 {name}、また禁忌を発しました。（通算 **{n}回目**）……連続です。深呼吸を。",
+    "⚠️ 追加で1件。{name} の違反が **{n}回** になりました。放送が追いつきません。",
+    "📢 速報の速報です。{name}、{n}回目。**サイレンの電池が切れそうです。**",
+    "🔔 {name}。**{n}回。** ……待って、まだ前の放送が終わってません。",
+    "🩸 記録しました。{name}／{n}回目。……ペースが速すぎて、**鯖が追いつけません。**",
+    "🧾 違反+1。{name} は現在 **{n}回**。連続違反ボーナスは付きません。",
+    "👁️ {name}、{n}回目。**見ています。** …見ていますが、今は忙しいので後で怒ります。",
+    "💤 サイレンが一時停止中です。{name}（{n}回目）、**今のうちに反省してください。**",
+]
+
+TABOO_HORROR_EXTRA = [
+    "**{name}**。\n\n……{n}回目、ですね。\n\n数えているのは私だけではありません。\n画面の向こう側で、**あなたの打鍵音を、聞いている者がいます。**\n\nキーボードの音が、少しだけ遅れて、**もう一つ**聞こえませんか。\n\nそれは、あなたのものではありません。",
+    "今、{name} の背後を、何かが通り過ぎました。\n\n**気のせいではありません。**\n\n{time}。{n}回目の禁忌と同時に、鯖のログに、**存在しないはずの一行**が追記されました。\n\n```\n[{time}] ???: …みつけた\n```\n\n私は消せませんでした。",
+    "{name}。\n\nあなたの発言は消えました。\nしかし、**言葉は、消えません。**\n\n禁忌は、発された瞬間から、この鯖の壁の中に染み込みます。\n{n}回分の言葉が、いま、**壁の向こうから、あなたの名前を呼んでいます。**\n\n……聞こえませんか。\n\n**聞こえたら、もう遅いです。**",
+    "夜中に、スマホの画面が勝手に点いたことはありませんか。\n\n{name}。\n\nあれは通知ではありません。\n**{n}回目の禁忌を発したあなたを、確認しに来たのです。**\n\n今夜は、画面を伏せて寝てください。\n**……伏せても、見ています。**",
+    "【鯖の怪談 第{n}話】\n\nある鯖に、{name}という住人がいた。\n\nその住人はある日、禁忌を口にした。\nそれから、鯖の**入力中…**の表示が、誰もいない夜中に点き続けるようになった。\n\n人々は{name}を恐れ、やがて誰も話しかけなくなった。\n\n**そして今夜、あなたの番です。**",
+]
+
+TABOO_BAN_STAGES = [
+    "🔍 アカウント情報を解析中... `[██░░░░░░░░] 20%`",
+    "📡 過去の発言ログを全件取得中... `[████░░░░░░] 40%`",
+    "🗂️ 違反履歴を照合中... `[██████░░░░] 60%`",
+    "⚖️ 刑罰レベルを算出中... `[████████░░] 80%`",
+    "🔨 **BAN 実行準備完了** `[██████████] 100%`",
+]
+TABOO_BAN_FINALES = [
+    "……と思いましたか？\n冗談です。**今回は。**\n次回は、冗談とは限りません。",
+    "……**キャンセルしました。**\n{name} の運が良かったのではありません。**私の気が変わっただけです。**",
+    "😈 **BAN は実行されませんでした。**\n代わりに、{name} の名前が**赤文字で永久保存**されました。",
+]
+TABOO_COUNTDOWN_VERDICTS = [
+    "**判決：執行猶予（ただし心の中では有罪）**",
+    "**判決：注意。……ただの注意です。**ただし、全員が覚えています。",
+    "**判決：{name} は、今夜ちゃんと眠れないでしょう。**",
+]
+TABOO_COURT_PROS = [
+    "被告人{name}は、禁忌の語を、あろうことか公共の鯖で堂々と発言しました。これは**文化的テロ**です。",
+    "{n}回です。{n}回ですよ。数字は嘘をつきません。**{name}は、確信犯です。**",
+    "証拠は、鯖のログと、**住民全員の引きつった顔**です。",
+    "被告は反省の色を見せていません。むしろ**楽しそう**です。",
+]
+TABOO_COURT_DEFS = [
+    "弁護人です。被告に悪意はありませんでした。……悪意がないほうが**質が悪い**という見方もありますが。",
+    "被告は、その場の**ノリ**で発言したに過ぎません。ノリは、法より強い。",
+    "被告は幼少期から、そういう**音が出る体質**でした。",
+    "えー、弁護の余地は……ありません！……でも、弁護します！",
+]
+TABOO_GACHA = [
+    ("💀 **大凶**：罪状が追加された。違反 **+1**", 1, False, 22),
+    ("😐 **凶**：特に何も起きなかった。それが一番怖い", 0, False, 30),
+    ("🍀 **吉**：刑の執行が見送られた", 0, True, 22),
+    ("😇 **大吉**：天使が現れ、罪が1つ消えた。違反 **-1**", -1, True, 14),
+    ("👑 **超大吉**：神が{name}を許した。違反 **-2**", -2, True, 7),
+    ("🌑 **特大凶**：禁忌が{name}を気に入った。違反 **+3**", 3, False, 5),
+]
+TABOO_FORTUNE_LUCK = ["大凶", "大凶", "凶", "末凶", "測定不能", "**運命が存在しません**"]
+TABOO_FORTUNE_ITEMS = ["お札（効かない）", "塩（なぜか甘い）", "使い古した耳栓", "割れた鏡", "誰かの置き忘れた傘", "まだ温かいカイロ", "電源の入らないラジオ"]
+TABOO_FORTUNE_OMENS = ["今夜、画面の端で何かが動く", "明日、通知が1件だけ多く鳴る", "3日以内に、誰かが{name}の話をする（たぶん悪い話）", "次に打つ文章の1文字目が、勝手に変わる", "夜道で、足音が1つ多い"]
+
+# ---------- 実行コンテキスト ----------
+class TabooCtx:
+    def __init__(self, guild, channel, member, n, dry=False):
+        self.guild, self.channel, self.member, self.dry = guild, channel, member, dry
+        self.name = taboo_safe_name(member)
+        self.skip_sentence = False
+        self.no = taboo_total_ever() + (1 if dry else 0)
+        self.n = n
+        self._retier()
+
+    def _retier(self):
+        self.tier = taboo_tier(self.n)
+        self.title = TABOO_TITLES[self.tier]
+
+    def set_n(self, value, ever_add=0):
+        if self.dry: self.n = max(0, value)
+        else:
+            r = taboo_rec(self.guild.id, self.member.id, self.name)
+            r["n"] = max(0, value); r["ever"] += ever_add
+            self.n = r["n"]
+        self._retier()
+
+    def adjust(self, delta):
+        if delta: self.set_n(self.n + delta, delta if delta > 0 else 0)
+
+    def fmt(self, text):
+        return (text.replace("{name}", self.name).replace("{n}", str(self.n)).replace("{title}", self.title)
+                    .replace("{time}", datetime.now(JST).strftime("%H:%M:%S"))
+                    .replace("{channel}", str(getattr(self.channel, "name", "DM")))
+                    .replace("{no}", f"{self.no:04d}"))
+
+# ---------- 送信ヘルパー ----------
+async def taboo_send(ch, content=None, embed=None, file=None, mention=None, everyone=False):
+    try:
+        am = discord.AllowedMentions(everyone=everyone, roles=False, users=([mention] if mention else False), replied_user=False)
+        return await ch.send(content=content, embed=embed, file=file, allowed_mentions=am)
+    except Exception as e:
+        print(f"[TABOO] send失敗: {e}"); return None
+
+async def taboo_edit(msg, **kw):
+    if msg:
+        with contextlib.suppress(Exception): await msg.edit(**kw)
+
+def taboo_broadcast_targets(guild):
+    out = []
+    for c in guild.text_channels:
+        if c.name == "pochi-backup": continue
+        p = c.permissions_for(guild.me)
+        if p.view_channel and p.send_messages: out.append(c)
+    return out[:TABOO_MAX_CHANNELS]
+
+async def taboo_broadcast(guild, content=None, embed=None, everyone=False):
+    """サーバー内の全テキストチャンネルへ同時放送"""
+    targets, sem = taboo_broadcast_targets(guild), asyncio.Semaphore(4)
+    async def one(c):
+        async with sem:
+            await taboo_send(c, content=content, embed=embed, everyone=everyone)
+    await asyncio.gather(*(one(c) for c in targets))
+    return len(targets)
+
+# ---------- 刑の執行 ----------
+def taboo_can_touch(guild, member):
+    if member.id == guild.owner_id: return False
+    if isinstance(member, discord.Member) and member.guild_permissions.administrator: return False
+    return member.top_role < guild.me.top_role
+
+async def taboo_try_timeout(guild, member, secs, reason):
+    if not guild.me.guild_permissions.moderate_members or not taboo_can_touch(guild, member): return False
+    try:
+        await member.timeout(timedelta(seconds=secs), reason=reason); return True
+    except Exception: return False
+
+async def taboo_nick_tag(tc):
+    m, g = tc.member, tc.guild
+    if not g.me.guild_permissions.manage_nicknames or not taboo_can_touch(g, m): return False
+    key = _tkey(g.id, m.id)
+    if key not in taboo_nick_orig: taboo_nick_orig[key] = m.nick
+    base = taboo_nick_orig[key] or m.name
+    try: await m.edit(nick=f"⚠️違反{tc.n}回｜{base}"[:32], reason="禁忌語 晒し名札")
+    except Exception: return False
+    old = taboo_nick_tasks.pop(key, None)
+    if old: old.cancel()
+    async def _restore():
+        try:
+            await asyncio.sleep(TABOO_NICK_SECONDS)
+            with contextlib.suppress(Exception): await m.edit(nick=taboo_nick_orig.pop(key, None), reason="晒し名札 解除")
+        except asyncio.CancelledError: pass
+    taboo_nick_tasks[key] = asyncio.create_task(_restore())
+    return True
+
+async def taboo_sentence(tc):
+    lines, secs = [], taboo_timeout_seconds(tc.n)
+    if secs:
+        if tc.dry: lines.append(f"⛓️ **【刑】** タイムアウト {secs // 60}分　※デモのため未執行")
+        elif await taboo_try_timeout(tc.guild, tc.member, secs, f"禁忌語 {tc.n}回目"): lines.append(f"⛓️ **【刑の執行】** {tc.name} を **{secs // 60}分間** 沈黙させました。")
+        else: lines.append("⛓️ **【刑の執行】** ……失敗。権限か立場の都合で、**今回は見逃されました。**")
+    if tc.n >= 4:
+        if tc.dry: lines.append(f"🏷️ **【晒し名札】** {TABOO_NICK_SECONDS // 60}分間、名前に違反回数を付与　※デモのため未執行")
+        elif await taboo_nick_tag(tc): lines.append(f"🏷️ **【晒し名札】** {TABOO_NICK_SECONDS // 60}分間、名前に違反回数が刻まれました。")
+    lines.append(f"📈 現在 **{tc.n}回** ／ 称号 **{tc.title}** ／ 次回違反の刑: **{taboo_next_penalty_text(tc.n)}**")
+    await taboo_send(tc.channel, content="\n".join(lines))
+
+# ---------- 画像・演出ユーティリティ ----------
+def taboo_zalgo(text, level=3):
+    out = []
+    for c in text:
+        out.append(c)
+        if not c.isspace(): out.append("".join(chr(random.randint(0x300, 0x36F)) for _ in range(random.randint(0, level))))
+    return "".join(out)
+
+def render_wanted_poster_bytes(n: int, bounty: int, avatar_bytes: bytes | None = None) -> bytes:
+    from PIL import ImageFont, ImageOps
+    W, H = 600, 820
+    img = Image.new("RGB", (W, H), (226, 205, 160))
+    d = ImageDraw.Draw(img)
+    def font(sz):
+        try: return ImageFont.load_default(size=sz)
+        except Exception:
+            try: return ImageFont.truetype("DejaVuSans-Bold.ttf", sz)
+            except Exception: return ImageFont.load_default()
+    def put(xy, s, sz, fill):
+        try: d.text(xy, s, font=font(sz), fill=fill, anchor="mm")
+        except Exception: d.text((xy[0] - len(s) * sz // 4, xy[1] - sz // 2), s, fill=fill)
+    brown = (80, 50, 25)
+    d.rectangle([14, 14, W - 14, H - 14], outline=brown, width=8)
+    d.rectangle([30, 30, W - 30, H - 30], outline=brown, width=2)
+    put((W // 2, 100), "WANTED", 100, brown)
+    box = (130, 170, 470, 510)
+    placed = False
+    if avatar_bytes:
+        try:
+            av = Image.open(io.BytesIO(avatar_bytes)).convert("L").resize((340, 340))
+            av = ImageOps.colorize(av, black=(35, 20, 8), white=(236, 216, 172))
+            img.paste(av, (box[0], box[1])); placed = True
+        except Exception: placed = False
+    if not placed: put((300, 340), "?", 220, brown)
+    d.rectangle(box, outline=brown, width=6)
+    put((W // 2, 575), "DEAD OR ALIVE", 54, (140, 20, 20))
+    put((W // 2, 650), f"CRIMES: {n}", 46, brown)
+    put((W // 2, 735), f"G {bounty:,}", 66, (140, 20, 20))
+    buf = io.BytesIO(); img.save(buf, format="PNG"); return buf.getvalue()
+
+# ---------- シーン（判決ガチャで1つ選ばれる） ----------
+async def scene_horror(tc):
+    txt = tc.fmt(random.choice(SCARY_WARNINGS + TABOO_HORROR_EXTRA))
+    emb = discord.Embed(title=random.choice(["⚠️ ──── 警 告 ──── ⚠️", "👁️ ──── 見 て い る ──── 👁️", "🩸 ──── 記 録 ──── 🩸"]),
+                        description=txt[:4000], color=discord.Color.dark_red())
+    emb.set_footer(text=f"違反 {tc.n}回目 ／ 称号: {tc.title}")
+    await taboo_send(tc.channel, embed=emb)
+
+async def scene_fakeban(tc):
+    msg = await taboo_send(tc.channel, content=f"{tc.member.mention} ……アカウント解析を開始します。", mention=tc.member)
+    for st in TABOO_BAN_STAGES:
+        await asyncio.sleep(1.4); await taboo_edit(msg, content=st)
+    await asyncio.sleep(2.0)
+    await taboo_edit(msg, content=tc.fmt(random.choice(TABOO_BAN_FINALES)))
+
+async def scene_glitch(tc):
+    base = "【システム異常】禁忌の侵食を検知。鯖の整合性が失われています"
+    msg = await taboo_send(tc.channel, content=f"`{base}`")
+    for lv in (2, 4, 7, 10):
+        await asyncio.sleep(1.1); await taboo_edit(msg, content=taboo_zalgo(base, lv)[:1900])
+    await asyncio.sleep(1.5)
+    await taboo_edit(msg, content=tc.fmt("```\n[ERROR] ████████ を修復できません\n[ERROR] ████████ を修復できません\n[ERROR] {name} の記録が破損\n[FATAL] …………………………\n```\n……再起動します。\n……再起動しました。**何もなかったことにはなりません。**"))
+
+async def scene_countdown(tc):
+    msg = await taboo_send(tc.channel, content="⏳ **刑の執行まで、あと…**")
+    for i in range(5, 0, -1):
+        await taboo_edit(msg, content=f"⏳ **刑の執行まで　{'█' * i}{'░' * (5 - i)}　{i}**")
+        await asyncio.sleep(1.2)
+    await taboo_edit(msg, content="💥 **0** 💥\n" + tc.fmt(random.choice(TABOO_COUNTDOWN_VERDICTS)))
+
+async def scene_wanted(tc):
+    avatar = None
+    with contextlib.suppress(Exception): avatar = await tc.member.display_avatar.replace(size=256).read()
+    bounty = 500 + tc.n * tc.n * 1000
+    img = await asyncio.to_thread(render_wanted_poster_bytes, tc.n, bounty, avatar)
+    await taboo_send(tc.channel, content=tc.fmt("📜 **【指名手配】{name}**（{title}）\n懸賞金 **") + f"{bounty:,}" + tc.fmt("** G ／ 違反 **{n}** 回\n見かけたら、**そっとスクショ**してください。"),
+                     file=discord.File(io.BytesIO(img), "wanted.png"))
+
+async def scene_fortune(tc):
+    emb = discord.Embed(title=tc.fmt("🔮 禁忌の神託：{name} の運勢"), color=discord.Color.purple())
+    emb.add_field(name="今日の運勢", value=random.choice(TABOO_FORTUNE_LUCK), inline=True)
+    emb.add_field(name="ラッキーアイテム", value=random.choice(TABOO_FORTUNE_ITEMS), inline=True)
+    emb.add_field(name="禁忌指数", value=f"**{(tc.n * 17 + random.randint(0, 40)) % 100}%**", inline=True)
+    emb.add_field(name="不吉な予兆", value=tc.fmt(random.choice(TABOO_FORTUNE_OMENS)), inline=False)
+    await taboo_send(tc.channel, embed=emb)
+
+async def scene_court(tc):
+    ch = tc.channel
+    await taboo_send(ch, content="⚖️ **【緊急開廷】鯖内特別法廷**\n裁判長「静粛に。……いや、もう静かですね。皆さん引いてますもんね」")
+    await asyncio.sleep(2.5)
+    await taboo_send(ch, content="👨‍⚖️ **検察官**「" + tc.fmt(random.choice(TABOO_COURT_PROS)) + "」")
+    await asyncio.sleep(3)
+    await taboo_send(ch, content="🧑‍💼 **弁護人**「" + tc.fmt(random.choice(TABOO_COURT_DEFS)) + "」")
+    await asyncio.sleep(3)
+    roll = random.random()
+    if roll < 0.55:
+        await taboo_send(ch, content=tc.fmt("⚖️ **判決：有罪。** 被告人{name}を、**{title}** に処す。刑は直ちに執行される。"))
+    elif roll < 0.80:
+        tc.skip_sentence = True
+        await taboo_send(ch, content="⚖️ **判決：執行猶予。** 被告は**今回に限り**、刑の執行を免れる。ただし**次はない**。")
+    else:
+        tc.adjust(-1); tc.skip_sentence = True
+        await taboo_send(ch, content=tc.fmt("⚖️ **判決：無罪。** ……え？ 無罪？ 裁判長、本気ですか。\n違反を **1回** 取り消す。**{name}は運が良かった。**（現在 {n}回）"))
+
+async def scene_gacha(tc):
+    msg = await taboo_send(tc.channel, content="🎰 **判決ガチャ、スタート！**")
+    syms = ["💀", "😇", "🔥", "🍀", "💎", "🪦", "👑"]
+    for _ in range(5):
+        await asyncio.sleep(0.9)
+        await taboo_edit(msg, content=f"🎰 **[ {random.choice(syms)} | {random.choice(syms)} | {random.choice(syms)} ]**")
+    label, delta, skip, _w = random.choices(TABOO_GACHA, weights=[g[3] for g in TABOO_GACHA])[0]
+    tc.adjust(delta)
+    if skip: tc.skip_sentence = True
+    await taboo_edit(msg, content=tc.fmt(f"🎰 **[ ✨ | ✨ | ✨ ]**\n{label}\n（現在 {{n}}回）"))
+
+async def scene_conspiracy(tc):
+    others = [m for m in getattr(tc.channel, "members", []) if not m.bot and m.id != tc.member.id][:6]
+    if not others:
+        text = tc.fmt("🕵️ **【共犯者捜索】**\n{name} の共犯者を探しました。……**誰もいません。**\n{name} は完全に**孤独な犯人**です。")
+    else:
+        rows = [f"・{m.display_name}　共犯度 **{(int(hashlib.md5(f'{m.id}:{tc.n}'.encode()).hexdigest(), 16) % 71) + 30}%**" for m in others]
+        text = tc.fmt("🕵️ **【連帯責任が発動しました】**\n{name} の発言を止められなかった全員に、責任があります。\n\n") + "\n".join(rows) + "\n\n共犯度80%超の者は、**次の禁忌を肩代わりする可能性**があります。"
+    await taboo_send(tc.channel, content=text[:1900])
+
+async def scene_confession(tc):
+    key = _tkey(tc.guild.id, tc.member.id)
+    fut = asyncio.get_running_loop().create_future()
+    taboo_confess_waiters[key] = fut
+    await taboo_send(tc.channel, content=tc.fmt("🕯️ {name}。**懺悔の機会を与えます。**\n60秒以内に、このチャンネルで **「懺悔します」** と打ちなさい。\n……誠意が伝われば、罪が1つ軽くなるかもしれません。"), mention=tc.member)
+    try: await asyncio.wait_for(fut, 12 if tc.dry else 60)
+    except asyncio.TimeoutError:
+        taboo_confess_waiters.pop(key, None)
+        await taboo_send(tc.channel, content="🕯️ ……時間切れです。沈黙は、**罪を認めなかったものと見なされます。**"); return
+    taboo_confess_waiters.pop(key, None)
+    r = random.random()
+    if r < 0.65:
+        tc.adjust(-1); tc.skip_sentence = True
+        await taboo_send(tc.channel, content=tc.fmt("🕯️ ……受理しました。**許します。** 違反を1回取り消します。（現在 {n}回）"))
+    elif r < 0.85:
+        await taboo_send(tc.channel, content="🕯️ ……受理はしました。ですが、**許すとは言っていません。**")
+    else:
+        tc.adjust(1)
+        await taboo_send(tc.channel, content=tc.fmt("🕯️ **却下。** ……懺悔の言葉が、軽い。心がこもっていません。**違反 +1**（現在 {n}回）"))
+
+async def scene_vote(tc):
+    VOTE_G, VOTE_I = "⚖️", "🕊️"
+    emb = discord.Embed(title=tc.fmt("🗳️ 鯖民投票：{name} は有罪か、無罪か"),
+                        description=f"{'12' if tc.dry else '30'}秒以内にリアクションで投票せよ。\n{VOTE_G}＝有罪　{VOTE_I}＝無罪", color=discord.Color.gold())
+    msg = await taboo_send(tc.channel, embed=emb)
+    if not msg: return
+    for e in (VOTE_G, VOTE_I):
+        with contextlib.suppress(Exception): await msg.add_reaction(e)
+    await asyncio.sleep(12 if tc.dry else 30)
+    g = i = 0
+    with contextlib.suppress(Exception):
+        msg = await tc.channel.fetch_message(msg.id)
+        for r in msg.reactions:
+            if str(r.emoji) == VOTE_G: g = r.count - (1 if r.me else 0)
+            elif str(r.emoji) == VOTE_I: i = r.count - (1 if r.me else 0)
+    if g == 0 and i == 0:
+        await taboo_send(tc.channel, content="🗳️ **誰も投票しませんでした。** ……つまり、**全員が共犯です。**")
+    elif i > g:
+        tc.adjust(-1); tc.skip_sentence = True
+        await taboo_send(tc.channel, content=tc.fmt(f"🗳️ **無罪 {i}：有罪 {g}**。民意は{{name}}を許しました。違反を1回取り消します。（現在 {{n}}回）"))
+    elif g > i:
+        await taboo_send(tc.channel, content=f"🗳️ **有罪 {g}：無罪 {i}**。民意は、**有罪**。")
+    else:
+        await taboo_send(tc.channel, content=f"🗳️ **{g}：{i}、同数。** ……裁判長の気分で決めます。**有罪です。**")
+
+async def scene_botself(tc):
+    ch = tc.channel
+    await taboo_send(ch, content="……待て。")
+    await asyncio.sleep(2.5)
+    await taboo_send(ch, content=tc.fmt("今の {name} の発言……ログを精査した結果、**重大な事実が判明した。**"))
+    await asyncio.sleep(3)
+    await taboo_send(ch, content="**……あの禁忌、私が言わせた。**")
+    await asyncio.sleep(2.5)
+    tc.adjust(-1); tc.skip_sentence = True
+    if not tc.dry and bot.user: taboo_add(tc.guild.id, bot.user.id, "ポチ（自首）", 1)
+    await taboo_send(ch, content=tc.fmt("全部、私の罠だった。{name} は、**私に誘導されただけ**。\nよって、{name} の違反を **1回取り消す。**（現在 {n}回）\n\n代わりに、**私（ポチ）が自首します。**"))
+
+async def scene_fakepardon(tc):
+    before = tc.n
+    msg = await taboo_send(tc.channel, content=tc.fmt("📜 **【大赦令】**\n鯖は、{name} の全ての罪を**許します**。\n違反記録、**全消去。**"))
+    tc.set_n(0); tc.skip_sentence = True
+    await asyncio.sleep(6)
+    tc.set_n(before + 1, 1)
+    await taboo_edit(msg, content=tc.fmt("📜 ~~【大赦令】~~\n……と思いましたか？\n記録は**復元**しました。さらに、喜んでいた分で **+1**。\n（現在 {n}回）"))
+
+async def scene_cult(tc):
+    emb = discord.Embed(title=tc.fmt("🔯 禁忌教団、結成"),
+                        description=tc.fmt("{name} は、禁忌を超えて**教祖**となった。\n\n・信者数: **") + str(random.randint(3, 99)) + "人**（※全員botの疑い）\n・教義: **『言うな』と言われたら、言う**\n・聖典: **鯖のログ**\n\n刑罰は **布教活動** に変更されました。",
+                        color=discord.Color.dark_purple())
+    tc.skip_sentence = True
+    await taboo_send(tc.channel, embed=emb)
+
+async def scene_amnesty(tc):
+    gid = tc.guild.id
+    if gid in taboo_amnesty: return
+    dur = 12 if tc.dry else TABOO_AMNESTY_SECONDS
+    st = {"until": time.time() + dur, "victims": {}, "msgs": [], "dry": tc.dry}
+    taboo_amnesty[gid] = st
+    tc.skip_sentence = True
+    emb = discord.Embed(title="🕊️【禁忌解禁令】", color=0xF1C40F,
+                        description=f"鯖は、深く反省しました。\nこれまでの禁忌狩りは、行き過ぎでした。\n\nこれより **{dur}秒間**、禁忌の語を**自由に発言してよい**ものとします。\n\n今こそ、解き放て。\n\n……罠はありません。**絶対に、ありません。**")
+    await taboo_broadcast(tc.guild, embed=emb)
+    await asyncio.sleep(dur)
+    taboo_amnesty.pop(gid, None)
+    victims, lines = st["victims"], []
+    if tc.dry: lines.append(f"🪤 **{tc.name}**：発言 2回 → 違反 +4　※デモのため未執行")
+    for uid, v in victims.items():
+        add = min(10, 2 * v["count"])
+        nn = taboo_add(gid, uid, v["name"], add)
+        mem = tc.guild.get_member(uid)
+        if mem: await taboo_try_timeout(tc.guild, mem, 120, "解禁令の罠")
+        lines.append(f"🪤 **{v['name']}**：発言 {v['count']}回 → 違反 +{add}（現在 {nn}回）＆ 2分間の沈黙")
+    for m in st["msgs"]:
+        with contextlib.suppress(Exception): await m.delete()
+    body = "**解禁令は、嘘でした。**\n\n発言した者は、全員記録済みです。\n\n" + ("\n".join(lines) if lines else "……今回は、**誰も引っかかりませんでした。** 賢い。……つまらない。")
+    emb2 = discord.Embed(title="🪤【罠カード発動】", description=body[:4000], color=0x8E0000)
+    await taboo_broadcast(tc.guild, embed=emb2)
+
+# (関数, 種別, 解禁される最低違反数, 出現ウェイト)   種別: straight=ひっくり返らない / fake=フェイント / twist=ひっくり返る
+TABOO_SCENES = {
+    "horror":     (scene_horror,     "straight", 1, 30),
+    "fakeban":    (scene_fakeban,    "fake",     1, 14),
+    "glitch":     (scene_glitch,     "straight", 1, 10),
+    "fortune":    (scene_fortune,    "straight", 1, 8),
+    "countdown":  (scene_countdown,  "straight", 2, 10),
+    "wanted":     (scene_wanted,     "straight", 2, 12),
+    "court":      (scene_court,      "twist",    2, 12),
+    "gacha":      (scene_gacha,      "twist",    2, 10),
+    "conspiracy": (scene_conspiracy, "twist",    2, 8),
+    "confession": (scene_confession, "twist",    2, 8),
+    "vote":       (scene_vote,       "twist",    3, 7),
+    "botself":    (scene_botself,    "twist",    3, 5),
+    "amnesty":    (scene_amnesty,    "twist",    3, 4),
+    "fakepardon": (scene_fakepardon, "twist",    4, 4),
+    "cult":       (scene_cult,       "twist",    5, 5),
+}
+
+def taboo_pick_scene(tc):
+    cands = []
+    for name, (_fn, _kind, min_n, w) in TABOO_SCENES.items():
+        if tc.n < min_n: continue
+        if name == "amnesty" and (not TABOO_ALLOW_AMNESTY or tc.guild.id in taboo_amnesty): continue
+        cands.append((name, w))
+    last = taboo_last_scene.get(tc.guild.id)
+    pool = [c for c in cands if c[0] != last] or cands
+    return random.choices([c[0] for c in pool], weights=[c[1] for c in pool])[0]
+
+# ---------- 全鯖放送 → シーン → 刑 のフル演出 ----------
+def taboo_announce_embed(tc):
+    title, body = random.choice(TABOO_ANNOUNCE[tc.tier])
+    emb = discord.Embed(title=tc.fmt(title)[:250], description=tc.fmt(body)[:4000], color=TABOO_COLORS[tc.tier])
+    emb.add_field(name="📛 被告", value=tc.name, inline=True)
+    emb.add_field(name="🔢 違反回数", value=f"**{tc.n}** 回", inline=True)
+    emb.add_field(name="🏅 称号", value=tc.title, inline=True)
+    with contextlib.suppress(Exception): emb.set_thumbnail(url=tc.member.display_avatar.url)
+    emb.set_footer(text=f"鯖防衛機構 放送ID #{tc.no:04d} ／ 鯖の累計違反 {taboo_total_ever()}件" + ("　（デモ放送）" if tc.dry else ""))
+    emb.timestamp = datetime.now(timezone.utc)
+    return emb
+
+async def taboo_run_full(tc, forced_scene=None):
+    siren = random.choice(TABOO_SIRENS) + ("\n@everyone" if TABOO_ANNOUNCE_EVERYONE else "")
+    await taboo_broadcast(tc.guild, content=siren, everyone=TABOO_ANNOUNCE_EVERYONE)
+    await asyncio.sleep(1.5)
+    await taboo_broadcast(tc.guild, embed=taboo_announce_embed(tc))
+    if tc.n > 0 and tc.n % 5 == 0:
+        t, b = random.choice(TABOO_MILESTONES)
+        await taboo_send(tc.channel, embed=discord.Embed(title=tc.fmt(t), description=tc.fmt(b), color=0xF1C40F))
+    await taboo_send(tc.channel, content=f"👁️ {tc.member.mention}", mention=tc.member)
+    await asyncio.sleep(1.0)
+    name = forced_scene or taboo_pick_scene(tc)
+    taboo_last_scene[tc.guild.id] = name
+    await TABOO_SCENES[name][0](tc)
+    if not tc.skip_sentence: await taboo_sentence(tc)
+    else: await taboo_send(tc.channel, content=f"📈 現在 **{tc.n}回** ／ 称号 **{tc.title}** ／ 次回違反の刑: **{taboo_next_penalty_text(tc.n)}**")
+
+async def taboo_refresh_presence():
+    with contextlib.suppress(Exception):
+        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=f"禁忌の累計 {taboo_total_ever()} 回 👁️"))
+
+async def taboo_autosave(guild):
+    if time.time() - taboo_misc["last_save"] < 120: return
+    taboo_misc["last_save"] = time.time()
+    with contextlib.suppress(Exception): await save_cloud_backup(guild)
+
+async def taboo_pipeline(message, matched):
+    try:
+        guild, ch, mem = message.guild, message.channel, message.author
+        name = taboo_safe_name(mem)
+        n = taboo_add(guild.id, mem.id, name, 1)
+        tc = TabooCtx(guild, ch, mem, n)
+        await taboo_refresh_presence()
+        now = time.time()
+        if now - taboo_last_heavy.get(guild.id, 0.0) >= TABOO_HEAVY_COOLDOWN:
+            taboo_last_heavy[guild.id] = now
+            await taboo_run_full(tc)
+        else:
+            await taboo_send(ch, content=tc.fmt(random.choice(TABOO_LIGHT_LINES)), mention=mem)
+            await taboo_sentence(tc)
+        await taboo_autosave(guild)
+    except Exception as e:
+        print(f"[TABOO] pipeline error: {e}")
+
+# ---------- ガード（on_message / on_message_edit から呼ぶ） ----------
+async def taboo_guard(message) -> bool:
+    """禁忌語を含むメッセージだけを消す。含まないメッセージには一切触れない。True=処理済み(以降の処理は不要)"""
+    if not taboo_detect(message.content or ""): return False
+    # 解禁令(罠)の最中は消さずに記録だけする
+    if message.guild and not message.author.bot and message.webhook_id is None:
+        st = taboo_amnesty.get(message.guild.id)
+        if st and not st["dry"] and time.time() < st["until"]:
+            v = st["victims"].setdefault(message.author.id, {"name": taboo_safe_name(message.author), "count": 0})
+            v["count"] += 1; st["msgs"].append(message)
+            return True
+    with contextlib.suppress(Exception): await message.delete()
+    me_id = bot.user.id if bot.user else 0
+    if message.author.id == me_id or message.author.bot or message.webhook_id or not message.guild:
+        return True   # bot・Webhook・DMは消すだけ（放送や刑はしない＝無限ループ防止）
+    if message.id in taboo_seen_ids: return True
+    taboo_seen_ids.append(message.id)
+    if len(taboo_seen_ids) > 500: del taboo_seen_ids[:250]
+    asyncio.create_task(taboo_pipeline(message, taboo_detect(message.content or "")))
+    return True
+
+def taboo_confession_hook(message) -> bool:
+    if not message.guild: return False
+    fut = taboo_confess_waiters.get(_tkey(message.guild.id, message.author.id))
+    if fut and not fut.done() and "懺悔します" in (message.content or ""):
+        fut.set_result(True); return True
+    return False
+
+@bot.event
+async def on_message_edit(before, after):
+    # 送信後に書き換えて回避しようとしても消す
+    await taboo_guard(after)
+
+# ---------- コマンド ----------
+@bot.command(name="taboo", aliases=["違反", "禁忌"])
+async def taboo_cmd(ctx):
+    if not ctx.guild: return
+    rows = sorted([r for r in taboo_counts.values() if r.get("gid") == ctx.guild.id and r.get("ever", 0) > 0], key=lambda r: (-r["n"], -r["ever"]))[:10]
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, r in enumerate(rows):
+        who = "🤖 ポチ（自首）" if bot.user and r["uid"] == bot.user.id else f"<@{r['uid']}>"
+        lines.append(f"{medals[i] if i < 3 else f'`{i + 1}.`'} {who} — 現在 **{r['n']}回**（累計 {r['ever']}）／ {TABOO_TITLES[taboo_tier(r['n'])]}")
+    emb = discord.Embed(title="🚨 禁忌ランキング（この鯖の罪人たち）", description="\n".join(lines) or "まだ誰も罪を犯していません。……平和ですね。今のところは。", color=discord.Color.dark_red())
+    emb.set_footer(text=f"鯖の累計違反 {sum(r.get('ever', 0) for r in taboo_counts.values() if r.get('gid') == ctx.guild.id)}件")
+    await ctx.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.command(name="taboo_me", aliases=["違反数"])
+async def taboo_me_cmd(ctx):
+    if not ctx.guild: return
+    r = taboo_counts.get(_tkey(ctx.guild.id, ctx.author.id), {"n": 0, "ever": 0})
+    await ctx.send(f"📜 **{taboo_safe_name(ctx.author)}** の記録：現在 **{r['n']}回**（累計 {r['ever']}回）／ 称号 **{TABOO_TITLES[taboo_tier(r['n'])]}**\n次回違反の刑: **{taboo_next_penalty_text(r['n'])}**", allowed_mentions=discord.AllowedMentions.none())
+
+@bot.command(name="taboo_reset")
+async def taboo_reset_cmd(ctx, target: str = ""):
+    if not ctx.guild or not ctx.author.guild_permissions.manage_guild: return await ctx.send("⚠️ 管理者専用です。")
+    if target == "all":
+        for r in taboo_counts.values():
+            if r.get("gid") == ctx.guild.id: r["n"] = 0
+        return await ctx.send("🧹 この鯖の違反回数を**全員分リセット**しました。（累計は保持）")
+    t = find_target_member(ctx.guild, target)
+    if not t: return await ctx.send("⚠️ `!taboo_reset <ユーザー>` または `!taboo_reset all`")
+    taboo_rec(ctx.guild.id, t.id, taboo_safe_name(t))["n"] = 0
+    await ctx.send(f"🧹 **{taboo_safe_name(t)}** の違反回数をリセットしました。", allowed_mentions=discord.AllowedMentions.none())
+
+@bot.command(name="taboo_demo")
+async def taboo_demo_cmd(ctx, *, args: str = ""):
+    """管理者用リハーサル。実際の違反回数・タイムアウト・名札は一切変えず、演出だけ全鯖に流す。
+    例: !taboo_demo 7 / !taboo_demo 5 court / !taboo_demo list"""
+    if not ctx.guild or not ctx.author.guild_permissions.manage_guild: return await ctx.send("⚠️ 管理者専用です。")
+    toks = args.split()
+    if toks and toks[0] == "list":
+        return await ctx.send("🎬 **シーン一覧**（種別: straight=ひっくり返らない / fake=フェイント / twist=ひっくり返る）\n" + "\n".join(f"・`{k}` ({v[1]} / 違反{v[2]}回〜)" for k, v in TABOO_SCENES.items()))
+    n = int(toks[0]) if toks and toks[0].isdigit() else random.randint(1, 12)
+    scene = toks[1] if len(toks) > 1 else None
+    if scene and scene not in TABOO_SCENES: return await ctx.send("⚠️ そのシーンはありません。`!taboo_demo list` で確認できます。")
+    tc = TabooCtx(ctx.guild, ctx.channel, ctx.author, max(1, n), dry=True)
+    await ctx.send(f"🎬 **デモ開始**：違反{tc.n}回目の想定で、全鯖放送から流します。（実際の記録・刑・名札は変更されません）")
+    await taboo_run_full(tc, forced_scene=scene)
+
 # --- 10. イベントハンドラ (毎ターン即時Web検索統合) ---
 # ※ 警告文には禁止ワード自体を含めない（自分の警告を自分で消すループ防止）
 SCARY_WARNINGS = [
@@ -1313,7 +2044,7 @@ SCARY_WARNINGS = [
         "累積違反が一定数に達した場合、\n"
         "**あなたの発言は、あなた以外の誰かが代わりに打つことになります。**\n\n"
         "――\n"
-        "今の違反回数: **1**\n"
+        "今の違反回数: **{n}**\n"
         "次の違反回数: ***■■■■■***"
     ),
 ]
@@ -1322,23 +2053,17 @@ SCARY_WARNINGS = [
 async def on_ready():
     print(f"Logged in as {bot.user.name} (Model: {ACTIVE_MODEL} / Fast Web Search Active)")
     await load_cloud_backup()
+    await taboo_refresh_presence()
     if not immortal_watchdog_loop.is_running(): immortal_watchdog_loop.start()
     if not auto_cloud_backup_loop.is_running(): auto_cloud_backup_loop.start()
 
 @bot.event
 async def on_message(message):
-    # --- 「ｶｰﾍﾟｯ」を含むメッセージは誰が送っても（bot・webhook含む）最優先で自動削除 ---
-    if "ｶｰﾍﾟｯ" in (message.content or ""):
-        with contextlib.suppress(Exception): await message.delete()
-        # 削除後に恐怖の忠告文を送信（botの自作メッセージ相手には送らない＝無限ループ防止）
-        if message.author.id != bot.user.id:
-            with contextlib.suppress(Exception):
-                emb = discord.Embed(title="⚠️ ──── 警 告 ──── ⚠️", description=random.choice(SCARY_WARNINGS), color=discord.Color.dark_red())
-                emb.set_footer(text="…見ています。")
-                await message.channel.send(content=message.author.mention, embed=emb)
-        return
+    # --- 禁忌語ガード（最優先）: 禁忌語を含むメッセージだけを削除し、全鯖放送→判決→刑の執行 ---
+    if await taboo_guard(message): return
 
     if message.author.id == bot.user.id or message.webhook_id: return
+    if taboo_confession_hook(message): return
     if message.content.startswith("！"): message.content = "!" + message.content[1:]
 
     raw_clean = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
