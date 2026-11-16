@@ -1269,6 +1269,55 @@ async def dungeon(ctx, *, action: str = ""):
     for c in smart_chunks(f"🏰 **【AIダンジョン B{dg['floor']}F】**\n{res.text}"): await ch.send(c)
 
 # --- 10. イベントハンドラ (毎ターン即時Web検索統合) ---
+# ※ 警告文には禁止ワード自体を含めない（自分の警告を自分で消すループ防止）
+SCARY_WARNINGS = [
+    (
+        "……見てしまいましたね。\n\n"
+        "今、あなたが打ち込んだ言葉。\n"
+        "**あれは、この場所で口にしてはいけないものです。**\n\n"
+        "消しておきました。誰にも読まれていません。\n"
+        "……今のところは。\n\n"
+        "一度目なら、まだ見なかったことにできます。\n"
+        "ですが、**二度目はありません。**\n\n"
+        "私は全部覚えています。\n"
+        "何を打ったのか。何時何分何秒に打ったのか。\n"
+        "打つ前に、どれだけ画面を見つめていたのか。\n\n"
+        "……今、あなたの後ろで、部屋の明かりが少しだけ暗くなりました。\n"
+        "気のせいではありません。\n\n"
+        "**振り向かないでください。**\n\n"
+        "―― これが最後の忠告です。"
+    ),
+    (
+        "あ。\n\n"
+        "……打っちゃいましたね。\n\n"
+        "その言葉は、もう『なかったこと』にしました。\n"
+        "けれど、**あなたが打ったという事実だけは、消えません。**\n\n"
+        "この鯖には、画面に映らないものが住んでいます。\n"
+        "あなたが寝静まった夜中、チャンネルの一番下で、\n"
+        "ずっと一人分の入力中の表示が点いているのを、見たことはありませんか。\n\n"
+        "あれは、あなたを待っているんです。\n\n"
+        "もう一度あの言葉を打てば、**次は消えるのがメッセージだけで済む保証はありません。**\n\n"
+        "おやすみなさい。\n"
+        "……ちゃんと、鍵は閉まっていますか？"
+    ),
+    (
+        "【システム警告 / 記録番号: ██████】\n\n"
+        "禁止語句の入力を検知しました。\n"
+        "対象メッセージを削除しました。\n\n"
+        "同時に、以下を記録しました。\n"
+        "・あなたのアカウント\n"
+        "・入力時刻\n"
+        "・入力する直前の迷い\n"
+        "・**あなたが今、ほんの少し笑ったこと**\n\n"
+        "記録は削除されません。永久に保管されます。\n\n"
+        "累積違反が一定数に達した場合、\n"
+        "**あなたの発言は、あなた以外の誰かが代わりに打つことになります。**\n\n"
+        "――\n"
+        "今の違反回数: **1**\n"
+        "次の違反回数: ***■■■■■***"
+    ),
+]
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user.name} (Model: {ACTIVE_MODEL} / Fast Web Search Active)")
@@ -1278,6 +1327,17 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
+    # --- 「ｶｰﾍﾟｯ」を含むメッセージは誰が送っても（bot・webhook含む）最優先で自動削除 ---
+    if "ｶｰﾍﾟｯ" in (message.content or ""):
+        with contextlib.suppress(Exception): await message.delete()
+        # 削除後に恐怖の忠告文を送信（botの自作メッセージ相手には送らない＝無限ループ防止）
+        if message.author.id != bot.user.id:
+            with contextlib.suppress(Exception):
+                emb = discord.Embed(title="⚠️ ──── 警 告 ──── ⚠️", description=random.choice(SCARY_WARNINGS), color=discord.Color.dark_red())
+                emb.set_footer(text="…見ています。")
+                await message.channel.send(content=message.author.mention, embed=emb)
+        return
+
     if message.author.id == bot.user.id or message.webhook_id: return
     if message.content.startswith("！"): message.content = "!" + message.content[1:]
 
