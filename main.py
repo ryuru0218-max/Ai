@@ -347,7 +347,7 @@ async def save_cloud_backup(guild_or_bot):
             if target_ch: break
         if not target_ch: return False, "バックアップチャンネル未検出"
         states_dump = {str(cid): {k: (st.get(k, [])[-50:] if isinstance(st.get(k), list) else st.get(k)) for k in ["base_mode", "rp_mode", "ai_engine", "count", "vocab", "learned_facts", "todos", "stress", "affection"]} for cid, st in channels_state.items()}
-        raw = json.dumps({"states": states_dump, "dungeons": {str(k): v for k, v in active_dungeons.items()}, "taboo": taboo_counts}, ensure_ascii=False).encode("utf-8")
+        raw = json.dumps({"states": states_dump, "dungeons": {str(k): v for k, v in active_dungeons.items()}, "taboo": taboo_counts, "convo": cv_export()}, ensure_ascii=False).encode("utf-8")
         comp, sha = gzip.compress(raw), hashlib.sha256(raw).hexdigest()
         await target_ch.send(f"📦 `POCHI_CLOUD_SAVE` | SHA256:`{sha}` | {datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')}", file=discord.File(io.BytesIO(comp), filename="pochi_state.json.gz"))
         return True, f"#{target_ch.name} にクラウドセーブ完了"
@@ -364,6 +364,7 @@ async def load_cloud_backup():
                     for cid_s, st in data.get("states", {}).items(): get_state(int(cid_s)).update(st)
                     for cid_s, dg in data.get("dungeons", {}).items(): active_dungeons[int(cid_s)] = dg
                     taboo_counts.update(data.get("taboo", {}))
+                    cv_import(data.get("convo", {}))
                     return True
     except Exception as e: print(f"Cloud Restore Skip: {e}")
     return False
@@ -1950,7 +1951,8 @@ def taboo_confession_hook(message) -> bool:
 @bot.event
 async def on_message_edit(before, after):
     # 送信後に書き換えて回避しようとしても消す
-    await taboo_guard(after)
+    if await taboo_guard(after): return
+    await cv_on_edit(before, after)
 
 # ---------- コマンド ----------
 @bot.command(name="taboo", aliases=["違反", "禁忌"])
@@ -1998,6 +2000,814 @@ async def taboo_demo_cmd(ctx, *, args: str = ""):
     tc = TabooCtx(ctx.guild, ctx.channel, ctx.author, max(1, n), dry=True)
     await ctx.send(f"🎬 **デモ開始**：違反{tc.n}回目の想定で、全鯖放送から流します。（実際の記録・刑・名札は変更されません）")
     await taboo_run_full(tc, forced_scene=scene)
+
+# =====================================================================
+# --- 9.8 会話エンジン v3 (CV) : 継続会話・自発参加・リアクション・編集/削除追従・マルチメディア理解 ---
+#  ※ 人格プロンプト(RP_MAP等)・台詞・返信フォーマットは一切変更しない。
+#    「会話の体験」と、それを支える裏側だけを強化する。!convo off で従来と同じ動作に戻せる。
+# =====================================================================
+import difflib
+from collections import deque, OrderedDict
+
+CV_ENABLED = True          # False にすると v3 の文脈・記憶・自発機能を全停止（従来動作）
+CV_LOG_MAX = 60            # チャンネルごとに保持する直近メッセージ数
+CV_CONTEXT_LINES = 14      # AIに渡す「直近の場の流れ」の行数
+CV_LINE_CHARS = 160        # 1行あたりの最大文字数
+CV_DIGEST_EVERY = 20       # 人間の発言がこの数たまったら「要約＋記憶抽出」を1回だけ走らせる
+CV_DIGEST_COOLDOWN = 120   # 要約の最短間隔(秒)
+CV_FACT_MAX = 30           # 1人あたりの記憶の最大数
+CV_RECALL_K = 6            # 返答時に思い出す記憶の数
+CV_CALL_TIMEOUT = 75       # AI応答の待ち時間上限(秒)
+CV_ME = "自分"             # ログ上でのbot自身の呼び名
+CV_CALL_NAMES = ["ポチ", "ぽち"]   # 名前を呼ばれたら（@なしでも）反応する
+CV_FOLLOWUP_SEC = 75       # 返答した相手の続きの発言を「会話の続き」と見なす秒数
+CV_CHIME_COOLDOWN = 90     # 自発参加の最短間隔(秒)
+CV_CHIME_CAP = {1: 4, 2: 8, 3: 14}            # 自発参加の1時間あたり上限（レベル別）
+CV_CHIME_BASE = {1: 0.10, 2: 0.22, 3: 0.38}   # 自発参加の基本確率（レベル別）
+CV_HUSH_SEC = 1800         # 「静かに」と言われたら自発発言を控える秒数
+CV_REPLY_MAP_MAX = 300
+CV_MAX_MEDIA_BYTES = 8 * 1024 * 1024
+CV_IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+CV_AUDIO_EXT = (".ogg", ".mp3", ".wav", ".m4a", ".flac", ".opus", ".aac")
+CV_VIDEO_EXT = (".mp4", ".mov", ".mkv")
+CV_TEXT_EXT = (".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".html", ".css", ".java", ".c", ".cpp", ".cs", ".go", ".rs", ".yaml", ".yml", ".xml", ".sql", ".sh", ".ini", ".toml")
+CV_DEFAULT_MIME = {"audio": "audio/ogg", "video": "video/mp4", "pdf": "application/pdf"}
+CV_MEDIA_DEFAULT_TEXT = {"audio": "添付の音声を聞いて、内容に返事して。", "video": "添付の動画を見て、内容に返事して。",
+                         "pdf": "添付のPDFを読んで、内容に返事して。", "text": "添付のファイルを読んで、内容に返事して。"}
+CV_BAD_WORDS = ["バカ", "死ね", "使えない", "ゴミ", "カス", "無能", "ポンコツ"]
+CV_GOOD_WORDS = ["ありがとう", "すごい", "天才", "助かる", "可愛い", "好き", "有能"]
+CV_HUSH_WORDS = ["黙れ", "だまれ", "うるさい", "静かに", "しゃべるな", "喋るな", "黙って"]
+CV_QUESTION_WORDS = ["?", "？", "どう思う", "どうする", "誰か", "知ってる", "分かる人", "教えて", "ない？", "かな"]
+CV_HYPE_WORDS = ["草", "ｗｗ", "www", "笑", "やば", "すご", "ありえ", "まじ", "マジ", "最高", "天才"]
+CV_REACT_MAP = [
+    (("草", "ｗｗ", "www", "笑", "lol"), "😂"), (("ありがとう", "感謝", "助かった"), "🙏"),
+    (("おめでとう", "合格", "優勝", "達成"), "🎉"), (("つらい", "しんどい", "悲しい", "泣", "疲れた"), "🥺"),
+    (("すごい", "やばい", "天才", "最高"), "🔥"), (("おはよう",), "☀️"), (("おやすみ",), "🌙"),
+]
+CV_FB_GOOD = {"👍", "❤️", "😂", "🤣", "🥰", "🔥", "💯"}
+CV_FB_BAD = {"👎", "😡", "💢", "🤮"}
+CV_CHIME_HINT = ("\n【割り込み判断】これは誰からも呼ばれていない、会話への自発的な参加の場面。"
+                 "混ざる価値がある（面白い・役に立つ・自然に乗れる）と思えば、いつものキャラのまま一言だけ返す。"
+                 "価値がなければ『[PASS]』とだけ出力する。")
+CV_REGEN_HINT = "\n【再生成】さっきの返答とは別の言い方・別の切り口で返し直すこと（キャラは変えない）。"
+CV_STARTER_HINT = ("\n【自発話題】しばらく誰も話していない。上の背景（あらすじ・直近の流れ・覚えていること）から話題を1つ選び、"
+                   "いつものキャラのまま自分から自然に話しかける。無理なら『[PASS]』とだけ出力する。")
+# 個人情報っぽいものは絶対に記憶しない
+CV_SENSITIVE = re.compile(r"(パスワード|暗証|カード番号|クレジット|住所|電話番号|本名|マイナンバー|口座|\d{7,}|[\w.+-]+@[\w-]+\.[\w.-]+|https?://)", re.I)
+
+# ---------- 状態 ----------
+cv_log = {}               # cid -> deque[entry]
+cv_pending = {}           # cid -> 未要約の人間発言数
+cv_digest_busy = set()
+cv_digest_last = {}       # cid -> 最後に要約した時刻
+cv_digest_upto = {}       # cid -> ここまで要約済みの時刻
+cv_summary = {}           # "cid" -> {"text", "ts"}                 ※バックアップ対象
+cv_mem = {}               # "gid:uid" -> {name, facts, aff, stress, last, n}   ※バックアップ対象
+cv_cfg = {}               # "cid" -> {cv, alive, lvl, react}        ※バックアップ対象
+cv_turns = {}             # (cid, uid) -> {"busy", "pending"}
+cv_recent_replies = {}    # cid -> 直近の自分の返答
+cv_bot_chain = {}         # cid -> botどうしの往復タイムスタンプ(無限ループ防止)
+cv_search_cache = {}
+cv_prefilled = set()
+cv_last_turn = {}         # cid -> {"uid", "ts"}  最後に返答した相手（継続会話の判定用）
+cv_reply_map = OrderedDict()   # ユーザー発言ID -> {cid, uid, bot_mids, ts}
+cv_bot_to_user = {}       # botの発言ID -> ユーザー発言ID
+cv_resync_busy = set()
+cv_chime_hist = {}        # cid -> 自発参加した時刻のリスト
+cv_chime_busy = set()
+cv_hush = {}              # cid -> 静かにしている期限
+cv_last_react = {}        # cid -> 最後に自動リアクションした時刻
+cv_last_starter = {}      # cid -> 最後に自発話題を振った時刻
+cv_stats = {"turns": 0, "merged": 0, "dups": 0, "digests": 0, "facts": 0, "timeouts": 0, "search_hit": 0,
+            "followups": 0, "chimes": 0, "reacts": 0, "regens": 0, "starters": 0, "media": 0}
+
+def cv_conf(cid): return cv_cfg.setdefault(str(cid), {"cv": True, "alive": False, "lvl": 2, "react": True})
+def cv_export(): return {"mem": cv_mem, "summary": cv_summary, "cfg": cv_cfg}
+def cv_import(d):
+    if not isinstance(d, dict): return
+    cv_mem.update(d.get("mem", {})); cv_summary.update(d.get("summary", {})); cv_cfg.update(d.get("cfg", {}))
+
+# ---------- 基本ユーティリティ ----------
+def cv_clean_text(s, limit=CV_LINE_CHARS):
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+def cv_name(m):
+    nm = re.sub(r"\s+", " ", str(getattr(m, "display_name", None) or getattr(m, "name", None) or "?")).strip()[:24]
+    return "名もなき者" if taboo_detect(nm) else nm
+
+def cv_rel(sec):
+    sec = max(0, int(sec))
+    if sec < 45: return "たった今"
+    if sec < 3600: return f"{max(1, sec // 60)}分前"
+    if sec < 86400: return f"{sec // 3600}時間前"
+    return f"{sec // 86400}日前"
+
+def cv_media_kind(att):
+    fn, ct = (getattr(att, "filename", "") or "").lower(), (getattr(att, "content_type", "") or "").lower()
+    if ct.startswith("image/") or fn.endswith(CV_IMG_EXT): return "image"
+    if ct.startswith("audio/") or fn.endswith(CV_AUDIO_EXT): return "audio"
+    if ct.startswith("video/") or fn.endswith(CV_VIDEO_EXT): return "video"
+    if ct == "application/pdf" or fn.endswith(".pdf"): return "pdf"
+    if ct.startswith("text/") or fn.endswith(CV_TEXT_EXT): return "text"
+    return None
+
+def cv_att_label(a):
+    return {"image": "[画像]", "audio": "[音声]", "video": "[動画]", "pdf": "[PDF]", "text": "[ファイル]"}.get(cv_media_kind(a), "[ファイル]")
+
+def cv_msg_text(message):
+    t = getattr(message, "clean_content", None)
+    if t is None: t = message.content or ""
+    extra = [cv_att_label(a) for a in (getattr(message, "attachments", None) or [])][:3]
+    if getattr(message, "stickers", None): extra.append("[スタンプ]")
+    return cv_clean_text((t + " " + " ".join(extra)).strip())
+
+def cv_strip_mentions(m):
+    s = m.content or ""
+    if bot.user: s = s.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
+    return s.strip()
+
+def cv_make_entry(message, ts=None):
+    txt, c0 = cv_msg_text(message), (message.content or "")
+    if not txt or c0.startswith(("!", "！")) or taboo_detect(c0): return None
+    is_me = bool(bot.user) and message.author.id == bot.user.id
+    return {"a": CV_ME if is_me else cv_name(message.author), "uid": message.author.id,
+            "gid": message.guild.id if message.guild else 0,
+            "bot": bool(message.author.bot or message.webhook_id), "me": is_me,
+            "t": ts if ts is not None else time.time(), "c": txt, "mid": message.id}
+
+def cv_quota_ok():
+    return bool(API_KEYS) and any(time.time() >= c for c in gemini_pool.cooldown.values())
+
+def cv_defang(text):
+    """AIの出力で意図せず全員メンションが飛ばないようにする"""
+    return (text or "").replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+
+def cv_call_names():
+    names = list(CV_CALL_NAMES)
+    if bot.user:
+        for n in (getattr(bot.user, "display_name", None), getattr(bot.user, "name", None)):
+            if n and len(n) >= 2: names.append(str(n))
+    return [n.lower() for n in names]
+
+# ---------- 場の流れ(ログ) ----------
+def cv_record(message):
+    """全メッセージを軽量に記録（削除済みの禁忌語・コマンドは入れない）"""
+    try:
+        e = cv_make_entry(message)
+        if not e: return
+        cid = message.channel.id
+        cv_log.setdefault(cid, deque(maxlen=CV_LOG_MAX)).append(e)
+        if not e["bot"]:
+            cv_pending[cid] = cv_pending.get(cid, 0) + 1
+            if (cv_pending[cid] >= CV_DIGEST_EVERY and cid not in cv_digest_busy
+                    and time.time() - cv_digest_last.get(cid, 0) > CV_DIGEST_COOLDOWN and cv_quota_ok()):
+                asyncio.create_task(cv_digest(cid))
+    except Exception as ex: print(f"[CV] record error: {ex}")
+
+def cv_log_update(message):
+    for e in cv_log.get(message.channel.id, []):
+        if e["mid"] == message.id:
+            e["c"] = cv_msg_text(message) or e["c"]; break
+
+async def cv_prefill(channel):
+    """再起動直後など、ログが空のときだけ過去の流れを一度だけ取り込む"""
+    cid = channel.id
+    if cid in cv_prefilled: return
+    cv_prefilled.add(cid)
+    if cv_log.get(cid): return
+    try:
+        items = [m async for m in channel.history(limit=CV_CONTEXT_LINES + 6)]
+    except Exception: return
+    dq = cv_log.setdefault(cid, deque(maxlen=CV_LOG_MAX))
+    for m in reversed(items):
+        e = cv_make_entry(m, ts=m.created_at.timestamp())
+        if e: dq.append(e)
+
+# ---------- 継続会話（@なしでも「自分に話している」と分かる） ----------
+def cv_is_addressed(message):
+    """返信先がbot / 名前を呼ばれた / 返答直後の同じ相手の続き、のどれかなら会話の続きとみなす"""
+    if message.author.bot or not message.guild or not CV_ENABLED: return False
+    if not cv_conf(message.channel.id).get("cv", True): return False
+    c = message.content or ""
+    if c.startswith(("!", "！")): return False
+    me_id = bot.user.id if bot.user else 0
+    ref = getattr(message, "reference", None)
+    r = getattr(ref, "resolved", None) if ref else None
+    if r is not None and getattr(getattr(r, "author", None), "id", None) == me_id: return True
+    low = c.lower()
+    if any(n in low for n in cv_call_names()): return True
+    last = cv_last_turn.get(message.channel.id)
+    if last and last["uid"] == message.author.id and time.time() - last["ts"] <= CV_FOLLOWUP_SEC:
+        for e in reversed(cv_log.get(message.channel.id, [])):
+            if e["t"] <= last["ts"]: break
+            if not e["bot"] and e["uid"] != message.author.id: return False     # 他の人が割って入ったら途切れ
+        cv_stats["followups"] += 1
+        return True
+    return False
+
+def cv_note_hush(message, raw, addressed):
+    if addressed and any(w in raw for w in CV_HUSH_WORDS): cv_hush[message.channel.id] = time.time() + CV_HUSH_SEC
+
+# ---------- 長期記憶 ----------
+def cv_user_rec(gid, uid, name=""):
+    r = cv_mem.setdefault(_tkey(gid or 0, uid), {"name": name, "facts": [], "aff": 50.0, "stress": 0.0, "last": time.time(), "n": 0})
+    if name: r["name"] = name
+    return r
+
+def cv_bigrams(s):
+    s = re.sub(r"\s+", "", (s or "").lower())
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+def cv_recall(rec, query, k=CV_RECALL_K):
+    facts = rec.get("facts", [])
+    if not facts: return []
+    qb, now, scored = cv_bigrams(query), time.time(), []
+    for f in facts:
+        fb = cv_bigrams(f["t"])
+        ov = len(qb & fb) / ((len(fb) ** 0.5) or 1)
+        scored.append((ov * 2.0 + f.get("w", 1.0) * 0.3 + (0.3 if now - f.get("ts", 0) < 7 * 86400 else 0.0), f))
+    scored.sort(key=lambda x: -x[0])
+    return [f["t"] for _, f in scored[:k]]
+
+def cv_add_fact(rec, text, now=None):
+    now = now or time.time()
+    t = cv_clean_text(text, 60)
+    if not (4 <= len(t) <= 60) or CV_SENSITIVE.search(t) or taboo_detect(t): return False
+    for f in rec["facts"]:
+        a = f["t"]
+        if a in t or t in a or difflib.SequenceMatcher(None, a, t).ratio() > 0.78:
+            f["ts"], f["w"] = now, min(5.0, f.get("w", 1.0) + 0.5)
+            if len(t) > len(a): f["t"] = t
+            return False
+    rec["facts"].append({"t": t, "ts": now, "w": 1.0})
+    if len(rec["facts"]) > CV_FACT_MAX:
+        rec["facts"].sort(key=lambda f: f.get("w", 1.0) + (0.5 if now - f.get("ts", 0) < 14 * 86400 else 0.0), reverse=True)
+        del rec["facts"][CV_FACT_MAX:]
+    cv_stats["facts"] += 1
+    return True
+
+# ---------- 感情(ユーザーごと・時間で自然に戻る) ----------
+def cv_mood_update(rec, text):
+    now = time.time()
+    steps = max(0.0, now - rec.get("last", now)) / 600.0     # 10分ごとに1ポイントずつ平常へ戻る
+    for key, base in (("aff", 50.0), ("stress", 0.0)):
+        v = rec.get(key, base)
+        rec[key] = max(base, v - steps) if v > base else min(base, v + steps)
+    if any(w in text for w in CV_BAD_WORDS): rec["stress"] += 15; rec["aff"] -= 10
+    if any(w in text for w in CV_GOOD_WORDS): rec["stress"] -= 15; rec["aff"] += 10
+    rec["stress"], rec["aff"] = max(0.0, min(100.0, rec["stress"])), max(0.0, min(100.0, rec["aff"]))
+    rec["last"] = now; rec["n"] = rec.get("n", 0) + 1
+
+# ---------- 要約＋記憶抽出（20発言に1回・バックグラウンド） ----------
+CV_DIGEST_SYS = ("あなたは会話ログの整理係です。出力はJSONオブジェクト1つだけ。前置き・説明・コードブロックは禁止。"
+                 "キャラ付けや口調は一切不要で、事実だけを淡々と書くこと。")
+
+def cv_llm_plain(sys_inst, prompt):
+    if not API_KEYS: return ""
+    for m_cand in [ACTIVE_MODEL] + [m for m in FALLBACK_MODELS if m != ACTIVE_MODEL][:1]:
+        k_idx, key = gemini_pool.get_best_key()
+        t0 = time.perf_counter()
+        try:
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel(model_name=m_cand, system_instruction=sys_inst, generation_config={"temperature": 0.2})
+            txt = getattr(model.generate_content(prompt), "text", "") or ""
+            gemini_pool.reward(k_idx, (time.perf_counter() - t0) * 1000)
+            return txt
+        except Exception as e:
+            gemini_pool.penalize(k_idx, 45.0 if any(k in str(e).lower() for k in ["quota", "429", "resourceexhausted"]) else 10.0)
+    return ""
+
+def cv_parse_json(raw):
+    try:
+        i, j = raw.index("{"), raw.rindex("}")
+        d = json.loads(raw[i:j + 1])
+        return d if isinstance(d, dict) else None
+    except Exception: return None
+
+def cv_find_uid(name, entries):
+    pool = {}
+    for e in entries:
+        if not e["bot"]: pool[e["a"]] = (e["gid"], e["uid"])
+    if name in pool: return pool[name]
+    low = {k.lower(): v for k, v in pool.items()}
+    if name.lower() in low: return low[name.lower()]
+    hit = [v for k, v in pool.items() if name and (name in k or k in name)]
+    return hit[0] if len(hit) == 1 else None
+
+async def cv_digest(cid, force=False):
+    if cid in cv_digest_busy: return 0
+    cv_digest_busy.add(cid); cv_digest_last[cid] = time.time()
+    try:
+        new = [e for e in list(cv_log.get(cid, [])) if e["t"] > cv_digest_upto.get(cid, 0)][-40:]
+        if len([e for e in new if not e["bot"]]) < (2 if force else 6): return 0
+        transcript = "\n".join(f"{e['a']}: {e['c']}" for e in new)
+        prev = cv_summary.get(str(cid), {}).get("text", "")
+        prompt = (f"【これまでのあらすじ】\n{prev or '（なし）'}\n\n【新しい会話ログ】\n{transcript}\n\n"
+                  "次のJSONだけを出力せよ。\n"
+                  '{"summary": "これまでのあらすじと新しい会話を統合した最新のあらすじ(300字以内)", '
+                  '"users": {"発言者名": ["あとで会話に活かせる短い事実(40字以内)", "..."]}}\n'
+                  "事実=好み・口癖・内輪ネタ・出来事・関係性など。確実でないことは書かない。"
+                  "住所・電話・本名・パスワード・メールなど個人情報は絶対に書かない。bot(自分)の事実は不要。")
+        data = cv_parse_json(await asyncio.to_thread(cv_llm_plain, CV_DIGEST_SYS, prompt))
+        if not data: return 0
+        added = 0
+        s = data.get("summary")
+        if isinstance(s, str) and s.strip(): cv_summary[str(cid)] = {"text": cv_clean_text(s, 400), "ts": time.time()}
+        users = data.get("users")
+        if isinstance(users, dict):
+            for nm, facts in users.items():
+                who = cv_find_uid(str(nm), new)
+                if not who or not isinstance(facts, list): continue
+                rec = cv_user_rec(who[0], who[1], str(nm))
+                for f in facts[:6]:
+                    if isinstance(f, str) and cv_add_fact(rec, f): added += 1
+        cv_digest_upto[cid] = new[-1]["t"]; cv_pending[cid] = 0; cv_stats["digests"] += 1
+        return added
+    except Exception as e:
+        print(f"[CV] digest error: {e}"); return 0
+    finally:
+        cv_digest_busy.discard(cid)
+
+# ---------- 文脈ブロック（ユーザー入力の前に付ける背景情報。台詞・口調は一切指示しない） ----------
+CV_CTX_HEAD = "━━ 会話の背景情報（参考。台詞・口調・キャラは普段のまま変えないこと） ━━\n"
+CV_CTX_TAIL = "\n※背景は、話の流れに自然に合うときだけさりげなく拾い、無理に持ち出さない。\n━━━━━━━━━━━━━━━━\n"
+
+def cv_build_context(message, raw_clean, rec):
+    cid, now = message.channel.id, time.time()
+    entries = [e for e in cv_log.get(cid, []) if e["mid"] != message.id]
+    recent = entries[-CV_CONTEXT_LINES:]
+    parts = []
+    summ = cv_summary.get(str(cid))
+    if summ and summ.get("text"): parts.append("【ここまでのあらすじ】\n" + summ["text"])
+    if recent:
+        parts.append("【直近の場の流れ（古い→新しい）】\n" + "\n".join(f"[{cv_rel(now - e['t'])}] {e['a']}: {e['c']}" for e in recent))
+        gap = now - recent[-1]["t"]
+        if gap > 1800: parts.append(f"【経過】この場での直前の発言は{cv_rel(gap)}。")
+        names, seen = [], set()
+        for e in reversed(recent):
+            if not e["me"] and e["a"] not in seen and e["uid"] != message.author.id: seen.add(e["a"]); names.append(e["a"])
+        if names: parts.append("【この場にいる他の人】" + "、".join(names[:5]))
+    mine = cv_recall(rec, raw_clean)
+    if mine: parts.append(f"【{cv_name(message.author)}について覚えていること】\n" + "\n".join("・" + x for x in mine))
+    others = []
+    for e in reversed(recent):
+        if e["me"] or e["bot"] or e["uid"] == message.author.id: continue
+        r = cv_mem.get(_tkey(e["gid"], e["uid"]))
+        if r and r.get("facts") and all(e["a"] not in o for o in others):
+            others.append(f"・{e['a']}: " + " / ".join(cv_recall(r, raw_clean, 2)))
+        if len(others) >= 3: break
+    if others: parts.append("【他の人について覚えていること】\n" + "\n".join(others))
+    if not parts: return ""
+    return CV_CTX_HEAD + "\n\n".join(parts)[:2600] + CV_CTX_TAIL + "【今回の発言（これに返答する）】\n"
+
+# ---------- 履歴の圧縮（背景情報が履歴に積もって膨らむのを防ぐ） ----------
+def cv_compact_history(state, user_compact):
+    P = getattr(genai, "protos", None)
+    h = state.get("history") or []
+    if not P or len(h) < 2: return
+    try:
+        out = []
+        for i, e in enumerate(h):
+            role = getattr(e, "role", "user") or "user"
+            txt = "".join(getattr(p, "text", "") or "" for p in e.parts)
+            if i == len(h) - 2 and role == "user": txt = user_compact
+            out.append(P.Content(role=role, parts=[P.Part(text=(txt[:1500] or "..."))]))
+        state["history"] = out
+    except Exception: pass
+
+# ---------- 重複防止 ----------
+def cv_norm(t): return re.sub(r"\s+", "", re.sub(r"<thought>.*?</thought>|\[[A-Z_]+(?::[^\]]*)?\]", "", t or "", flags=re.S | re.I))[:300]
+
+def cv_is_dup(cid, text):
+    a = cv_norm(text)
+    if len(a) < 20: return False
+    return any(difflib.SequenceMatcher(None, a, cv_norm(b)).ratio() >= 0.85 for b in cv_recent_replies.get(cid, [])[-3:])
+
+# ---------- 検索キャッシュ ----------
+async def cv_search(q):
+    q2 = (q or "").strip()[:100]
+    hit = cv_search_cache.get(q2)
+    if hit and time.time() - hit[0] < 120:
+        cv_stats["search_hit"] += 1; return hit[1]
+    try: res = await fast_web_search(q2)
+    except Exception: res = ""
+    if res: res += "\n（※検索結果は参考情報。会話に関係あるときだけ使い、無関係なら無視すること）"
+    cv_search_cache[q2] = (time.time(), res)
+    if len(cv_search_cache) > 80:
+        for k in sorted(cv_search_cache, key=lambda k: cv_search_cache[k][0])[:30]: cv_search_cache.pop(k, None)
+    return res
+
+async def cv_call(state, payload, is_bot, clone_prompt):
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(call_gemini_api, state, payload, is_bot, clone_prompt), CV_CALL_TIMEOUT)
+    except asyncio.TimeoutError:
+        cv_stats["timeouts"] += 1
+        return DummyResponse("⚠️ AI接続エラー: `応答がタイムアウトしました`")
+
+# ---------- マルチメディア理解（音声メッセージ・動画・PDF・テキスト/コードファイル） ----------
+async def cv_read_media(atts):
+    blobs, texts, kinds = [], [], []
+    for a in atts:
+        k = cv_media_kind(a)
+        if (getattr(a, "size", 0) or 0) > CV_MAX_MEDIA_BYTES: continue
+        try: data = await a.read()
+        except Exception: continue
+        if len(data) > CV_MAX_MEDIA_BYTES: continue
+        if k == "text":
+            texts.append(f"\n\n【添付ファイル: {a.filename}】\n```\n{data.decode('utf-8', errors='replace')[:12000]}\n```"); kinds.append("text")
+        else:
+            ct = (getattr(a, "content_type", "") or "").split(";")[0].strip().lower() or CV_DEFAULT_MIME[k]
+            blobs.append({"mime_type": ct, "data": data}); kinds.append(k)
+    cv_stats["media"] += len(kinds)
+    return blobs, texts, kinds
+
+# ---------- 返信の登録（編集・削除・リアクション操作への追従用） ----------
+def cv_register_reply(user_msg, sent):
+    ids = [m.id for m in sent if m is not None and hasattr(m, "id")]
+    if not ids: return
+    cv_reply_map[user_msg.id] = {"cid": user_msg.channel.id, "uid": user_msg.author.id, "bot_mids": ids, "ts": time.time()}
+    cv_reply_map.move_to_end(user_msg.id)
+    for i in ids: cv_bot_to_user[i] = user_msg.id
+    while len(cv_reply_map) > CV_REPLY_MAP_MAX:
+        _k, v = cv_reply_map.popitem(last=False)
+        for i in v["bot_mids"]: cv_bot_to_user.pop(i, None)
+
+# ---------- 1ターンの実行 ----------
+async def cv_run_turn(batch, mode="normal", edit_targets=None, extra_hint=""):
+    """mode: normal=呼ばれた / chime=自発参加 / regen=作り直し(既存の返信を編集)。送った返信メッセージのリストを返す"""
+    message = batch[-1]
+    ch_id = message.channel.id
+    state = get_state(ch_id)
+    is_cloned = ch_id in cloned_targets
+    use_cv = CV_ENABLED and cv_conf(ch_id).get("cv", True)
+    now = time.time()
+    if message.author.bot and mode == "normal":   # bot同士の無限往復を止める
+        chain = [t for t in cv_bot_chain.get(ch_id, []) if now - t < 60]
+        if len(chain) >= 4: return []
+        chain.append(now); cv_bot_chain[ch_id] = chain
+    raw_clean = "\n".join(x for x in (cv_strip_mentions(m) for m in batch) if x)
+    cv_stats["turns"] += 1; cv_stats["merged"] += len(batch) - 1
+    sent = []
+    async with (message.channel.typing() if mode != "chime" else contextlib.nullcontext()):
+        try:
+            state["count"] += 1
+            search_task = asyncio.create_task(cv_search(raw_clean)) if mode != "chime" else None
+            link_task = asyncio.create_task(process_all_links_async(raw_clean)) if (raw_clean and mode != "chime") else None
+            pre_task = asyncio.create_task(cv_prefill(message.channel)) if use_cv else None
+            ref = message.reference.resolved if (message.reference and isinstance(message.reference.resolved, discord.Message)) else None
+            atts_all = [a for m in batch for a in m.attachments] + (list(ref.attachments)[:2] if ref else [])   # 返信先の添付も見る
+            img_tasks = [download_attachment_as_pil(a) for a in [a for a in atts_all if cv_media_kind(a) == "image"][:4]]
+            media_task = asyncio.create_task(cv_read_media([a for a in atts_all if cv_media_kind(a) in ("audio", "video", "pdf", "text")][:3]))
+            search_res = (await search_task) if search_task else ""
+            link_ctx = (await link_task) if link_task else ""
+            if pre_task: await pre_task
+            valid_imgs = [i for i in await asyncio.gather(*img_tasks) if i] if img_tasks else []
+            blobs, file_texts, kinds = await media_task
+
+            reply_ctx = f"【返信対象 ({ref.author.display_name})】: {ref.clean_content[:300]}\n" if (ref and ref.clean_content) else ""
+            ctx_block, call_state = "", state
+            if use_cv:
+                rec = cv_user_rec(message.guild.id if message.guild else 0, message.author.id, cv_name(message.author))
+                if not message.author.bot:
+                    if mode == "normal": cv_mood_update(rec, raw_clean)
+                    call_state = dict(state); call_state["stress"], call_state["affection"] = int(rec["stress"]), int(rec["aff"])
+                ctx_block = cv_build_context(message, raw_clean, rec)
+            default_txt = CV_MEDIA_DEFAULT_TEXT[kinds[0]] if (not raw_clean and not valid_imgs and kinds) else "画像を分析して。"
+            speaker_line = f"{reply_ctx}【発言者: {message.author.display_name}】\n" + (raw_clean or default_txt)
+            in_txt = ctx_block + speaker_line + search_res + link_ctx + "".join(file_texts) + extra_hint
+            clone_prompt = cloned_targets[ch_id]["prompt"] if is_cloned else None
+            parts = valid_imgs + blobs
+            payload = (parts + [in_txt]) if parts else in_txt
+
+            hist_obj = call_state.get("history")
+            res = await cv_call(call_state, payload, message.author.bot, clone_prompt)
+            if mode == "chime":     # 混ざる価値がなければ黙る
+                t = (res.text or "").strip()
+                if not t or t.startswith("⚠️") or "[PASS]" in t[:16].upper(): return []
+            if use_cv and not parts and cv_is_dup(ch_id, res.text):      # 直前と同じ言い回しなら一度だけ言い直させる
+                cv_stats["dups"] += 1
+                call_state["history"] = hist_obj
+                res2 = await cv_call(call_state, in_txt + "\n【注意】直前の自分の返答と同じ言い回しの使い回しは避け、別の言い方・別の切り口で返すこと（キャラは変えない）。", message.author.bot, clone_prompt)
+                if res2.text and not res2.text.startswith("⚠️") and not cv_is_dup(ch_id, res2.text): res = res2
+            changed = call_state.get("history") is not hist_obj
+            if call_state is not state: state["history"] = call_state.get("history", state.get("history", []))
+            if use_cv and changed: cv_compact_history(state, speaker_line)
+
+            for im in valid_imgs:
+                with contextlib.suppress(Exception): im.close()
+
+            reply_txt, gen_img = await handle_special_actions(message, res.text if res and res.text else "")
+            reply_txt = cv_defang(reply_txt)
+            if not reply_txt and not gen_img: reply_txt = "..."
+            cv_recent_replies[ch_id] = (cv_recent_replies.get(ch_id, []) + [reply_txt])[-5:]
+
+            if (imp := mimic_targets.get(ch_id) or (cloned_targets[ch_id]["target"] if is_cloned else None)) and isinstance(message.channel, discord.TextChannel):
+                if await send_as_webhook(message.channel, imp, reply_txt, file=gen_img): return []
+
+            am = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=(mode == "normal" and not message.author.bot))
+            chunks = smart_chunks(reply_txt) if reply_txt else [""]
+            olds = list(edit_targets or [])
+            if olds and not gen_img:      # 作り直し/編集追従: 既存の返信を書き換える
+                for idx, chunk in enumerate(chunks):
+                    if idx < len(olds):
+                        try: await olds[idx].edit(content=chunk); sent.append(olds[idx]); continue
+                        except Exception: pass
+                    sent.append(await message.channel.send(chunk, allowed_mentions=am))
+                for extra in olds[len(chunks):]:
+                    with contextlib.suppress(Exception): await extra.delete()
+            else:
+                for idx, chunk in enumerate(chunks):
+                    sf = gen_img if idx == 0 else None
+                    if idx == 0:
+                        try: sent.append(await message.reply(chunk, file=sf, allowed_mentions=am))
+                        except Exception: sent.append(await message.channel.send(chunk, file=sf, allowed_mentions=am))
+                    else: sent.append(await message.channel.send(chunk, file=sf, allowed_mentions=am))
+                for old in olds:
+                    with contextlib.suppress(Exception): await old.delete()
+            if sent:
+                if mode in ("normal", "chime"): cv_last_turn[ch_id] = {"uid": message.author.id, "ts": time.time()}
+                cv_register_reply(message, sent)
+        except Exception as e:
+            print(f"処理エラー: {e}")
+            with contextlib.suppress(Exception): await message.channel.send(f"⚠️ 内部エラー (`!fix` でリセット可能): `{e}`")
+    return sent
+
+async def cv_submit(message):
+    """同じ人の連続投稿は順番待ちにして、返答の後にまとめて1ターンとして処理する（待たせずに最初の1通目は即返答）"""
+    key = (message.channel.id, message.author.id)
+    t = cv_turns.setdefault(key, {"busy": False, "pending": []})
+    if t["busy"]:
+        t["pending"] = (t["pending"] + [message])[-6:]; return
+    t["busy"] = True
+    try:
+        batch = [message]
+        while batch:
+            await cv_run_turn(batch)
+            batch, t["pending"] = t["pending"][:], []
+    finally:
+        t["busy"] = False
+
+# ---------- 自発参加（!alive on で有効。呼ばれていない会話にも、空気を読んで混ざる） ----------
+def cv_memory_hit(message, raw):
+    qb = cv_bigrams(raw)
+    if len(qb) < 3: return False
+    seen = set()
+    for e in reversed(list(cv_log.get(message.channel.id, []))[-12:]):
+        if e["bot"] or e["uid"] in seen: continue
+        seen.add(e["uid"])
+        r = cv_mem.get(_tkey(e["gid"], e["uid"]))
+        for f in (r or {}).get("facts", []):
+            fb = cv_bigrams(f["t"])
+            if fb and len(qb & fb) / len(fb) >= 0.34: return True
+    return False
+
+def cv_chime_score(message, raw):
+    score = 0
+    if any(w in raw for w in CV_QUESTION_WORDS): score += 2
+    if any(w in raw for w in CV_HYPE_WORDS): score += 1
+    if len(raw) >= 14: score += 1
+    now = time.time()
+    if len([e for e in cv_log.get(message.channel.id, []) if not e["bot"] and now - e["t"] < 60]) >= 3: score += 1
+    if cv_memory_hit(message, raw): score += 2
+    return score
+
+def cv_chime_ok(cid, lvl):
+    now = time.time()
+    if now < cv_hush.get(cid, 0): return False
+    log = cv_log.get(cid, [])
+    if any(e["me"] and now - e["t"] < CV_CHIME_COOLDOWN for e in list(log)[-6:]): return False
+    if now - cv_last_turn.get(cid, {}).get("ts", 0) < CV_CHIME_COOLDOWN: return False      # 直前に自分が話していたら控える
+    hist = [t for t in cv_chime_hist.get(cid, []) if now - t < 3600]
+    cv_chime_hist[cid] = hist
+    return len(hist) < CV_CHIME_CAP.get(lvl, 8)
+
+async def cv_chime_run(message):
+    cid = message.channel.id
+    try:
+        sent = await cv_run_turn([message], mode="chime", extra_hint=CV_CHIME_HINT)
+        if sent:
+            cv_chime_hist.setdefault(cid, []).append(time.time()); cv_stats["chimes"] += 1
+    finally: cv_chime_busy.discard(cid)
+
+async def cv_maybe_react(message, raw, conf):
+    if not conf.get("react", True): return
+    cid, now = message.channel.id, time.time()
+    if now - cv_last_react.get(cid, 0) < 20 or random.random() > 0.5: return
+    for words, emoji in CV_REACT_MAP:
+        if any(w in raw for w in words):
+            cv_last_react[cid] = now
+            with contextlib.suppress(Exception):
+                await message.add_reaction(emoji); cv_stats["reacts"] += 1
+            return
+
+async def cv_ambient(message, raw):
+    """呼ばれていない発言に対する、自発的なリアクションと割り込み"""
+    try:
+        if message.author.bot or not message.guild or not CV_ENABLED: return
+        conf = cv_conf(message.channel.id)
+        if not (conf.get("cv", True) and conf.get("alive")): return
+        if (message.content or "").startswith(("!", "！")): return
+        await cv_maybe_react(message, raw, conf)
+        cid, lvl = message.channel.id, conf.get("lvl", 2)
+        if cid in cv_chime_busy or not cv_chime_ok(cid, lvl): return
+        t = cv_turns.get((cid, message.author.id))
+        if t and t["busy"]: return
+        score = cv_chime_score(message, raw)
+        if score >= 2 and random.random() < min(0.8, CV_CHIME_BASE.get(lvl, 0.22) * (0.5 + 0.25 * score)):
+            cv_chime_busy.add(cid)
+            asyncio.create_task(cv_chime_run(message))
+    except Exception as e: print(f"[CV] ambient error: {e}")
+
+async def cv_idle_starter(channel):
+    """しばらく誰も話していないとき、記憶や流れから自分で話題を振る"""
+    cid = channel.id
+    await cv_prefill(channel)
+    log = list(cv_log.get(cid, []))
+    if not log: return False
+    now, state = time.time(), get_state(cid)
+    parts = []
+    summ = cv_summary.get(str(cid))
+    if summ and summ.get("text"): parts.append("【ここまでのあらすじ】\n" + summ["text"])
+    parts.append("【直近の場の流れ（古い→新しい）】\n" + "\n".join(f"[{cv_rel(now - e['t'])}] {e['a']}: {e['c']}" for e in log[-8:]))
+    mem_lines, seen = [], set()
+    for e in reversed(log):
+        if e["bot"] or e["uid"] in seen: continue
+        seen.add(e["uid"]); r = cv_mem.get(_tkey(e["gid"], e["uid"]))
+        if r and r.get("facts"): mem_lines.append(f"・{e['a']}: " + " / ".join(cv_recall(r, "", 3)))
+        if len(mem_lines) >= 3: break
+    if mem_lines: parts.append("【覚えていること】\n" + "\n".join(mem_lines))
+    text = CV_CTX_HEAD + "\n\n".join(parts)[:2200] + CV_CTX_TAIL + CV_STARTER_HINT
+    call_state = dict(state); hist_obj = call_state.get("history")
+    res = await cv_call(call_state, text, False, None)
+    t = (res.text or "").strip()
+    if not t or t.startswith("⚠️") or "[PASS]" in t[:16].upper(): return False
+    state["history"] = call_state.get("history", state.get("history", []))
+    if call_state.get("history") is not hist_obj: cv_compact_history(state, "（しばらく誰も話していないので、自分から話題を振った）")
+    clean, _img = await handle_special_actions(type("Ctx", (), {"guild": getattr(channel, "guild", None), "channel": channel, "author": None, "reference": None})(), t)
+    clean = cv_defang(clean)
+    if not clean: return False
+    am = discord.AllowedMentions(everyone=False, roles=False, users=False)
+    msg = await channel.send(smart_chunks(clean)[0], allowed_mentions=am)
+    cv_last_turn[cid] = {"uid": 0, "ts": time.time()}
+    cv_stats["starters"] += 1
+    return bool(msg)
+
+async def cv_idle_tick():
+    now, hour = time.time(), datetime.now(JST).hour
+    if not (9 <= hour < 23): return
+    for cid_s, c in list(cv_cfg.items()):
+        if not (c.get("alive") and c.get("cv", True)): continue
+        cid = int(cid_s)
+        if now < cv_hush.get(cid, 0) or now - cv_last_starter.get(cid, 0) < 6 * 3600: continue
+        ch = bot.get_channel(cid)
+        if ch is None or not getattr(ch, "guild", None) or not ch.permissions_for(ch.guild.me).send_messages: continue
+        await cv_prefill(ch)
+        log = cv_log.get(cid)
+        if not log or not (90 * 60 <= now - log[-1]["t"] <= 36 * 3600): continue
+        if random.random() > {1: 0.25, 2: 0.4, 3: 0.6}.get(c.get("lvl", 2), 0.4): continue
+        cv_last_starter[cid] = now
+        with contextlib.suppress(Exception): await cv_idle_starter(ch)
+
+@tasks.loop(minutes=10.0)
+async def cv_idle_loop():
+    await cv_idle_tick()
+
+# ---------- 編集・削除・リアクションへの追従 ----------
+async def cv_regen(umid, hint=""):
+    info = cv_reply_map.get(umid)
+    if not info or umid in cv_resync_busy: return
+    cv_resync_busy.add(umid)
+    try:
+        ch = bot.get_channel(info["cid"]) or await bot.fetch_channel(info["cid"])
+        umsg = await ch.fetch_message(umid)
+        olds = []
+        for mid in info["bot_mids"]:
+            with contextlib.suppress(Exception): olds.append(await ch.fetch_message(mid))
+        if not olds: return
+        sent = await cv_run_turn([umsg], mode="regen", edit_targets=olds, extra_hint=hint)
+        if sent: cv_stats["regens"] += 1
+    except Exception as e: print(f"[CV] regen error: {e}")
+    finally: cv_resync_busy.discard(umid)
+
+async def cv_on_edit(before, after):
+    """発言を編集したら、それに対する返信も新しい内容で作り直す"""
+    if after.author.bot: return
+    cv_log_update(after)
+    if (before.content or "") == (after.content or ""): return
+    info = cv_reply_map.get(after.id)
+    if info and time.time() - info["ts"] < 1800: await cv_regen(after.id)
+
+@bot.event
+async def on_raw_message_delete(payload):
+    """発言を消したら、それに対する自分の返信も片付ける（10分以内）"""
+    try:
+        info = cv_reply_map.pop(payload.message_id, None)
+        if not info or time.time() - info["ts"] > 600: return
+        ch = bot.get_channel(info["cid"])
+        if ch is None: return
+        for mid in info["bot_mids"]:
+            cv_bot_to_user.pop(mid, None)
+            with contextlib.suppress(Exception): await ch.get_partial_message(mid).delete()
+    except Exception as e: print(f"[CV] delete-sync error: {e}")
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    """自分の返信へのリアクション: 🔄=作り直し / 🗑️❌=削除 / 👍❤️😂等=好感度UP / 👎😡等=好感度DOWN"""
+    try:
+        if not bot.user or payload.user_id == bot.user.id: return
+        umid = cv_bot_to_user.get(payload.message_id)
+        info = cv_reply_map.get(umid) if umid is not None else None
+        if not info: return
+        emoji = str(payload.emoji)
+        mem = getattr(payload, "member", None)
+        is_owner = payload.user_id == info["uid"]
+        is_admin = bool(mem and getattr(getattr(mem, "guild_permissions", None), "manage_messages", False))
+        if emoji in ("🔄", "🔁") and (is_owner or is_admin):
+            await cv_regen(umid, CV_REGEN_HINT)
+        elif emoji in ("🗑️", "❌") and (is_owner or is_admin):
+            ch = bot.get_channel(info["cid"])
+            for mid in info["bot_mids"]:
+                cv_bot_to_user.pop(mid, None)
+                if ch is not None:
+                    with contextlib.suppress(Exception): await ch.get_partial_message(mid).delete()
+            cv_reply_map.pop(umid, None)
+        elif is_owner and (emoji in CV_FB_GOOD or emoji in CV_FB_BAD):
+            gid = getattr(payload, "guild_id", None) or 0
+            rec = cv_user_rec(gid, payload.user_id)
+            d = 1 if emoji in CV_FB_GOOD else -1
+            rec["aff"] = max(0.0, min(100.0, rec.get("aff", 50.0) + 3 * d)); rec["stress"] = max(0.0, min(100.0, rec.get("stress", 0.0) - 2 * d))
+    except Exception as e: print(f"[CV] reaction error: {e}")
+
+# ---------- コマンド ----------
+@bot.command(name="memory", aliases=["記憶"])
+async def cv_memory_cmd(ctx, *, target: str = ""):
+    gid, who = (ctx.guild.id if ctx.guild else 0), ctx.author
+    if target:
+        if not (ctx.guild and ctx.author.guild_permissions.manage_guild): return await ctx.send("⚠️ 他の人の記憶は管理者だけが見られます。")
+        who = find_target_member(ctx.guild, target)
+        if not who: return await ctx.send("⚠️ ユーザーが見つかりません。")
+    r = cv_mem.get(_tkey(gid, who.id))
+    if not r or not r.get("facts"): return await ctx.send(f"🧠 **{cv_name(who)}** について、まだ何も覚えていません。")
+    emb = discord.Embed(title=f"🧠 {cv_name(who)} について覚えていること", description="\n".join(f"・{f['t']}" for f in r["facts"][-20:]), color=discord.Color.teal())
+    emb.set_footer(text=f"好感度 {int(r.get('aff', 50))} ／ ストレス {int(r.get('stress', 0))} ／ 会話 {r.get('n', 0)}回 ｜ 消すなら !forget")
+    await ctx.send(embed=emb)
+
+@bot.command(name="forget", aliases=["忘れて"])
+async def cv_forget_cmd(ctx, target: str = ""):
+    gid = ctx.guild.id if ctx.guild else 0
+    if target == "all":
+        if not (ctx.guild and ctx.author.guild_permissions.manage_guild): return await ctx.send("⚠️ 管理者専用です。")
+        for k in [k for k in cv_mem if k.startswith(f"{gid}:")]: cv_mem.pop(k, None)
+        cv_summary.pop(str(ctx.channel.id), None)
+        return await ctx.send("🧹 この鯖の**全員分の記憶とあらすじ**を消しました。")
+    cv_mem.pop(_tkey(gid, ctx.author.id), None)
+    await ctx.send(f"🧹 **{cv_name(ctx.author)}** についての記憶を全部消しました。")
+
+CV_HELP = ("**🧩 会話エンジン v3 の使い方**\n"
+           "・**@なしで会話が続く**: 返信する／「ポチ」と呼ぶ／返答直後に続けて話す、で反応します。\n"
+           "・**自発参加**: `!alive on [1〜3]` で、呼ばれていない会話にも空気を読んで混ざります（`!alive off` で停止）。\n"
+           "・**リアクション操作**（私の返信に付ける）: 🔄=作り直し ／ 🗑️❌=削除 ／ 👍❤️😂=好感度UP ／ 👎😡=好感度DOWN\n"
+           "・**編集・削除に追従**: 発言を編集すると返信も作り直し、発言を消すと返信も消えます。\n"
+           "・**耳が増えた**: 音声メッセージ・動画・PDF・テキスト/コードファイルも読んで返事します。\n"
+           "・**記憶**: `!memory`（見る）／`!forget`（消す）／`!convo off`（従来動作に戻す・管理者）")
+
+@bot.command(name="convo", aliases=["会話"])
+async def cv_convo_cmd(ctx, mode: str = "status"):
+    c = cv_conf(ctx.channel.id)
+    if mode == "help": return await ctx.send(CV_HELP)
+    if mode in ("on", "off"):
+        if not (ctx.guild and ctx.author.guild_permissions.manage_guild): return await ctx.send("⚠️ 管理者専用です。")
+        c["cv"] = (mode == "on")
+        return await ctx.send(f"🧩 会話エンジンv3 を **{'ON' if c['cv'] else 'OFF（従来動作）'}** にしました。")
+    cid, gid = ctx.channel.id, (ctx.guild.id if ctx.guild else 0)
+    emb = discord.Embed(title="🧩 会話エンジン v3", description="使い方は `!convo help`", color=discord.Color.blurple())
+    emb.add_field(name="このチャンネル", value=f"状態: **{'ON' if c.get('cv', True) and CV_ENABLED else 'OFF'}**\n自発参加: **{'ON Lv' + str(c.get('lvl', 2)) if c.get('alive') else 'OFF'}**\n場のログ: {len(cv_log.get(cid, []))}件\n未要約: {cv_pending.get(cid, 0)}/{CV_DIGEST_EVERY}\nあらすじ: {'あり' if cv_summary.get(str(cid)) else 'なし'}", inline=True)
+    emb.add_field(name="記憶", value=f"人数: {len([k for k in cv_mem if k.startswith(f'{gid}:')])}人\n事実: {sum(len(v.get('facts', [])) for k, v in cv_mem.items() if k.startswith(f'{gid}:'))}件", inline=True)
+    s = cv_stats
+    emb.add_field(name="累計", value=f"会話ターン {s['turns']}（まとめ {s['merged']}）\n継続会話 {s['followups']} ／ 自発参加 {s['chimes']} ／ 自発話題 {s['starters']}\nリアクション {s['reacts']} ／ 作り直し {s['regens']}\n重複回避 {s['dups']} ／ 要約 {s['digests']}回\nメディア理解 {s['media']} ／ 検索キャッシュ {s['search_hit']}", inline=False)
+    await ctx.send(embed=emb)
+
+@bot.command(name="alive", aliases=["自発"])
+async def cv_alive_cmd(ctx, mode: str = "status", arg: str = ""):
+    c = cv_conf(ctx.channel.id)
+    if mode in ("on", "off", "react"):
+        if not (ctx.guild and ctx.author.guild_permissions.manage_guild): return await ctx.send("⚠️ 管理者専用です。")
+        if mode == "on":
+            c["alive"] = True
+            if arg.isdigit(): c["lvl"] = max(1, min(3, int(arg)))
+        elif mode == "off": c["alive"] = False
+        else: c["react"] = (arg != "off")
+    lv = {1: "控えめ（1時間に最大4回）", 2: "ふつう（同8回）", 3: "おしゃべり（同14回）"}.get(c.get("lvl", 2))
+    await ctx.send(f"🗣️ **自発参加: {'ON' if c.get('alive') else 'OFF'}** ／ レベル{c.get('lvl', 2)}: {lv} ／ 自動リアクション: {'ON' if c.get('react', True) else 'OFF'}\n"
+                   "`!alive on 1〜3` / `!alive off` / `!alive react on|off`　※「静かに」「黙れ」と言うと30分おとなしくなります")
+
+@bot.command(name="digest")
+async def cv_digest_cmd(ctx):
+    if not (ctx.guild and ctx.author.guild_permissions.manage_guild): return await ctx.send("⚠️ 管理者専用です。")
+    await ctx.send("🧠 いまの流れを要約して記憶に反映します…")
+    n = await cv_digest(ctx.channel.id, force=True)
+    await ctx.send(f"🧠 完了。新しく覚えたこと: **{n}件**（`!memory` で確認 / `!convo` で状態）")
 
 # --- 10. イベントハンドラ (毎ターン即時Web検索統合) ---
 # ※ 警告文には禁止ワード自体を含めない（自分の警告を自分で消すループ防止）
@@ -2054,6 +2864,7 @@ async def on_ready():
     print(f"Logged in as {bot.user.name} (Model: {ACTIVE_MODEL} / Fast Web Search Active)")
     await load_cloud_backup()
     await taboo_refresh_presence()
+    if not cv_idle_loop.is_running(): cv_idle_loop.start()
     if not immortal_watchdog_loop.is_running(): immortal_watchdog_loop.start()
     if not auto_cloud_backup_loop.is_running(): auto_cloud_backup_loop.start()
 
@@ -2061,6 +2872,7 @@ async def on_ready():
 async def on_message(message):
     # --- 禁忌語ガード（最優先）: 禁忌語を含むメッセージだけを削除し、全鯖放送→判決→刑の執行 ---
     if await taboo_guard(message): return
+    cv_record(message)
 
     if message.author.id == bot.user.id or message.webhook_id: return
     if taboo_confession_hook(message): return
@@ -2092,49 +2904,16 @@ async def on_message(message):
         state["vocab"] = state["vocab"][-60:]
 
     is_auto = state["base_mode"] in ["auto_full", "auto_stream", "anti_berserk", "troll_chaos", "quote_search", "meigen_search"]
-    is_mentioned = bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel)
+    is_mentioned = bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel) or cv_is_addressed(message)
+    cv_note_hush(message, raw_clean, is_mentioned)
     is_cloned, is_mimic = ch_id in cloned_targets, ch_id in mimic_targets
 
     if message.author.bot and not is_mentioned: return
 
     if is_mentioned or is_cloned or is_mimic or (is_auto and not message.author.bot):
         if not raw_clean and not message.attachments: return
-        async with message.channel.typing():
-            try:
-                state["count"] += 1
-                
-                # --- 💥 毎ターン超高速非同期Web検索を並列実行 ---
-                search_task = asyncio.create_task(fast_web_search(raw_clean))
-                link_task = asyncio.create_task(process_all_links_async(raw_clean)) if raw_clean else None
-                img_tasks = [download_attachment_as_pil(a) for a in message.attachments if any(a.filename.lower().endswith(e) for e in [".png",".jpg",".jpeg",".gif",".webp"])]
-                
-                search_res = await search_task
-                link_ctx = await link_task if link_task else ""
-                valid_imgs = [i for i in await asyncio.gather(*img_tasks) if i] if img_tasks else []
-
-                reply_ctx = f"【返信対象 ({message.reference.resolved.author.display_name})】: {message.reference.resolved.clean_content[:300]}\n" if (message.reference and isinstance(message.reference.resolved, discord.Message) and message.reference.resolved.clean_content) else ""
-
-                # 検索データをコンテキストに挿入
-                in_txt = f"{reply_ctx}【発言者: {message.author.display_name}】\n" + (raw_clean or "画像を分析して。") + search_res + link_ctx
-                res = await asyncio.to_thread(call_gemini_api, state, (valid_imgs + [in_txt] if valid_imgs else in_txt), message.author.bot, (cloned_targets[ch_id]["prompt"] if is_cloned else None))
-
-                for im in valid_imgs:
-                    with contextlib.suppress(Exception): im.close()
-
-                reply_txt, gen_img = await handle_special_actions(message, res.text if res and res.text else "")
-                if not reply_txt and not gen_img: reply_txt = "..."
-
-                if (imp := mimic_targets.get(ch_id) or (cloned_targets[ch_id]["target"] if is_cloned else None)) and isinstance(message.channel, discord.TextChannel):
-                    if await send_as_webhook(message.channel, imp, reply_txt, file=gen_img): return
-
-                for idx, chunk in enumerate(smart_chunks(reply_txt) if reply_txt else [""]):
-                    sf = gen_img if idx == 0 else None
-                    if idx == 0:
-                        try: await message.reply(chunk, file=sf, mention_author=not message.author.bot)
-                        except: await message.channel.send(chunk, file=sf)
-                    else: await message.channel.send(chunk, file=sf)
-            except Exception as e:
-                print(f"処理エラー: {e}")
-                with contextlib.suppress(Exception): await message.channel.send(f"⚠️ 内部エラー (`!fix` でリセット可能): `{e}`")
+        await cv_submit(message)
+    else:
+        await cv_ambient(message, raw_clean)
 
 bot.run(os.environ.get("DISCORD_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN"), reconnect=True)
