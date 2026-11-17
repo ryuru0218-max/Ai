@@ -2079,7 +2079,8 @@ cv_hush = {}              # cid -> 静かにしている期限
 cv_last_react = {}        # cid -> 最後に自動リアクションした時刻
 cv_last_starter = {}      # cid -> 最後に自発話題を振った時刻
 cv_stats = {"turns": 0, "merged": 0, "dups": 0, "digests": 0, "facts": 0, "timeouts": 0, "search_hit": 0,
-            "followups": 0, "chimes": 0, "reacts": 0, "regens": 0, "starters": 0, "media": 0}
+            "followups": 0, "chimes": 0, "reacts": 0, "regens": 0, "starters": 0, "media": 0,
+            "crafts": 0, "crisis": 0, "sem_ok": 0, "sem_fail": 0}
 
 def cv_conf(cid): return cv_cfg.setdefault(str(cid), {"cv": True, "alive": False, "lvl": 2, "react": True})
 def cv_export(): return {"mem": cv_mem, "summary": cv_summary, "cfg": cv_cfg}
@@ -2219,14 +2220,16 @@ def cv_bigrams(s):
     s = re.sub(r"\s+", "", (s or "").lower())
     return {s[i:i + 2] for i in range(len(s) - 1)}
 
-def cv_recall(rec, query, k=CV_RECALL_K):
+def cv_recall(rec, query, k=CV_RECALL_K, sem=None):
     facts = rec.get("facts", [])
     if not facts: return []
     qb, now, scored = cv_bigrams(query), time.time(), []
     for f in facts:
         fb = cv_bigrams(f["t"])
         ov = len(qb & fb) / ((len(fb) ** 0.5) or 1)
-        scored.append((ov * 2.0 + f.get("w", 1.0) * 0.3 + (0.3 if now - f.get("ts", 0) < 7 * 86400 else 0.0), f))
+        sv = (sem or {}).get(f["t"])
+        sb = max(0.0, sv - 0.55) * 8.0 if sv is not None else 0.0     # 意味の近さ（埋め込み）
+        scored.append((ov * 2.0 + sb + f.get("w", 1.0) * 0.3 + (0.3 if now - f.get("ts", 0) < 7 * 86400 else 0.0), f))
     scored.sort(key=lambda x: -x[0])
     return [f["t"] for _, f in scored[:k]]
 
@@ -2333,7 +2336,7 @@ async def cv_digest(cid, force=False):
 CV_CTX_HEAD = "━━ 会話の背景情報（参考。台詞・口調・キャラは普段のまま変えないこと） ━━\n"
 CV_CTX_TAIL = "\n※背景は、話の流れに自然に合うときだけさりげなく拾い、無理に持ち出さない。\n━━━━━━━━━━━━━━━━\n"
 
-def cv_build_context(message, raw_clean, rec):
+def cv_build_context(message, raw_clean, rec, craft="", sem=None):
     cid, now = message.channel.id, time.time()
     entries = [e for e in cv_log.get(cid, []) if e["mid"] != message.id]
     recent = entries[-CV_CONTEXT_LINES:]
@@ -2348,18 +2351,19 @@ def cv_build_context(message, raw_clean, rec):
         for e in reversed(recent):
             if not e["me"] and e["a"] not in seen and e["uid"] != message.author.id: seen.add(e["a"]); names.append(e["a"])
         if names: parts.append("【この場にいる他の人】" + "、".join(names[:5]))
-    mine = cv_recall(rec, raw_clean)
+    mine = cv_recall(rec, raw_clean, sem=sem)
     if mine: parts.append(f"【{cv_name(message.author)}について覚えていること】\n" + "\n".join("・" + x for x in mine))
     others = []
     for e in reversed(recent):
         if e["me"] or e["bot"] or e["uid"] == message.author.id: continue
         r = cv_mem.get(_tkey(e["gid"], e["uid"]))
         if r and r.get("facts") and all(e["a"] not in o for o in others):
-            others.append(f"・{e['a']}: " + " / ".join(cv_recall(r, raw_clean, 2)))
+            others.append(f"・{e['a']}: " + " / ".join(cv_recall(r, raw_clean, 2, sem=sem)))
         if len(others) >= 3: break
     if others: parts.append("【他の人について覚えていること】\n" + "\n".join(others))
-    if not parts: return ""
-    return CV_CTX_HEAD + "\n\n".join(parts)[:2600] + CV_CTX_TAIL + "【今回の発言（これに返答する）】\n"
+    if not parts and not craft: return ""
+    head = (CV_CTX_HEAD + "\n\n".join(parts)[:2600] + CV_CTX_TAIL) if parts else ""
+    return head + craft + "【今回の発言（これに返答する）】\n"
 
 # ---------- 履歴の圧縮（背景情報が履歴に積もって膨らむのを防ぐ） ----------
 def cv_compact_history(state, user_compact):
@@ -2433,6 +2437,164 @@ def cv_register_reply(user_msg, sent):
         _k, v = cv_reply_map.popitem(last=False)
         for i in v["bot_mids"]: cv_bot_to_user.pop(i, None)
 
+# ---------- 会話の作法（返し方の技術）: 発言の種類・感情・流れを読んで、その都度「返し方のメモ」を作る ----------
+#  ※ 台詞は作らない。キャラ・口調・台詞回しは普段のまま、「何をどの順で返すか」だけを補助する。
+CV_CRISIS_WORDS = ["死にたい", "消えたい", "自殺", "自傷", "リストカット", "リスカ", "生きていたくない", "生きるのが辛", "生きるのがつら", "生きるのがしんど", "いなくなりたい"]
+CV_VENT_WORDS = ["つらい", "辛い", "しんどい", "疲れた", "最悪", "むかつく", "ムカつく", "イライラ", "泣いた", "泣きそう", "悲しい", "寂しい", "落ち込", "へこ", "不安", "怖い", "やる気出ない", "もう嫌"]
+CV_POS_WORDS = ["嬉しい", "うれしい", "楽しい", "たのしい", "最高", "やった", "好き", "ありがとう", "助かった", "わーい", "すごい"]
+CV_ACK_WORDS = ["うん", "はい", "そうだね", "なるほど", "了解", "りょ", "ok", "ふーん", "へえ", "へー", "ほーん", "そっか", "たしかに", "確かに"]
+CV_GREET_WORDS = ["おはよう", "こんにちは", "こんばんは", "やあ", "ただいま", "おやすみ", "はじめまして", "ひさしぶり", "久しぶり"]
+CV_THANKS_WORDS = ["ありがとう", "感謝", "助かった", "助かる"]
+CV_SORRY_WORDS = ["ごめん", "すまん", "申し訳", "すみません"]
+CV_REQUEST_WORDS = ["して欲しい", "してほしい", "てくれ", "お願い", "頼む", "作って", "書いて", "教えて", "やって", "まとめて", "直して", "考えて", "調べて"]
+CV_CORRECT_WORDS = ["違う", "ちがう", "そうじゃなくて", "ちゃうやん", "間違って", "おかしい", "そうじゃない", "誤解"]
+CV_OPINION_WORDS = ["どう思う", "どっちが", "どっち", "ありかな", "どれがいい"]
+CV_REF_WORDS = ["それ", "あれ", "これ", "さっき", "その", "あの", "もう一回", "もう一度", "続き", "前の"]
+CV_QUESTION_RX = re.compile(r"[?？]|ですか|ますか|教えて|どう(?:思う|する|なの)|なぜ|なんで|どうして|いつ|どこ|誰|だれ|どれ|いくら|とは")
+CV_LAUGH_RX = re.compile(r"草|ｗ|w{2,}|笑|lol|😂|🤣", re.I)
+CV_SHARE_RX = re.compile(r"(した|てきた|だった|なった|行った|食べた|買った|見た|聞いた|もらった|かった|ちゃった|ました)")
+CV_CRISIS_NOTE = ("【最優先・安全】相手が深刻な苦痛や、自傷・自殺をほのめかしている可能性がある。この返答に限り、茶化し・煽り・ネタは控え、まず気持ちを真剣に受け止める。"
+                  "冗談や誇張かもしれなくても、一度「本気で言っているのか」を優しく確かめる。押し付けにならない形で、身近な人に話すことと、"
+                  "専門の相談先（日本なら よりそいホットライン 0120-279-338 ／ #いのちSOS 0120-061-338、どちらも24時間・無料）を一言伝える。説教や否定はしない。")
+CV_CRAFT_HINTS = {
+    "correction": "相手は直前の返答を訂正・否定している。言い訳せず、どこが違っていたかを具体的に受け止めて、言い直す。",
+    "vent": "相手は愚痴や弱音を吐いている。解決策や説教の前に、まず気持ちを一言受け止めてから話す。",
+    "multi": "質問や用件が複数ある。漏れなく、順番に全部へ答える。",
+    "request": "頼みごと。引き受けるか断るかを先にはっきりさせてから、中身を出す。",
+    "question": "質問には、まず結論（答え）を先に述べ、そのあとに補足する。",
+    "opinion": "意見を求められている。無難に濁さず、はっきり一つ選んで理由を添える。",
+    "vague": "短くて意味が曖昧。長く推測で語らず、直前の流れから指す対象が分かればそれに答え、分からなければ短く聞き返す。",
+    "ref": "「それ・あれ・さっきの」等の指示語を含む。【直前の話題】の何を指すかを踏まえて返す。",
+    "ack": "短い相づち。長々と説明せず、テンポよく短く返す（話を進める一言を添えてよい）。",
+    "greeting": "挨拶。軽く短く返し、時間帯や前回からの間隔に自然に触れてよい。",
+    "thanks": "感謝されている。軽く受け止める程度でよく、長く語らない。",
+    "sorry": "謝られている。重く扱わず、さらっと受け止める。",
+    "banter": "ふざけ・笑いの場面。説明せず、ノリとテンポを合わせて短めに返す。",
+    "share": "出来事の共有。まず反応・共感してから、話を広げる。",
+    "long": "長文。冒頭で要点を一言で受け止め、全体に目を配って返す。",
+}
+CV_CRAFT_ORDER = ["correction", "vent", "multi", "request", "question", "opinion", "vague", "ref", "ack", "greeting", "thanks", "sorry", "banter", "share", "long"]
+cv_open_q = {}      # (cid, uid) -> 自分が直前にした質問 {"q", "ts"}
+
+def cv_acts(text, has_media=False):
+    """発言の種類を判定（ローカル処理・追加のAI呼び出しなし）"""
+    t, acts = (text or "").strip(), set()
+    n = len(t)
+    if any(w in t for w in CV_CRISIS_WORDS): acts.add("crisis")
+    if any(w in t for w in CV_VENT_WORDS): acts.add("vent")
+    if CV_QUESTION_RX.search(t): acts.add("question")
+    if len(re.findall(r"[?？]", t)) >= 2 or len(re.findall(r"(?:^|\n)\s*(?:[0-9０-９]+[.．)）]|[①-⑩])", t)) >= 2: acts.add("multi")
+    if any(w in t for w in CV_REQUEST_WORDS): acts.add("request")
+    if any(w in t for w in CV_CORRECT_WORDS): acts.add("correction")
+    if any(w in t for w in CV_OPINION_WORDS): acts.add("opinion")
+    if n <= 20 and any(t.startswith(w) for w in CV_GREET_WORDS): acts.add("greeting")
+    if any(w in t for w in CV_THANKS_WORDS): acts.add("thanks")
+    if any(w in t for w in CV_SORRY_WORDS): acts.add("sorry")
+    if n <= 8 and not has_media and "question" not in acts and any(t.lower().startswith(w) for w in CV_ACK_WORDS): acts.add("ack")
+    if n <= 6 and not has_media and re.search(r"[?？]$", t) and not acts & {"ack", "greeting", "thanks"}: acts.add("vague")
+    if CV_LAUGH_RX.search(t): acts.add("banter")
+    if n >= 250: acts.add("long")
+    if n <= 40 and any(w in t for w in CV_REF_WORDS): acts.add("ref")
+    if n >= 15 and not acts & {"question", "request", "vent", "correction"} and CV_SHARE_RX.search(t): acts.add("share")
+    return acts
+
+def cv_sentiment(text):
+    return sum(1 for w in CV_POS_WORDS if w in text) - sum(1 for w in CV_VENT_WORDS + CV_BAD_WORDS if w in text)
+
+def cv_user_trend(cid, uid):
+    """この人の直近の発言の流れから、気分の傾向と会話のテンポを読む"""
+    msgs = [e["c"] for e in cv_log.get(cid, []) if e["uid"] == uid and not e["bot"]][-5:]
+    out = []
+    if len(msgs) >= 3:
+        s = sum(cv_sentiment(m) for m in msgs)
+        if s <= -2: out.append("相手はここ数発言ずっと元気がない／苛立っている。")
+        elif s >= 2: out.append("相手はここ数発言ずっと上機嫌。")
+        if sum(len(m) for m in msgs[-3:]) / 3 <= 10: out.append("相手は短文でテンポよく話している。返しも軽くテンポよく。")
+    return out
+
+def cv_topic_pointer(message):
+    ents = [e for e in cv_log.get(message.channel.id, []) if e["mid"] != message.id]
+    prev_u = next((e for e in reversed(ents) if e["uid"] == message.author.id and not e["bot"]), None)
+    prev_me = next((e for e in reversed(ents) if e["me"]), None)
+    bits = []
+    if prev_u: bits.append(f"相手の直前の発言『{cv_clean_text(prev_u['c'], 60)}』")
+    if prev_me: bits.append(f"自分の直前の返答『{cv_clean_text(prev_me['c'], 60)}』")
+    return "【直前の話題】" + " ／ ".join(bits) if bits else ""
+
+def cv_note_reply_question(cid, uid, reply_txt):
+    """自分の返答が質問で終わっていたら覚えておく（次の発言はその返事かもしれない）"""
+    t = re.sub(r"<thought>.*?</thought>|\[[A-Z_]+(?::[^\]]*)?\]", "", reply_txt or "", flags=re.S | re.I).strip()
+    sents = [s.strip() for s in re.split(r"[。！!\n]", t) if s.strip()]
+    if sents and re.search(r"[?？]$", sents[-1]): cv_open_q[(cid, uid)] = {"q": cv_clean_text(sents[-1], 80), "ts": time.time()}
+    else: cv_open_q.pop((cid, uid), None)
+
+def cv_craft_block(message, raw, has_media, gap_prev, consume=True):
+    acts = cv_acts(raw, has_media)
+    cid, uid, lines = message.channel.id, message.author.id, []
+    oq = cv_open_q.pop((cid, uid), None) if consume else cv_open_q.get((cid, uid))
+    if "crisis" in acts:
+        cv_stats["crisis"] += 1
+        lines.append(CV_CRISIS_NOTE)
+    else:
+        for a in CV_CRAFT_ORDER:
+            if a in acts and len(lines) < 4: lines.append(CV_CRAFT_HINTS[a])
+        if oq and time.time() - oq["ts"] < 600 and "question" not in acts:
+            lines.append(f"自分が直前に「{oq['q']}」と聞いている。この発言はその返事の可能性が高い。そうなら答えを受け止めて話を進める。")
+        if gap_prev >= 6 * 3600: lines.append(f"この人と話すのは約{cv_rel(gap_prev).replace('前', '')}ぶり。")
+        lines += cv_user_trend(cid, uid)[:2]
+        lines = lines[:5]     # 多すぎるメモはかえってノイズになるので上限を設ける
+    pointer = cv_topic_pointer(message) if (acts & {"ref", "vague"}) else ""
+    if not lines and not pointer: return ""
+    cv_stats["crafts"] += 1
+    return ("━━ 会話の作法メモ（この発言への返し方の参考。台詞・口調・キャラは普段のまま変えないこと） ━━\n"
+            + "\n".join("・" + x for x in lines) + (("\n" + pointer) if pointer else "") + "\n━━━━━━━━━━━━━━━━\n")
+
+# ---------- 意味検索（言い回しが違っても関連する記憶を拾う。失敗したら黙って従来方式に戻る） ----------
+CV_EMBED_MODELS = ["models/text-embedding-004", "models/gemini-embedding-001"]
+cv_embed_state = {"until": 0.0, "model": 0}
+cv_vec = {}
+
+def cv_cos(a, b):
+    dot = sum(x * y for x, y in zip(a, b)); na = sum(x * x for x in a) ** 0.5; nb = sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+
+def cv_embed_sync(texts):
+    last = None
+    for off in range(len(CV_EMBED_MODELS)):
+        idx = (cv_embed_state["model"] + off) % len(CV_EMBED_MODELS)
+        k_idx, key = gemini_pool.get_best_key()
+        try:
+            genai.configure(api_key=key)
+            emb = genai.embed_content(model=CV_EMBED_MODELS[idx], content=texts, task_type="semantic_similarity")["embedding"]
+            if emb and isinstance(emb[0], (int, float)): emb = [emb]
+            if len(emb) == len(texts):
+                cv_embed_state["model"] = idx
+                return emb
+        except Exception as e: last = e
+    raise RuntimeError(str(last))
+
+async def cv_semantic_prepare(recs, query):
+    now = time.time()
+    if now < cv_embed_state["until"] or not cv_quota_ok() or len((query or "").strip()) < 2: return {}
+    facts = list(dict.fromkeys(f["t"] for r in recs if r for f in r.get("facts", [])))
+    if not facts: return {}
+    need = [t for t in facts if t not in cv_vec][:40]
+    try: vecs = await asyncio.wait_for(asyncio.to_thread(cv_embed_sync, [query[:300]] + need), 5.0)
+    except Exception:
+        cv_embed_state["until"] = now + 1800; cv_stats["sem_fail"] += 1; return {}
+    for t, v in zip(need, vecs[1:]): cv_vec[t] = v
+    if len(cv_vec) > 3000:
+        for k in list(cv_vec)[:1500]: cv_vec.pop(k, None)
+    cv_stats["sem_ok"] += 1
+    return {t: cv_cos(vecs[0], cv_vec[t]) for t in facts if t in cv_vec}
+
+def cv_recent_recs(message, rec):
+    out, seen = [rec], {message.author.id}
+    for e in reversed(list(cv_log.get(message.channel.id, []))[-14:]):
+        if e["bot"] or e["uid"] in seen: continue
+        seen.add(e["uid"]); out.append(cv_mem.get(_tkey(e["gid"], e["uid"])))
+    return out
+
 # ---------- 1ターンの実行 ----------
 async def cv_run_turn(batch, mode="normal", edit_targets=None, extra_hint=""):
     """mode: normal=呼ばれた / chime=自発参加 / regen=作り直し(既存の返信を編集)。送った返信メッセージのリストを返す"""
@@ -2469,10 +2631,13 @@ async def cv_run_turn(batch, mode="normal", edit_targets=None, extra_hint=""):
             ctx_block, call_state = "", state
             if use_cv:
                 rec = cv_user_rec(message.guild.id if message.guild else 0, message.author.id, cv_name(message.author))
+                gap_prev = (time.time() - rec.get("last", time.time())) if rec.get("n", 0) > 0 else 0.0
                 if not message.author.bot:
                     if mode == "normal": cv_mood_update(rec, raw_clean)
                     call_state = dict(state); call_state["stress"], call_state["affection"] = int(rec["stress"]), int(rec["aff"])
-                ctx_block = cv_build_context(message, raw_clean, rec)
+                sem = await cv_semantic_prepare(cv_recent_recs(message, rec), raw_clean) if mode in ("normal", "regen") else {}
+                craft = cv_craft_block(message, raw_clean, bool(valid_imgs or kinds), gap_prev, consume=(mode == "normal")) if (mode in ("normal", "regen") and not message.author.bot) else ""
+                ctx_block = cv_build_context(message, raw_clean, rec, craft, sem)
             default_txt = CV_MEDIA_DEFAULT_TEXT[kinds[0]] if (not raw_clean and not valid_imgs and kinds) else "画像を分析して。"
             speaker_line = f"{reply_ctx}【発言者: {message.author.display_name}】\n" + (raw_clean or default_txt)
             in_txt = ctx_block + speaker_line + search_res + link_ctx + "".join(file_texts) + extra_hint
@@ -2528,6 +2693,7 @@ async def cv_run_turn(batch, mode="normal", edit_targets=None, extra_hint=""):
             if sent:
                 if mode in ("normal", "chime"): cv_last_turn[ch_id] = {"uid": message.author.id, "ts": time.time()}
                 cv_register_reply(message, sent)
+                cv_note_reply_question(ch_id, message.author.id, reply_txt)
         except Exception as e:
             print(f"処理エラー: {e}")
             with contextlib.suppress(Exception): await message.channel.send(f"⚠️ 内部エラー (`!fix` でリセット可能): `{e}`")
@@ -2770,6 +2936,8 @@ CV_HELP = ("**🧩 会話エンジン v3 の使い方**\n"
            "・**リアクション操作**（私の返信に付ける）: 🔄=作り直し ／ 🗑️❌=削除 ／ 👍❤️😂=好感度UP ／ 👎😡=好感度DOWN\n"
            "・**編集・削除に追従**: 発言を編集すると返信も作り直し、発言を消すと返信も消えます。\n"
            "・**耳が増えた**: 音声メッセージ・動画・PDF・テキスト/コードファイルも読んで返事します。\n"
+           "・**会話の作法**: 発言の種類（愚痴・質問・訂正・相づち等）や気分・テンポを読んで、返し方を調整します。台詞とキャラは変えません。\n"
+           "・**意味で思い出す**: 言い回しが違っても、関連する記憶を拾います。\n"
            "・**記憶**: `!memory`（見る）／`!forget`（消す）／`!convo off`（従来動作に戻す・管理者）")
 
 @bot.command(name="convo", aliases=["会話"])
@@ -2785,7 +2953,7 @@ async def cv_convo_cmd(ctx, mode: str = "status"):
     emb.add_field(name="このチャンネル", value=f"状態: **{'ON' if c.get('cv', True) and CV_ENABLED else 'OFF'}**\n自発参加: **{'ON Lv' + str(c.get('lvl', 2)) if c.get('alive') else 'OFF'}**\n場のログ: {len(cv_log.get(cid, []))}件\n未要約: {cv_pending.get(cid, 0)}/{CV_DIGEST_EVERY}\nあらすじ: {'あり' if cv_summary.get(str(cid)) else 'なし'}", inline=True)
     emb.add_field(name="記憶", value=f"人数: {len([k for k in cv_mem if k.startswith(f'{gid}:')])}人\n事実: {sum(len(v.get('facts', [])) for k, v in cv_mem.items() if k.startswith(f'{gid}:'))}件", inline=True)
     s = cv_stats
-    emb.add_field(name="累計", value=f"会話ターン {s['turns']}（まとめ {s['merged']}）\n継続会話 {s['followups']} ／ 自発参加 {s['chimes']} ／ 自発話題 {s['starters']}\nリアクション {s['reacts']} ／ 作り直し {s['regens']}\n重複回避 {s['dups']} ／ 要約 {s['digests']}回\nメディア理解 {s['media']} ／ 検索キャッシュ {s['search_hit']}", inline=False)
+    emb.add_field(name="累計", value=f"会話ターン {s['turns']}（まとめ {s['merged']}）\n継続会話 {s['followups']} ／ 自発参加 {s['chimes']} ／ 自発話題 {s['starters']}\nリアクション {s['reacts']} ／ 作り直し {s['regens']}\n重複回避 {s['dups']} ／ 要約 {s['digests']}回\nメディア理解 {s['media']} ／ 検索キャッシュ {s['search_hit']}\n作法メモ {s['crafts']}（安全対応 {s['crisis']}） ／ 意味検索 {s['sem_ok']}回（失敗 {s['sem_fail']}）", inline=False)
     await ctx.send(embed=emb)
 
 @bot.command(name="alive", aliases=["自発"])
